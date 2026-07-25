@@ -220,7 +220,9 @@ def _resolve_markdown_links_in_skill_bundle(
             preserved_source_root=source_root,
         )
         if count:
-            target_file.write_text(resolved, encoding="utf-8")
+            from apm_cli.utils.atomic_io import write_text_lf
+
+            write_text_lf(target_file, resolved)
             links_resolved += count
     return links_resolved
 
@@ -309,12 +311,11 @@ def _build_ownership_maps(project_root: Path) -> tuple[dict[str, str], dict[str,
     if not lockfile:
         return owned_by, native_owners
     for dep in lockfile.get_package_dependencies():
-        short_owner = (dep.virtual_path or dep.repo_url).rsplit("/", 1)[-1]
         unique_key = dep.get_unique_key()
         for deployed_path in dep.deployed_files:
             normalized = deployed_path.rstrip("/").replace("\\", "/")
             skill_name = normalized.rsplit("/", 1)[-1]
-            owned_by[skill_name] = short_owner
+            owned_by[skill_name] = unique_key
             if "/skills/" in normalized:
                 native_owners[skill_name] = unique_key
     return owned_by, native_owners
@@ -329,24 +330,6 @@ def _target_skills_root(target: Any, project_root: Path) -> Path:
     return project_root / effective_root / "skills"
 
 
-def _skill_subset_name_filter(skill_subset: tuple[str, ...] | None) -> set[str] | None:
-    """Return promotion filter tokens for --skill subset values."""
-    if not skill_subset:
-        return None
-    name_filter: set[str] = set()
-    for skill_name in skill_subset:
-        raw_name = str(skill_name).strip()
-        if not raw_name:
-            continue
-        normalized_path = raw_name.replace("\\", "/")
-        leaf_name = Path(normalized_path).name
-        name_filter.add(raw_name)
-        name_filter.add(normalized_path)
-        if leaf_name:
-            name_filter.add(leaf_name)
-    return name_filter or None
-
-
 def _promote_sub_skills_standalone(
     link_rewriter: Any,
     package_info: Any,
@@ -358,6 +341,7 @@ def _promote_sub_skills_standalone(
     logger: Any = None,
     targets: Any = None,
     skill_subset: Any = None,
+    name_filter: set[str] | None = None,
     skip_bin: bool = False,
 ) -> tuple[int, list[Path]]:
     """Promote sub-skills from a package that is not itself a skill."""
@@ -372,15 +356,30 @@ def _promote_sub_skills_standalone(
         targets = active_targets(project_root)
 
     parent_name = package_path.name
+    _dep_ref = getattr(package_info, "dependency_ref", None)
+    if _dep_ref is not None:
+        parent_name = _dep_ref.get_unique_key()
     owned_by, _ = link_rewriter._build_ownership_maps(project_root)
-    name_filter = _skill_subset_name_filter(skill_subset)
+    if name_filter is None:
+        from apm_cli.models.dependency.subsets import skill_subset_filter_tokens
+
+        name_filter = skill_subset_filter_tokens(skill_subset)
+    available_names = (
+        frozenset(
+            child.name
+            for child in sub_skills_dir.iterdir()
+            if sub_skills_dir.is_dir() and child.is_dir() and (child / "SKILL.md").is_file()
+        )
+        if sub_skills_dir.is_dir()
+        else frozenset()
+    )
     count = 0
     all_deployed: list[Path] = []
     seen_skill_dirs: set[Path] = set()
-    for idx, target in enumerate(targets):
+    primary_selected = False
+    for target in targets:
         if not target.supports("skills"):
             continue
-        is_primary = idx == 0
         target_skills_root = _target_skills_root(target, project_root)
         resolved_root = target_skills_root.resolve()
         if resolved_root in seen_skill_dirs:
@@ -391,6 +390,8 @@ def _promote_sub_skills_standalone(
                 )
             continue
         seen_skill_dirs.add(resolved_root)
+        is_primary = not primary_selected
+        primary_selected = True
         target_skills_root.mkdir(parents=True, exist_ok=True)
         n, deployed = _promote_sub_skills(
             sub_skills_dir,
@@ -402,6 +403,7 @@ def _promote_sub_skills_standalone(
             managed_files=managed_files if is_primary else None,
             force=force,
             project_root=project_root,
+            logger=logger if is_primary else None,
             name_filter=name_filter,
             link_rewriter=link_rewriter,
             skip_bin=skip_bin,
@@ -409,6 +411,19 @@ def _promote_sub_skills_standalone(
         if is_primary:
             count = n
         all_deployed.extend(deployed)
+    if name_filter is not None and name_filter.isdisjoint(available_names):
+        available_display = ", ".join(sorted(available_names)) if available_names else "(none)"
+        requested_display = ", ".join(sorted(set(str(s) for s in (skill_subset or ()))))
+        msg = (
+            "Skill selection matched no available skills. "
+            f"Requested: {requested_display}. Available: {available_display}. "
+            "Edit 'skills:' in apm.yml to use an available name or remove the filter, "
+            "then run 'apm install'."
+        )
+        if diagnostics is not None:
+            diagnostics.warn(msg, package=parent_name)
+        elif logger:
+            logger.warning(f"Package '{parent_name}': {msg}")
     return count, all_deployed
 
 
@@ -476,13 +491,12 @@ def _integrate_native_skill_to_target(
         return {"target_paths": []}
 
     skills_mapping = target.primitives["skills"]
-    if target.resolved_deploy_root is not None:
-        target_skill_dir = target.resolved_deploy_root / context.skill_name
-        target_skills_root = target.resolved_deploy_root
-    else:
+    target_skill_dir = _target_skills_root(target, context.project_root) / context.skill_name
+    target_skills_root = _target_skills_root(target, context.project_root)
+    if target.resolved_deploy_root is None:
+        # static targets: keep the effective_root for containment guard
         effective_root = skills_mapping.deploy_root or target.root_dir
-        target_skills_root = context.project_root / effective_root / "skills"
-        target_skill_dir = target_skills_root / context.skill_name
+        _ = effective_root  # referenced below for ensure_path_within
 
     from apm_cli.utils.path_security import (
         PathTraversalError,
@@ -538,7 +552,7 @@ def _integrate_native_skill_to_target(
     _, sub_deployed = _promote_sub_skills(
         context.sub_skills_dir,
         target_skills_root,
-        context.skill_name,
+        context.current_key or context.skill_name,
         warn=is_primary,
         owned_by=context.owned_by if is_primary else None,
         diagnostics=context.diagnostics if is_primary else None,
@@ -687,6 +701,7 @@ def _integrate_skill_bundle(
     logger: Any = None,
     targets: Any = None,
     skill_subset: Any = None,
+    name_filter: set[str] | None = None,
     skip_bin: bool = False,
 ) -> dict[str, Any]:
     """Promote every skill in a skill bundle's top-level skills directory."""
@@ -697,16 +712,34 @@ def _integrate_skill_bundle(
         targets = active_targets(project_root)
 
     owned_by, _ = link_rewriter._build_ownership_maps(project_root)
+    _dep_ref = getattr(package_info, "dependency_ref", None)
+    _parent_name = (
+        _dep_ref.get_unique_key() if _dep_ref is not None else package_info.install_path.name
+    )
+    _name_filter = name_filter
+    if _name_filter is None:
+        from apm_cli.models.dependency.subsets import skill_subset_filter_tokens
+
+        _name_filter = skill_subset_filter_tokens(skill_subset)
+    available_names = (
+        frozenset(
+            child.name
+            for child in skills_dir.iterdir()
+            if skills_dir.is_dir() and child.is_dir() and (child / "SKILL.md").is_file()
+        )
+        if skills_dir.is_dir()
+        else frozenset()
+    )
     context = SkillBundleTargetContext(
         skills_dir=skills_dir,
-        parent_name=package_info.install_path.name,
+        parent_name=_parent_name,
         owned_by=owned_by,
         diagnostics=diagnostics,
         managed_files=managed_files,
         force=force,
         project_root=project_root,
         logger=logger,
-        name_filter=_skill_subset_name_filter(skill_subset),
+        name_filter=_name_filter,
         link_rewriter=link_rewriter,
         seen_skill_dirs=set(),
         skip_bin=skip_bin,
@@ -714,16 +747,34 @@ def _integrate_skill_bundle(
     total_promoted = 0
     all_deployed: list[Path] = []
     any_created = False
-    for idx, target in enumerate(targets):
+    primary_selected = False
+    for target in targets:
+        is_primary = not primary_selected
         target_result = _integrate_skill_bundle_target(
             target,
-            is_primary=idx == 0,
+            is_primary=is_primary,
             context=context,
         )
-        if idx == 0:
+        if is_primary and target_result.get("deployed"):
+            primary_selected = True
             total_promoted = target_result["promoted"]
             any_created = target_result["created"]
+        elif is_primary and target.supports("skills"):
+            primary_selected = True
         all_deployed.extend(target_result["deployed"])
+    if _name_filter is not None and _name_filter.isdisjoint(available_names):
+        available_display = ", ".join(sorted(available_names)) if available_names else "(none)"
+        requested_display = ", ".join(sorted(set(str(s) for s in (skill_subset or ()))))
+        msg = (
+            "Skill selection matched no available skills. "
+            f"Requested: {requested_display}. Available: {available_display}. "
+            "Edit 'skills:' in apm.yml to use an available name or remove the filter, "
+            "then run 'apm install'."
+        )
+        if diagnostics is not None:
+            diagnostics.warn(msg, package=_parent_name)
+        elif logger:
+            logger.warning(f"Package '{_parent_name}': {msg}")
     return {
         "skill_created": any_created,
         "skill_updated": False,

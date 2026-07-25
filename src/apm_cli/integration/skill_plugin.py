@@ -10,6 +10,20 @@ from pathlib import Path
 from typing import Any
 
 
+def _normalize_bin_deploy_deny_key_local(value: object) -> str:
+    """Local fallback for normalize_bin_deploy_deny_key (mirrors security.executables)."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        from apm_cli.models.apm_package import DependencyReference
+
+        raw = DependencyReference.parse(raw).get_canonical_dependency_string()
+    except ValueError:
+        raw = raw.removesuffix(".git")
+    return raw.rstrip("/").lower()
+
+
 def _bin_deploy_denied(package_info: Any, policy: Any, logger: Any) -> bool:
     """Return True when policy opts the package out of bin deployment."""
     if policy is None:
@@ -18,6 +32,12 @@ def _bin_deploy_denied(package_info: Any, policy: Any, logger: Any) -> bool:
     if bd_policy is None:
         return False
     canonical = package_info.get_canonical_dependency_string()
+    try:
+        from apm_cli.security.executables import normalize_bin_deploy_deny_key
+    except ImportError:
+        normalize_bin_deploy_deny_key = _normalize_bin_deploy_deny_key_local
+
+    normalized_canonical = normalize_bin_deploy_deny_key(canonical)
     if bd_policy.deny_all:
         if logger:
             logger.progress(
@@ -25,7 +45,8 @@ def _bin_deploy_denied(package_info: Any, policy: Any, logger: Any) -> bool:
                 symbol="info",
             )
         return True
-    if canonical in bd_policy.deny:
+    deny_entries = {normalize_bin_deploy_deny_key(entry) for entry in bd_policy.deny}
+    if normalized_canonical in deny_entries:
         if logger:
             logger.progress(
                 f"bin_deploy.deny: skipping bin deploy for {canonical}",
@@ -179,8 +200,7 @@ def _copy_plugin_file(
         shutil.copy2(src_file, dest_file)
 
     if make_executable and os.name == "posix":
-        current = dest_file.stat().st_mode
-        dest_file.chmod((current & ~(stat.S_IXGRP | stat.S_IXOTH)) | stat.S_IXUSR)
+        dest_file.chmod(stat.S_IRWXU)
 
     if not skip_copy and logger:
         logger.progress(f"deployed {src_file.name} -> {rel_label}", symbol="check")

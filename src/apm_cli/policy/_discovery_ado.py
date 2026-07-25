@@ -16,7 +16,8 @@ from __future__ import annotations
 import base64
 from typing import TYPE_CHECKING
 
-from ..utils.github_host import build_ado_api_url
+from ..cache.url_normalize import SCP_LIKE_RE
+from ..utils.github_host import build_ado_api_url, is_visualstudio_legacy_hostname
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -58,6 +59,7 @@ def _fetch_from_ado_repo(
                 outcome=outcome,
                 raw_bytes_hash=cache_entry.raw_bytes_hash or None,
                 expected_hash=expected_hash,
+                warnings=cache_entry.warnings,
             )
 
     content, error = _d._fetch_ado_contents(org, project, repo, "apm-policy.yml", host=host)
@@ -81,23 +83,27 @@ def _fetch_from_ado_repo(
         return mismatch
 
     try:
-        policy, _warnings = _d.load_policy(content)
+        policy, warnings = _d.load_policy(content)
     except _d.PolicyValidationError as e:
         return _d.PolicyFetchResult(
             error=f"Invalid policy in {repo_ref}: {e}",
             source=source_label,
             outcome="malformed",
+            warnings=e.warnings,
         )
 
     chain_refs = [repo_ref]
     actual_hash = _d._compute_hash_normalized(content, expected_hash)
-    _d._write_cache(
-        repo_ref,
-        policy,
-        project_root,
-        chain_refs=chain_refs,
-        raw_bytes_hash=actual_hash,
-    )
+    # Defer cache write for policies with extends: -- chain resolver writes merged cache.
+    if not policy.extends:
+        _d._write_cache(
+            repo_ref,
+            policy,
+            project_root,
+            chain_refs=chain_refs,
+            raw_bytes_hash=actual_hash,
+            warnings=warnings,
+        )
     outcome = "empty" if _d._is_policy_empty(policy) else "found"
     return _d.PolicyFetchResult(
         policy=policy,
@@ -105,6 +111,7 @@ def _fetch_from_ado_repo(
         outcome=outcome,
         raw_bytes_hash=actual_hash,
         expected_hash=expected_hash,
+        warnings=warnings,
     )
 
 
@@ -161,3 +168,160 @@ def _fetch_ado_contents(
         return None, f"Connection error fetching policy from {repo_ref}"
     except Exception as e:
         return None, f"Error fetching policy from {repo_ref}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Host-classification and token helpers (re-exported via discovery.py)
+# ---------------------------------------------------------------------------
+
+
+def _is_github_host(host: str) -> bool:
+    """Return True if *host* is a known GitHub-family hostname."""
+    import os
+
+    if host == "github.com":
+        return True
+    if host.endswith(".ghe.com"):
+        return True
+    gh_host = os.environ.get("GITHUB_HOST", "")
+    if gh_host and host == gh_host:  # noqa: SIM103
+        return True
+    return False
+
+
+def _get_token_for_host(host: str) -> str | None:
+    """Get authentication token for a given host.
+
+    Environment-variable tokens (GITHUB_TOKEN, GITHUB_APM_PAT, GH_TOKEN)
+    are only returned when *host* is a recognized GitHub-family hostname.
+    For other hosts the token manager + git credential helpers are used.
+    """
+    import logging
+    import os
+
+    logger = logging.getLogger(__name__)
+    try:
+        from ..core.token_manager import GitHubTokenManager
+
+        manager = GitHubTokenManager()
+        return manager.get_token_with_credential_fallback("modules", host)
+    except Exception as exc:
+        logger.debug("Token manager failed for %s: %s", host, exc)
+        if _is_github_host(host):
+            return (
+                os.environ.get("GITHUB_TOKEN")
+                or os.environ.get("GITHUB_APM_PAT")
+                or os.environ.get("GH_TOKEN")
+            )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# File-based policy loader (re-exported via discovery.py)
+# ---------------------------------------------------------------------------
+
+
+def _load_from_file(path: Path, *, expected_hash: str | None = None) -> PolicyFetchResult:
+    """Load policy from a local file.
+
+    Rule B: Uses ``_verify_hash_pin``, ``_is_policy_empty``,
+    ``_compute_hash_normalized`` via ``apm_cli.policy.discovery`` so test
+    patches on ``discovery.*`` still intercept.
+    """
+    from apm_cli.policy import discovery as _d
+    from apm_cli.policy.parser import PolicyValidationError, load_policy
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        return _d.PolicyFetchResult(
+            error=f"Failed to read {path}: {e}",
+            outcome="cache_miss_fetch_fail",
+        )
+
+    source_label = f"file:{path}"
+    mismatch = _d._verify_hash_pin(content, expected_hash, source_label)
+    if mismatch is not None:
+        return mismatch
+
+    try:
+        policy, warnings = load_policy(content)
+        outcome = "empty" if _d._is_policy_empty(policy) else "found"
+        actual_hash = (
+            _d._compute_hash_normalized(content, expected_hash)
+            if expected_hash is not None
+            else None
+        )
+        return _d.PolicyFetchResult(
+            policy=policy,
+            source=source_label,
+            outcome=outcome,
+            raw_bytes_hash=actual_hash,
+            expected_hash=expected_hash,
+            warnings=warnings,
+        )
+    except PolicyValidationError as e:
+        return _d.PolicyFetchResult(
+            error=f"Invalid policy file {path}: {e}",
+            outcome="malformed",
+            warnings=e.warnings,
+        )
+
+
+def _parse_remote_url(url: str) -> tuple[str, str] | None:
+    """Parse a git remote URL into (org, host).
+
+    Accepts SCP-style SSH URLs with any username (not just ``git@``), so
+    EMU/GHE deployments that use a non-``git`` SSH user parse correctly.
+    Also handles Azure DevOps SSH URLs (``v3/`` path prefix).
+
+    Returns None if URL can't be parsed.
+    """
+    if not url:
+        return None
+
+    scp_match = SCP_LIKE_RE.match(url)
+    if scp_match:
+        host = scp_match.group("host")
+        path_part = scp_match.group("path")
+        try:
+            parts = path_part.rstrip("/").removesuffix(".git").split("/")
+            parts = [p for p in parts if p]
+            if not parts:
+                return None
+            if host == "ssh.dev.azure.com" and parts[0] == "v3" and len(parts) >= 2:
+                return (parts[1], host)
+            return (parts[0], host)
+        except (ValueError, IndexError):
+            return None
+
+    if "://" in url:
+        return _parse_scheme_remote_url(url)
+
+    return None
+
+
+def _parse_scheme_remote_url(url: str) -> tuple[str, str] | None:
+    """Parse a scheme-style remote URL (``https://host/org/...``).
+
+    Azure DevOps legacy ``*.visualstudio.com`` hosts encode the org in the
+    hostname rather than the path, so they are handled before the generic
+    path-based extraction.
+
+    Uses ``_d.urlparse`` so test patches on
+    ``apm_cli.policy.discovery.urlparse`` are intercepted.
+    """
+    from apm_cli.policy import discovery as _d
+
+    try:
+        parsed = _d.urlparse(url)
+        host = parsed.hostname or ""
+        path_parts = parsed.path.strip("/").removesuffix(".git").rstrip("/").split("/")
+        if is_visualstudio_legacy_hostname(host):
+            return (host[: -len(".visualstudio.com")], host)
+        if host and path_parts and path_parts[0]:
+            return (path_parts[0], host)
+    except Exception:
+        return None
+
+    return None

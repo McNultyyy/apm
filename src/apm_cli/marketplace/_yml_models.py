@@ -107,8 +107,8 @@ class PackageEntry:
     author: Mapping[str, str] | None = None
     license: str | None = None
     repository: str | None = None
-    # Marketplace category metadata. Emitted only by output formats that
-    # consume categories, currently Codex repo marketplace output.
+    # Marketplace category metadata. Emitted by both the Claude and Codex
+    # outputs when present; the Codex output additionally requires it.
     category: str | None = None
     # Derived (set by loader, not by user)
     is_local: bool = False

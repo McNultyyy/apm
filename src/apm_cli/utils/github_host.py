@@ -18,6 +18,22 @@ from ._github_host_artifactory import (
 )
 
 
+def _get_ghes_host() -> str:
+    """Return the normalised GITHUB_HOST env value."""
+    return os.environ.get("GITHUB_HOST", "").strip().lower().split("/")[0]
+
+
+def _get_gitlab_single_host() -> str:
+    """Return the normalised GITLAB_HOST env value."""
+    return os.environ.get("GITLAB_HOST", "").strip().lower().split("/")[0]
+
+
+def _get_gitlab_hosts_list() -> list[str]:
+    """Return normalised APM_GITLAB_HOSTS entries."""
+    raw = os.environ.get("APM_GITLAB_HOSTS", "")
+    return [part.strip().lower().split("/")[0] for part in raw.split(",") if part.strip()]
+
+
 def default_host() -> str:
     """Return the default Git host (can be overridden via GITHUB_HOST env var)."""
     return os.environ.get("GITHUB_HOST", "github.com")
@@ -60,8 +76,8 @@ def is_gitlab_hostname(hostname: str | None) -> bool:
     Matches, in order of what this function checks (not full ``classify_host`` order):
 
     - ``gitlab.com`` (case-insensitive)
-    - ``GITLAB_HOST`` — single self-managed host (same pattern as ``GITHUB_HOST`` for GHES)
-    - ``APM_GITLAB_HOSTS`` — comma-separated list of self-managed hosts
+    - ``GITLAB_HOST`` -- single self-managed host (same pattern as ``GITHUB_HOST`` for GHES)
+    - ``APM_GITLAB_HOSTS`` -- comma-separated list of self-managed hosts
 
     **GHES precedence:** If ``GITHUB_HOST`` matches *hostname* under the same
     rules as ``AuthResolver.classify_host`` (GHES, not ``gitlab.com`` SaaS),
@@ -75,7 +91,7 @@ def is_gitlab_hostname(hostname: str | None) -> bool:
     # GHES precedence: GITHUB_HOST match is enterprise GitHub, not GitLab, even if
     # the same host appears in GitLab env vars (GHES takes priority over any
     # GitLab environment hint).
-    ghes_host = os.environ.get("GITHUB_HOST", "").strip().lower().split("/")[0]
+    ghes_host = _get_ghes_host()
     if (
         ghes_host
         and ghes_host == h
@@ -87,15 +103,10 @@ def is_gitlab_hostname(hostname: str | None) -> bool:
 
     if h == "gitlab.com":
         return True
-    gitlab_single = os.environ.get("GITLAB_HOST", "").strip().lower().split("/")[0]
+    gitlab_single = _get_gitlab_single_host()
     if gitlab_single and gitlab_single == h:
         return is_valid_fqdn(h)
-    raw_list = os.environ.get("APM_GITLAB_HOSTS", "")
-    for part in raw_list.split(","):
-        entry = part.strip().lower().split("/")[0]
-        if entry and entry == h and is_valid_fqdn(entry):
-            return True
-    return False
+    return any(entry and entry == h and is_valid_fqdn(entry) for entry in _get_gitlab_hosts_list())
 
 
 def has_github_gitlab_host_env_conflict(hostname: str | None) -> bool:
@@ -114,7 +125,7 @@ def has_github_gitlab_host_env_conflict(hostname: str | None) -> bool:
     if not is_valid_fqdn(h):
         return False
 
-    ghes_host = os.environ.get("GITHUB_HOST", "").strip().lower().split("/")[0]
+    ghes_host = _get_ghes_host()
     github_claims_as_ghes = (
         ghes_host
         and ghes_host == h
@@ -125,17 +136,11 @@ def has_github_gitlab_host_env_conflict(hostname: str | None) -> bool:
     if not github_claims_as_ghes:
         return False
 
-    gitlab_single = os.environ.get("GITLAB_HOST", "").strip().lower().split("/")[0]
+    gitlab_single = _get_gitlab_single_host()
     if gitlab_single and gitlab_single == h and is_valid_fqdn(h):
         return True
 
-    raw_list = os.environ.get("APM_GITLAB_HOSTS", "")
-    for part in raw_list.split(","):
-        entry = part.strip().lower().split("/")[0]
-        if entry and entry == h and is_valid_fqdn(entry):
-            return True
-
-    return False
+    return any(entry and entry == h and is_valid_fqdn(entry) for entry in _get_gitlab_hosts_list())
 
 
 def format_github_gitlab_host_conflict_error(hostname: str) -> str:
@@ -385,6 +390,8 @@ def build_https_clone_url(
 
     ``port`` is embedded in the netloc (``host:port``) when set so custom
     HTTPS ports (e.g. self-hosted Git servers on 8443) are preserved.
+    Returned Git-family URLs always carry the ``.git`` suffix, matching SSH,
+    plain-HTTP, and GitLab builders.
 
     Note: callers must avoid logging raw token-bearing URLs.
     """
@@ -392,7 +399,11 @@ def build_https_clone_url(
     if token:
         # Use x-access-token format which is compatible with GitHub Enterprise and GH Actions
         return f"https://x-access-token:{token}@{netloc}/{repo_ref}.git"
-    return f"https://{netloc}/{repo_ref}"
+    # Keep the .git suffix on the anonymous form too: hosts like GitBucket
+    # serve smart-HTTP only at the .git path (no redirect), while GitHub /
+    # GitLab / Bitbucket / Gitea accept both. This also keeps parity with
+    # the token, SSH, and plain-HTTP builders, which all emit .git.
+    return f"https://{netloc}/{repo_ref}.git"
 
 
 def build_gitlab_https_clone_url(
@@ -638,6 +649,52 @@ def build_ado_api_url(
         f"https://{api_host}/{org_path}{quoted_project}/_apis/git/repositories/{quoted_repo}/items"
         f"?path={encoded_path}&versionDescriptor.version={quoted_ref}&api-version=7.0"
     )
+
+
+def parse_ado_repo_url(url: str | None) -> tuple[str, str, str] | None:
+    """Decompose an Azure DevOps repo URL into ``(org, project, repo)``.
+
+    Accepts the standard ``_git`` clone shape on both ADO hostnames:
+
+    - ``https://dev.azure.com/{org}/{project}/_git/{repo}`` (org in path)
+    - ``https://{org}.visualstudio.com/{project}/_git/{repo}`` (org in subdomain)
+
+    A trailing ``.git`` and any segments after ``{repo}`` are ignored. Path
+    segments are percent-decoded. Returns ``None`` when the URL is not an ADO
+    host, lacks the ``_git`` marker, or cannot be decomposed.
+    """
+    if not url:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    hostname = parsed.hostname or ""
+    if not is_azure_devops_hostname(hostname):
+        return None
+
+    path = parsed.path.strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    segments = [urllib.parse.unquote(s) for s in path.split("/") if s]
+    if "_git" not in segments:
+        return None
+    git_idx = segments.index("_git")
+    if git_idx + 1 >= len(segments):
+        return None
+    repo = segments[git_idx + 1]
+    before = segments[:git_idx]
+
+    if is_visualstudio_legacy_hostname(hostname):
+        # Legacy ``*.visualstudio.com``: org lives in the subdomain.
+        org, project = hostname.split(".")[0], (before[-1] if before else "")
+    else:
+        # ``dev.azure.com``: org and project both precede ``_git``.
+        org, project = (before[0], before[1]) if len(before) >= 2 else ("", "")
+
+    if not (org and project and repo):
+        return None
+    return org, project, repo
 
 
 def is_valid_fqdn(hostname: str) -> bool:

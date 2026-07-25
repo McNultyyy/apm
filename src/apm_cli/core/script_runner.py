@@ -8,6 +8,11 @@ import time
 from pathlib import Path
 
 from ..output.script_formatters import ScriptExecutionFormatter
+from ..runtime.registry import (
+    get_runtime_descriptor,
+    runtime_descriptors,  # noqa: F401 -- accessed via _sr.runtime_descriptors() in _runtime_commands.py
+    runtime_names,
+)
 from ..runtime.utils import find_runtime_binary
 from ._prompt_compiler import PromptCompiler as PromptCompiler
 from ._runtime_commands import _RuntimeCommandsMixin
@@ -253,7 +258,7 @@ class ScriptRunner(_RuntimeCommandsMixin):
             # Check if this is a runtime command before transformation
             is_runtime_cmd = any(
                 re.search(r"(?:^|\s)" + runtime + r"(?:\s|$)", command)
-                for runtime in ["copilot", "codex", "llm", "gemini"]
+                for runtime in runtime_names()
             ) and re.search(re.escape(prompt_file), command)
 
             # Transform command based on runtime pattern
@@ -310,20 +315,13 @@ class ScriptRunner(_RuntimeCommandsMixin):
         # Determine how to pass content based on runtime
         runtime = self._detect_runtime(" ".join(actual_command_args))
 
-        if runtime == "copilot":
-            # Copilot uses -p flag
-            actual_command_args.extend(["-p", content])
-        elif runtime == "codex":
-            # Codex exec expects content as the last argument
-            actual_command_args.append(content)
-        elif runtime == "llm":
-            # LLM expects content as argument
-            actual_command_args.append(content)
-        elif runtime == "gemini":
-            # Gemini uses -p flag for prompt content
+        try:
+            content_argument = get_runtime_descriptor(runtime).content_argument
+        except ValueError:
+            content_argument = "positional"
+        if content_argument == "prompt_flag":
             actual_command_args.extend(["-p", content])
         else:
-            # Default: assume content as last argument
             actual_command_args.append(content)
 
         # Show subprocess details for debugging

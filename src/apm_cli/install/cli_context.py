@@ -3,7 +3,7 @@
 import builtins
 import dataclasses
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -41,17 +41,16 @@ class InstallContext:
     protocol_pref: Any  # ProtocolPreference
     allow_protocol_fallback: bool
     trust_transitive_mcp: bool
-    trust_canvas: bool
     no_policy: bool
     install_mode: Any  # InstallMode
     packages: tuple  # Original Click packages
+    transaction: Any = None  # InstallTransaction; default preserves direct-call compatibility
     refresh: bool = False
     only_packages: builtins.list | None = None
-    manifest_snapshot: bytes | None = None
-    snapshot_manifest_path: Optional["Path"] = None
     legacy_skill_paths: bool = False
     frozen: bool = False
     plan_callback: "Callable[[UpdatePlan], bool] | None" = None
     skill_subset: "builtins.tuple[str, ...] | None" = None
     skill_subset_from_cli: bool = False
     audit_override: str | None = None
+    install_result: Any = None  # InstallResult | None

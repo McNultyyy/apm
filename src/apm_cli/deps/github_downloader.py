@@ -30,6 +30,7 @@ from ..models.apm_package import (
 from ..models.apm_package import (
     validate_apm_package as validate_apm_package,
 )
+from ..utils.atomic_io import atomic_write_text as atomic_write_text
 from ..utils.console import (
     _rich_warning as _rich_warning,
 )
@@ -50,6 +51,7 @@ from .git_remote_ops import (
     semver_sort_key,
     sort_remote_refs,
 )
+from .github_rate_limit import GitHubThrottleError as GitHubThrottleError
 from .transport_selection import (
     ProtocolPreference,
     TransportSelector,
@@ -337,12 +339,37 @@ class GitHubPackageDownloader:
             suppress_credential_helpers=suppress_credential_helpers,
         )
 
+    def _cache_git_env(self, dep_ref: DependencyReference) -> dict[str, str]:
+        """Return the subprocess environment for persistent Git cache operations."""
+        from .git_auth_env import GitAuthEnvBuilder
+
+        git_env = GitAuthEnvBuilder.subprocess_env_dict(self.git_env)
+        if dep_ref.is_insecure:
+            git_env = GitAuthEnvBuilder.noninteractive_env(
+                git_env,
+                preserve_config_isolation=True,
+                suppress_credential_helpers=True,
+            )
+        return git_env
+
     def _resilient_get(
-        self, url: str, headers: dict[str, str], timeout: int = 30, max_retries: int = 3
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout: int = 30,
+        max_retries: int = 3,
+        *,
+        stream: bool = False,
+        retry_throttles: bool = True,
     ) -> requests.Response:
         """Backward-compat stub -- delegates to download strategies."""
         return self._strategies.resilient_get(
-            url, headers, timeout=timeout, max_retries=max_retries
+            url,
+            headers,
+            timeout=timeout,
+            max_retries=max_retries,
+            stream=stream,
+            retry_throttles=retry_throttles,
         )
 
     def _sanitize_git_error(self, error_message: str) -> str:

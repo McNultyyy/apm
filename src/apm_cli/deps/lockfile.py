@@ -13,16 +13,33 @@ from typing import Any
 
 import yaml
 
+from ..core.deployment_state import DeploymentLedger
 from ..models.apm_package import DependencyReference
+from ..models.dependency.identity import normalize_package_repo_url
 from ..models.dependency.reference import (
     build_canonical_dependency_string,
     build_dependency_unique_key,
 )
 from ._lockfile_serde import (
+    LockfileFormatError,
+    UnsupportedLockfileVersionError,
     _dedupe_preserving_order,
+    _normalize_exec_status,  # noqa: F401 -- re-exported for test seam
+    _normalize_lockfile_host_type,  # noqa: F401 -- re-exported for test seam
+    _validate_lockfile_container,
     locked_dependency_from_dict,
     locked_dependency_from_ref,
 )
+
+# Canonical version authority for lockfile format (#1078: moved from _lockfile_serde.py).
+# All other modules must import or route through this definition.
+SUPPORTED_LOCKFILE_VERSIONS: frozenset[str] = frozenset({"1", "2"})
+
+
+def _get_supported_versions() -> frozenset[str]:
+    """Return supported lockfile versions; sibling modules call this to avoid naming the constant."""
+    return SUPPORTED_LOCKFILE_VERSIONS
+
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +105,41 @@ class LockedDependency:
     # rather than stored as a sentinel, so absence stays distinguishable from
     # an explicit declaration.
     declared_license: str | None = None
+
+    # Resolved executable-trust state (issue #1873). One of ``deployed`` |
+    # ``gated_pending_approval`` | ``denied`` | ``absent``, mirroring the
+    # resolver ``trust_state``. Absence (``None``) means the package declared
+    # no executable primitive; it is OMITTED from the serialized entry so a
+    # never-gated package stays distinguishable from an explicitly-cleared one.
+    exec_status: str | None = None
+
+    # Package-declared name from the dependency's own apm.yml (issue #1888).
+    # SELF-ASSERTED display/inventory metadata only -- NOT an identity anchor.
+    # See to_dict/from_dict and the supply-chain boundary note in the lockfile
+    # spec. Omitted from the serialized entry when absent.
+    name: str | None = None
+
+    # Declaring-parent repo URL (for transitive dependencies).
+    declaring_parent: str | None = None
+    # Resolved anchor path for local dependencies.
+    anchored_local_path: str | None = None
+    # Audit-only consumer target subset.
+    target_subset: list[str] = field(default_factory=list)
+
     # Forward-compat carrier: keys we don't recognise are preserved
     # through a from_dict / to_dict round-trip so an older APM build
     # reading a lockfile written by a newer build doesn't silently drop
     # fields when it re-emits.
     _unknown_fields: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Normalize case-insensitive package identity when loading or creating locks."""
+        self.repo_url = normalize_package_repo_url(
+            self.repo_url,
+            host=self.host,
+            source=self.source,
+            registry_prefix=self.registry_prefix,
+        )
 
     def get_unique_key(self) -> str:
         """Returns unique key for this dependency."""
@@ -104,6 +151,8 @@ class LockedDependency:
             is_virtual=self.is_virtual,
             virtual_path=self.virtual_path,
             registry_prefix=self.registry_prefix,
+            declaring_parent=self.declaring_parent,
+            anchored_local_path=self.anchored_local_path,
         )
 
     def get_canonical_dependency_string(self) -> str:
@@ -122,9 +171,56 @@ class LockedDependency:
             virtual_path=self.virtual_path,
         )
 
+    def _to_dict_provenance_fields(self, result: dict[str, Any]) -> None:
+        """Populate optional provenance and resolution fields into *result*."""
+        if self.source:
+            result["source"] = self.source
+        if self.local_path:
+            result["local_path"] = self.local_path
+        if self.declaring_parent:
+            result["declaring_parent"] = self.declaring_parent
+        if self.anchored_local_path:
+            result["anchored_local_path"] = self.anchored_local_path
+        if self.content_hash:
+            result["content_hash"] = self.content_hash
+        if self.is_dev:
+            result["is_dev"] = True
+        if self.discovered_via:
+            result["discovered_via"] = self.discovered_via
+        if self.marketplace_plugin_name:
+            result["marketplace_plugin_name"] = self.marketplace_plugin_name
+        if self.source_url:
+            result["source_url"] = self.source_url
+        if self.source_digest:
+            result["source_digest"] = self.source_digest
+        if self.is_insecure:
+            result["is_insecure"] = True
+        if self.allow_insecure:
+            result["allow_insecure"] = True
+        if self.skill_subset:
+            result["skill_subset"] = sorted(self.skill_subset)
+        if self.target_subset:
+            result["target_subset"] = sorted(self.target_subset)
+        if self.resolved_url:
+            result["resolved_url"] = self.resolved_url
+        if self.resolved_hash:
+            result["resolved_hash"] = self.resolved_hash
+        if self.constraint:
+            result["constraint"] = self.constraint
+        if self.resolved_tag:
+            result["resolved_tag"] = self.resolved_tag
+        if self.resolved_at:
+            result["resolved_at"] = self.resolved_at
+        if self.declared_license:
+            result["declared_license"] = self.declared_license
+        if self.exec_status:
+            result["exec_status"] = self.exec_status
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for YAML output."""
         result: dict[str, Any] = {"repo_url": self.repo_url}
+        if self.name is not None:
+            result["name"] = self.name
         if self.host:
             result["host"] = self.host
         if self.host_type:
@@ -153,40 +249,7 @@ class LockedDependency:
             result["deployed_files"] = sorted(_dedupe_preserving_order(self.deployed_files))
         if self.deployed_file_hashes:
             result["deployed_file_hashes"] = dict(sorted(self.deployed_file_hashes.items()))
-        if self.source:
-            result["source"] = self.source
-        if self.local_path:
-            result["local_path"] = self.local_path
-        if self.content_hash:
-            result["content_hash"] = self.content_hash
-        if self.is_dev:
-            result["is_dev"] = True
-        if self.discovered_via:
-            result["discovered_via"] = self.discovered_via
-        if self.marketplace_plugin_name:
-            result["marketplace_plugin_name"] = self.marketplace_plugin_name
-        if self.source_url:
-            result["source_url"] = self.source_url
-        if self.source_digest:
-            result["source_digest"] = self.source_digest
-        if self.is_insecure:
-            result["is_insecure"] = True
-        if self.allow_insecure:
-            result["allow_insecure"] = True
-        if self.skill_subset:
-            result["skill_subset"] = sorted(self.skill_subset)
-        if self.resolved_url:
-            result["resolved_url"] = self.resolved_url
-        if self.resolved_hash:
-            result["resolved_hash"] = self.resolved_hash
-        if self.constraint:
-            result["constraint"] = self.constraint
-        if self.resolved_tag:
-            result["resolved_tag"] = self.resolved_tag
-        if self.resolved_at:
-            result["resolved_at"] = self.resolved_at
-        if self.declared_license:
-            result["declared_license"] = self.declared_license
+        self._to_dict_provenance_fields(result)
         # Replay forward-compat unknown fields LAST so they never shadow a
         # known field that this build understands.
         for k, v in self._unknown_fields.items():
@@ -214,6 +277,8 @@ class LockedDependency:
         registry_config=None,
         registry_resolution=None,
         git_semver_resolution=None,
+        package_name: str | None = None,
+        package_version: str | None = None,
     ) -> LockedDependency:
         """Create from a DependencyReference with resolution info.
 
@@ -230,6 +295,8 @@ class LockedDependency:
             registry_config=registry_config,
             registry_resolution=registry_resolution,
             git_semver_resolution=git_semver_resolution,
+            package_name=package_name,
+            package_version=package_version,
         )
 
     def to_dependency_ref(self) -> DependencyReference:
@@ -257,10 +324,14 @@ class LockedDependency:
             artifactory_prefix=self.registry_prefix,
             is_local=(self.source == "local"),
             local_path=self.local_path,
+            declaring_parent=self.declaring_parent,
+            anchored_local_path=self.anchored_local_path,
             is_insecure=self.is_insecure,
             allow_insecure=self.allow_insecure,
             source=self.source,
-        )
+            skill_subset=sorted(self.skill_subset) if self.skill_subset else None,
+            target_subset=sorted(self.target_subset) if self.target_subset else None,
+        ).with_derived_provider_coordinates()
 
 
 @dataclass
@@ -273,10 +344,23 @@ class LockFile:
     dependencies: dict[str, LockedDependency] = field(default_factory=dict)
     mcp_servers: list[str] = field(default_factory=list)
     mcp_configs: dict[str, dict] = field(default_factory=dict)
+    mcp_target_servers: dict[str, list[str]] = field(default_factory=dict)
+    # Provenance for transitively-contributed MCP servers: name -> declaring
+    # package identity. Only servers NOT declared in the root manifest's mcp:
+    # block appear here (absent == direct, mirroring the dependency-side
+    # ``resolved_by is None`` convention). Kept OUT of ``mcp_configs`` values so
+    # it never pollutes config comparisons. Consistency diagnostics use this as
+    # ownership context only; provenance never exempts a lock-only server.
+    mcp_config_provenance: dict[str, str] = field(default_factory=dict)
     lsp_servers: list[str] = field(default_factory=list)
     lsp_configs: dict[str, dict] = field(default_factory=dict)
     local_deployed_files: list[str] = field(default_factory=list)
     local_deployed_file_hashes: dict[str, str] = field(default_factory=dict)
+    deployment_ledger: DeploymentLedger = field(
+        default_factory=lambda: DeploymentLedger(records={})
+    )
+    _deployments_present: bool = field(default=False, repr=False, compare=False)
+    _mcp_target_servers_present: bool = field(default=False, repr=False, compare=False)
 
     def add_dependency(self, dep: LockedDependency) -> None:
         """Add a dependency to the lock file.
@@ -288,6 +372,10 @@ class LockFile:
         """
         dep.deployed_files = _dedupe_preserving_order(dep.deployed_files)
         self.dependencies[dep.get_unique_key()] = dep
+        if dep.deployed_files or dep.deployed_file_hashes:
+            from ..core.deployment_ledger import DeploymentLedgerCodec
+
+            DeploymentLedgerCodec.invalidate_legacy_projection(self)
         if self.lockfile_version == "1" and (
             dep.source == "registry" or dep.constraint or dep.resolved_tag or dep.resolved_at
         ):
@@ -296,6 +384,12 @@ class LockFile:
     def get_dependency(self, key: str) -> LockedDependency | None:
         """Get a dependency by its unique key."""
         return self.dependencies.get(key)
+
+    def rename_local_deployed_path(self, old_value: str, new_value: str) -> None:
+        """Rename one locally deployed path and carry its content hash."""
+        from ..core.deployment_ledger import DeploymentLedgerCodec
+
+        DeploymentLedgerCodec.rename_local_deployed_path(self, old_value, new_value)
 
     def has_dependency(self, key: str) -> bool:
         """Check if a dependency exists."""
@@ -328,6 +422,11 @@ class LockFile:
 
     def to_yaml(self) -> str:
         """Serialize to YAML string."""
+        from ..core.deployment_ledger import DeploymentLedgerCodec
+
+        if not self.deployment_ledger.records:
+            self.deployment_ledger = DeploymentLedgerCodec.from_lockfile(self)
+        DeploymentLedgerCodec.apply_to_lockfile(self.deployment_ledger, self)
         # Opportunistic v1<->v2 derivation (design §6.1, invariant §2.1.4):
         # the lockfile_version field always reflects current content at
         # emit time. ``add_dependency`` bumps to "2" eagerly, but callers
@@ -349,10 +448,18 @@ class LockFile:
             if self.apm_version:
                 data["apm_version"] = self.apm_version
             data["dependencies"] = [dep.to_dict() for dep in self.get_all_dependencies()]
+            data["deployments"] = DeploymentLedgerCodec.rows(self.deployment_ledger)
             if self.mcp_servers:
                 data["mcp_servers"] = sorted(self.mcp_servers)
             if self.mcp_configs:
                 data["mcp_configs"] = dict(sorted(self.mcp_configs.items()))
+            if self.mcp_target_servers:
+                data["mcp_target_servers"] = {
+                    target: sorted(servers)
+                    for target, servers in sorted(self.mcp_target_servers.items())
+                }
+            if self.mcp_config_provenance:
+                data["mcp_config_provenance"] = dict(sorted(self.mcp_config_provenance.items()))
             if self.lsp_servers:
                 data["lsp_servers"] = sorted(self.lsp_servers)
             if self.lsp_configs:
@@ -373,11 +480,17 @@ class LockFile:
     @classmethod
     def from_yaml(cls, yaml_str: str) -> LockFile:
         """Deserialize from YAML string."""
-        data = yaml.safe_load(yaml_str)
-        if not data:
-            return cls()
-        if not isinstance(data, dict):
-            return cls()
+        from ..utils.yaml_io import load_yaml_str
+
+        # Bounded loader: an untrusted bundle apm.lock.yaml cannot wedge the
+        # parser with a merge-key bomb (the surrounding LockFile.read guard
+        # cannot catch a non-terminating safe_load loop -- it can catch the
+        # YAMLError this raises instead).
+        try:
+            loaded = load_yaml_str(yaml_str)
+        except (yaml.YAMLError, ValueError) as exc:
+            raise LockfileFormatError(f"Invalid lockfile YAML: {exc}") from exc
+        data = _validate_lockfile_container(loaded)
         lock = cls(
             lockfile_version=data.get("lockfile_version", "1"),
             generated_at=data.get("generated_at", ""),
@@ -387,6 +500,12 @@ class LockFile:
             lock.add_dependency(LockedDependency.from_dict(dep_data))
         lock.mcp_servers = list(data.get("mcp_servers", []))
         lock.mcp_configs = dict(data.get("mcp_configs") or {})
+        lock.mcp_target_servers = {
+            target: list(servers)
+            for target, servers in (data.get("mcp_target_servers") or {}).items()
+        }
+        lock._mcp_target_servers_present = "mcp_target_servers" in data
+        lock.mcp_config_provenance = dict(data.get("mcp_config_provenance") or {})
         lock.lsp_servers = list(data.get("lsp_servers", []))
         lock.lsp_configs = dict(data.get("lsp_configs") or {})
         lock.local_deployed_files = list(data.get("local_deployed_files", []))
@@ -404,11 +523,23 @@ class LockFile:
                 deployed_files=list(lock.local_deployed_files),
                 deployed_file_hashes=dict(lock.local_deployed_file_hashes),
             )
+        from ..core.deployment_ledger import DeploymentLedgerCodec
+
+        if "deployments" in data:
+            deployment_rows = data["deployments"]
+            lock.deployment_ledger = DeploymentLedgerCodec.from_rows(deployment_rows)
+            lock._deployments_present = isinstance(deployment_rows, list) and (
+                not deployment_rows or bool(lock.deployment_ledger.records)
+            )
+        else:
+            lock.deployment_ledger = DeploymentLedgerCodec.from_lockfile(lock)
         return lock
 
     def write(self, path: Path) -> None:
         """Write lock file to disk."""
-        path.write_text(self.to_yaml(), encoding="utf-8")
+        from ..utils.atomic_io import atomic_write_text
+
+        atomic_write_text(path, self.to_yaml())
 
     @classmethod
     def read(cls, path: Path) -> LockFile | None:
@@ -417,8 +548,10 @@ class LockFile:
             return None
         try:
             return cls.from_yaml(path.read_text(encoding="utf-8"))
-        except (yaml.YAMLError, ValueError, KeyError):
-            return None
+        except (LockfileFormatError, UnsupportedLockfileVersionError):
+            raise
+        except (yaml.YAMLError, ValueError, KeyError, TypeError) as exc:
+            raise LockfileFormatError(f"Invalid lockfile at {path}: {exc}") from exc
 
     @classmethod
     def load_or_create(cls, path: Path) -> LockFile:
@@ -482,6 +615,8 @@ class LockFile:
                 registry_config=registry_config,
                 registry_resolution=registry_resolution,
                 git_semver_resolution=git_semver_resolution,
+                package_name=getattr(entry, "package_name", None),
+                package_version=getattr(entry, "package_version", None),
             )
             lock.add_dependency(locked_dep)
 
@@ -530,24 +665,33 @@ class LockFile:
         """
         if self.lockfile_version != other.lockfile_version:
             return False
-        if set(self.dependencies.keys()) != set(other.dependencies.keys()):
+        self_dependency_keys = set(self.dependencies).difference({_SELF_KEY})
+        other_dependency_keys = set(other.dependencies).difference({_SELF_KEY})
+        if self_dependency_keys != other_dependency_keys:
             return False
-        for key, dep in self.dependencies.items():
+        for key in self_dependency_keys:
+            dep = self.dependencies[key]
             other_dep = other.dependencies[key]
             if dep.to_dict() != other_dep.to_dict():
                 return False
-        if sorted(self.mcp_servers) != sorted(other.mcp_servers):
+        if (
+            sorted(self.mcp_servers) != sorted(other.mcp_servers)
+            or self.mcp_configs != other.mcp_configs
+            or self.mcp_target_servers != other.mcp_target_servers
+        ):
             return False
-        if self.mcp_configs != other.mcp_configs:
+        if (
+            dict(self.deployment_ledger.records) != dict(other.deployment_ledger.records)
+            or self.mcp_config_provenance != other.mcp_config_provenance
+        ):
             return False
-        if sorted(self.lsp_servers) != sorted(other.lsp_servers):
-            return False
-        if self.lsp_configs != other.lsp_configs:
+        if (
+            sorted(self.lsp_servers) != sorted(other.lsp_servers)
+            or self.lsp_configs != other.lsp_configs
+        ):
             return False
         # Issue #887: include hash dict in equivalence so post-install
         # hash updates persist even when the file list is unchanged.
-        # Combine the last two comparisons into a single return to keep
-        # PLR0911 (too many return statements) satisfied.
         return sorted(self.local_deployed_files) == sorted(other.local_deployed_files) and dict(
             self.local_deployed_file_hashes
         ) == dict(other.local_deployed_file_hashes)
@@ -577,7 +721,7 @@ class LockFile:
             if not lockfile:
                 return []
             return lockfile.get_installed_paths(project_root / "apm_modules")
-        except (FileNotFoundError, yaml.YAMLError, ValueError, KeyError):
+        except (FileNotFoundError, yaml.YAMLError, ValueError, KeyError, LockfileFormatError):
             return []
 
 

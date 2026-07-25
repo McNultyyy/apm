@@ -32,7 +32,11 @@ All subcommands operate on the project scope (`./apm_modules/`) by default. Pass
 
 ### `apm deps list`
 
-List installed dependencies and the primitive counts each one contributes.
+List every installed dependency recorded by the manifest or lockfile and the
+primitive counts each one contributes. Manifests embedded anywhere inside an
+installed package's source tree are parent-owned content, not separate
+dependencies. Real lockfile-resolved dependencies install at their own package
+roots and remain visible regardless of graph depth.
 
 ```bash
 apm deps list [OPTIONS]
@@ -46,7 +50,12 @@ apm deps list [OPTIONS]
 
 ### `apm deps tree`
 
-Render the dependency graph as a hierarchical tree, using `apm.lock.yaml` when present and falling back to a scan of `apm_modules/`.
+Render the complete dependency graph as a hierarchical tree, following
+`resolved_by` relationships at every lockfile depth. When no lockfile is
+present, the command falls back to a scan of `apm_modules/` and ignores
+parent-owned manifests embedded inside an installed package. Circular
+relationships are marked `(circular)` at the repeated ancestor and do not
+prevent other branches from rendering.
 
 ```bash
 apm deps tree [OPTIONS]
@@ -107,7 +116,7 @@ apm deps update [PACKAGES...] [OPTIONS]
 |---|---|
 | `-v, --verbose` | Show detailed update information. |
 | `--force` | Overwrite locally-authored files on collision. |
-| `-t, --target` | Force deployment to specific targets. Comma-separated. Values: `copilot`, `claude`, `cursor`, `opencode`, `codex`, `gemini`, `windsurf`, `kiro`, `agent-skills`, `all`. `copilot-cowork` is also accepted when its experimental flag is enabled. `agent-skills` deploys to `.agents/skills/` (cross-client). `all` covers every per-client target but excludes `agent-skills`; combine to get both. |
+| `-t, --target` | Force deployment to specific targets. Comma-separated. Values: `copilot`, `claude`, `cursor`, `opencode`, `codex`, `gemini`, `antigravity`, `windsurf`, `kiro`, `agent-skills`, `all`. `copilot-cowork` is also accepted when its experimental flag is enabled. `agent-skills` and `antigravity` are explicit-only and excluded from `all`; combine them with `all` when needed. |
 | `--parallel-downloads N` | Max concurrent downloads. Default `4`. `0` disables parallelism. |
 | `-g, --global` | Update user-scope dependencies in `~/.apm/`. |
 | `--legacy-skill-paths` | Deploy skill files to per-client paths (`.cursor/skills/`, etc.) instead of the shared `.agents/skills/` directory. |

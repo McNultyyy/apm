@@ -9,6 +9,7 @@ No module-level import of resolver.py (cycle-safe).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
@@ -22,6 +23,8 @@ from ..utils.github_host import (
 if TYPE_CHECKING:
     from ..models.dependency.reference import DependencyReference
     from .models import MarketplacePlugin, MarketplaceSource
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +206,7 @@ def _source_needs_explicit_git_path(source: MarketplaceSource) -> bool:
     kind = source.kind
     if kind == "github":
         return False
-    if kind in ("gitlab", "git"):
+    if kind in ("gitlab", "git", "ado"):
         return True
     # Fall back to legacy host-based behaviour for any kind we don't recognise
     return _marketplace_host_needs_explicit_git_path(source.host)
@@ -340,3 +343,68 @@ def _compute_cross_repo_misconfig_risk(
         bare_repo_field=bare,
         suggested_qualified_repo=f"{source.host}/{bare}",
     )
+
+
+# ---------------------------------------------------------------------------
+# Auth and packed-source helpers (ported from resolver.py)
+# ---------------------------------------------------------------------------
+
+
+def _dependency_reference_from_packed_source(
+    plugin: MarketplacePlugin,
+) -> DependencyReference | None:
+    """Parse producer-emitted remote source objects through the reference owner.
+
+    Returns ``None`` for non-URL source shapes so callers fall back to the
+    existing string-projection path.
+    """
+    from ..models.dependency.reference import DependencyReference
+
+    source = plugin.source
+    if not isinstance(source, dict):
+        return None
+
+    source_type = _coerce_dict_plugin_type(source)
+    if source_type == "url" or (source_type == "git-subdir" and not source.get("repo")):
+        remote = source.get("url")
+    else:
+        return None
+    if not isinstance(remote, str) or not remote.strip():
+        return None
+
+    entry: dict[str, object] = {"git": remote.strip()}
+    if source_type == "git-subdir":
+        path = source.get("subdir", "") or source.get("path", "")
+        if path:
+            entry["path"] = path
+    declared_ref = source.get("ref")
+    if declared_ref:
+        entry["ref"] = declared_ref
+    dependency = DependencyReference.parse_from_dict(entry)
+    if dependency.is_local:
+        raise ValueError(
+            f"{source_type} source '{remote}' resolves to a local path, not a Git coordinate."
+        )
+    return dependency
+
+
+def _extract_auth(
+    auth_resolver: object | None, host: str, org: str | None = None
+) -> tuple[str | None, str]:
+    """Extract the token and auth scheme from the auth resolver for the given host."""
+    if auth_resolver is None:
+        return None, "basic"
+    try:
+        ctx = auth_resolver.resolve(host, org=org)  # type: ignore[union-attr]
+        if ctx is None or not ctx.token:
+            return None, "basic"
+        return ctx.token, ctx.auth_scheme
+    except Exception as exc:
+        logger.debug("Could not extract auth for host '%s': %s", host, type(exc).__name__)
+        return None, "basic"
+
+
+def _extract_token(auth_resolver: object | None, host: str, org: str | None = None) -> str | None:
+    """Compatibility wrapper -- returns only the token."""
+    token, _ = _extract_auth(auth_resolver, host, org)
+    return token

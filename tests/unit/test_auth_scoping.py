@@ -141,7 +141,7 @@ class TestBuildRepoUrlTokenScoping:
             url = dl._build_repo_url("acme/rules", use_ssh=False, dep_ref=dep)
         assert "ghp_SHOULD_NOT_LEAK" not in url
         assert "oauth2" not in url
-        assert url == "https://gitlab.com/acme/rules"
+        assert url == "https://gitlab.com/acme/rules.git"
 
     def test_bitbucket_does_not_get_github_token(self):
         dl = _make_downloader(github_token="ghp_TESTTOKEN")
@@ -766,6 +766,31 @@ class TestParseFromDict:
     def test_empty_alias_field(self):
         with pytest.raises(ValueError, match="'alias' field"):
             DependencyReference.parse_from_dict({"git": "https://gitlab.com/a/b.git", "alias": ""})
+
+    @pytest.mark.parametrize("field", ("alais", "resolved_commit", "version"))
+    def test_remote_git_rejects_unknown_fields(self, field: str) -> None:
+        expected = (
+            "Git dependency field 'version' is unsupported; use 'ref' for a branch, tag, or commit"
+            if field == "version"
+            else r"Unsupported field\(s\) for git dependency"
+        )
+        with pytest.raises(ValueError, match=expected):
+            DependencyReference.parse_from_dict(
+                {
+                    "git": "git@gitlab.com:acme/rules.git",
+                    field: "unexpected",
+                }
+            )
+
+    def test_remote_git_rejects_mixed_registry_discriminator(self) -> None:
+        with pytest.raises(ValueError, match="cannot mix"):
+            DependencyReference.parse_from_dict(
+                {
+                    "git": "git@gitlab.com:acme/rules.git",
+                    "registry": "corp",
+                    "id": "rules",
+                }
+            )
 
 
 # ===========================================================================

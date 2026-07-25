@@ -162,12 +162,20 @@ def _gh_contents_api(
     try:
         if verbose_callback and not is_github_host:
             verbose_callback(f"Trying Contents API on {host}: {api_url}")
-        response = delegate._host._resilient_get(api_url, headers=headers, timeout=30)
+        response = delegate._host._resilient_get(
+            api_url, headers=headers, timeout=30, retry_throttles=not is_github_host
+        )
         response.raise_for_status()
         if verbose_callback:
             verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
         return delegate._extract_contents_api_payload(response, is_github_host)
     except requests.exceptions.HTTPError as e:
+        if is_github_host and e.response is not None:
+            from apm_cli.deps.github_rate_limit import github_throttle_error as _gte
+
+            _throttle = _gte(e.response, host)
+            if _throttle is not None:
+                raise _throttle from e
         if e.response.status_code == 404:
             return _gh_handle_404(
                 delegate,
@@ -254,12 +262,20 @@ def _gh_handle_404(
 
     for fallback_url in fallback_url_candidates:
         try:
-            response = delegate._host._resilient_get(fallback_url, headers=headers, timeout=30)
+            response = delegate._host._resilient_get(
+                fallback_url, headers=headers, timeout=30, retry_throttles=not is_github_host
+            )
             response.raise_for_status()
             if verbose_callback:
                 verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
             return delegate._extract_contents_api_payload(response, is_github_host)
         except requests.exceptions.HTTPError as fe:
+            if is_github_host and fe.response is not None:
+                from apm_cli.deps.github_rate_limit import github_throttle_error as _gte
+
+                _throttle = _gte(fe.response, host)
+                if _throttle is not None:
+                    raise _throttle from fe
             if fe.response.status_code != 404:
                 raise RuntimeError(  # noqa: B904
                     f"Failed to download {file_path}: HTTP {fe.response.status_code}"
@@ -278,6 +294,110 @@ def _gh_handle_404(
     )
 
 
+def _download_gitlab_file_via_git_impl(
+    delegate,
+    dep_ref: "DependencyReference",
+    file_path: str,
+    ref: str,
+) -> bytes:
+    """Implementation of GitLab path: file fetch via reusable sparse checkout."""
+    import os
+
+    from apm_cli.deps import download_strategies as _ds
+
+    key = delegate._git_file_transport_key(dep_ref, ref)
+    with delegate._git_file_transports_lock:
+        transport = delegate._git_file_transports.get(key)
+        if transport is None:
+            git_env = {**os.environ, **(delegate._host.git_env or {})}
+            transport_factory = delegate._git_file_transport_factory or _ds.GitSparseFileTransport
+            transport = transport_factory(
+                dep_ref,
+                ref,
+                build_repo_url_fn=delegate.build_repo_url,
+                git_env=git_env,
+            )
+            delegate._git_file_transports[key] = transport
+    try:
+        return transport.fetch_file(file_path)
+    except _ds.GitFileTransportError:
+        delegate._discard_git_file_transport(key)
+        raise
+
+
+def _download_github_file_via_git_impl(
+    delegate,
+    dep_ref: "DependencyReference",
+    file_path: str,
+    ref: str,
+):
+    """Fetch a GitHub virtual file via sparse-Git transport (throttle fallback path)."""
+    from apm_cli.deps import download_strategies as _ds
+    from apm_cli.utils.github_host import build_authorization_header_git_env
+
+    key = delegate._git_file_transport_key(dep_ref, ref)
+    auth_ctx = delegate._host.auth_resolver.resolve_for_dep(dep_ref)
+    if auth_ctx.token:
+        git_env = {
+            **auth_ctx.git_env,
+            **build_authorization_header_git_env("Bearer", auth_ctx.token),
+        }
+        git_env.pop("GIT_TOKEN", None)
+        auth_scheme = "basic"
+    else:
+        git_env = delegate._host._build_noninteractive_git_env()
+        auth_scheme = "basic"
+
+    def _tokenless_repo_url(repo_ref: str, *, dep_ref: "DependencyReference") -> str:
+        return delegate.build_repo_url(
+            repo_ref,
+            dep_ref=dep_ref,
+            token="",
+            auth_scheme=auth_scheme,
+        )
+
+    with delegate._git_file_transports_lock:
+        transport = delegate._git_file_transports.get(key)
+        if transport is None:
+            transport_factory = delegate._git_file_transport_factory or _ds.GitSparseFileTransport
+            transport = transport_factory(
+                dep_ref,
+                ref,
+                build_repo_url_fn=_tokenless_repo_url,
+                git_env=git_env,
+            )
+            delegate._git_file_transports[key] = transport
+    try:
+        return transport.fetch_file_with_commit(file_path)
+    except _ds.GitFileTransportError:
+        delegate._discard_git_file_transport(key)
+        raise
+
+
+def download_github_file_via_throttle_fallback_impl(
+    delegate,
+    dep_ref: "DependencyReference",
+    file_path: str,
+    ref: str,
+    throttle,
+):
+    """Sparse-Git fallback when a confirmed GitHub throttle fires."""
+    from apm_cli.deps import download_strategies as _ds
+
+    if dep_ref.is_insecure:
+        raise RuntimeError(
+            f"{throttle}; sparse Git fallback is unavailable for insecure HTTP dependencies"
+        )
+    try:
+        return delegate._download_github_file_via_git(dep_ref, file_path, ref)
+    except _ds.GitFileTransportError as exc:
+        raise RuntimeError(
+            f"{throttle}; sparse Git transport failed: {exc}. "
+            "Retry after GitHub quota recovery; for private repositories, "
+            "verify GITHUB_APM_PAT can read the repository."
+        ) from exc
+
+
 def _gh_handle_auth_error(
     delegate,
     e,
@@ -292,26 +412,20 @@ def _gh_handle_auth_error(
     verbose_callback,
 ) -> bytes:
     """Handle a Contents-API 401/403: rate-limit vs auth, with unauth retry."""
-    # Distinguish rate limiting from auth failure. X-RateLimit-* headers are
-    # GitHub-specific; treat as rate-limit only when host is GitHub family.
-    is_rate_limit = False
-    if is_github_host:
-        try:
-            rl_remaining = e.response.headers.get("X-RateLimit-Remaining")
-            if rl_remaining is not None and int(rl_remaining) == 0:
-                is_rate_limit = True
-        except (TypeError, ValueError):
-            pass
+    from apm_cli.deps.github_rate_limit import github_throttle_error
 
-    if is_rate_limit:
-        raise RuntimeError(_gh_rate_limit_msg(delegate, host, owner, dep_ref, token)) from e
+    throttle = github_throttle_error(e.response, "GitHub API") if is_github_host else None
+    if throttle is not None:
+        raise throttle from e
 
     # Retry without auth -- the repo might be public. GHES/GHE-DR don't
     # support unauthenticated org-scoped retries.
     if token and is_github_host and not host.lower().endswith(".ghe.com"):
         try:
             unauth_headers: dict[str, str] = {"Accept": "application/vnd.github.v3.raw"}
-            response = delegate._host._resilient_get(api_url, headers=unauth_headers, timeout=30)
+            response = delegate._host._resilient_get(
+                api_url, headers=unauth_headers, timeout=30, retry_throttles=False
+            )
             response.raise_for_status()
             if verbose_callback:
                 verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")

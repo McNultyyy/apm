@@ -68,11 +68,19 @@ from .identity import (
 from .identity import (
     build_dependency_unique_key as build_dependency_unique_key,
 )
+from .identity import normalize_package_repo_url
+from .object_fields import local_path_apm_yml_entry
+from .provider_coordinates import ProviderCoordinateMixin
 from .types import VirtualPackageType
 
 
 @dataclass
-class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceShorthandMixin):
+class DependencyReference(
+    ProviderCoordinateMixin,
+    _ReferenceParseMixin,
+    _ReferenceUrlMixin,
+    _ReferenceShorthandMixin,
+):
     """Represents a reference to an APM dependency."""
 
     repo_url: str  # e.g., "user/repo" for GitHub or "org/project/repo" for Azure DevOps
@@ -95,6 +103,8 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
     # Local path dependency fields
     is_local: bool = False  # True if this is a local filesystem dependency
     local_path: str | None = None  # Original local path string (e.g., "./packages/my-pkg")
+    declaring_parent: str | None = None
+    anchored_local_path: str | None = None
 
     # Monorepo inheritance: { git: parent, path: ... } -- expanded in resolver
     is_parent_repo_inheritance: bool = False
@@ -107,6 +117,7 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
 
     # SKILL_BUNDLE subset selection (persisted in apm.yml `skills:` field)
     skill_subset: list[str] | None = None  # Sorted skill names, or None = all
+    target_subset: list[str] | None = None  # Sorted lowercase target names, or None = all
 
     # SSH username for SCP-shorthand or ``ssh://`` dependencies. ``None`` for
     # non-SSH inputs. Defaults to ``"git"`` whenever an SSH form was parsed
@@ -134,6 +145,17 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
     marketplace_name: str | None = None
     marketplace_plugin_name: str | None = None
     marketplace_version_spec: str | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize case-insensitive package identity at the model boundary."""
+        self.repo_url = normalize_package_repo_url(
+            self.repo_url,
+            host=self.host,
+            source=self.source,
+            registry_prefix=self.artifactory_prefix,
+            is_local=self.is_local,
+            is_marketplace=self.is_marketplace,
+        )
 
     @property
     def ref_kind(self) -> str | None:
@@ -181,7 +203,6 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
     VIRTUAL_FILE_EXTENSIONS = (
         ".prompt.md",
         ".instructions.md",
-        ".chatmode.md",
         ".agent.md",
     )
 
@@ -206,7 +227,6 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
             "agents",
             "prompts",
             "instructions",
-            "chatmodes",
             "collections",
             "contexts",
             "memory",
@@ -223,12 +243,27 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
 
         return self.host is not None and is_azure_devops_hostname(self.host)
 
+    @classmethod
+    def canonical_ado_coordinates(
+        cls,
+        host: str | None,
+        repo_url: str,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return canonical ADO coordinates for a host and repository path."""
+        from ...utils.github_host import is_azure_devops_hostname
+
+        return (
+            cls._validate_final_repo_fields(host, repo_url)
+            if host and is_azure_devops_hostname(host)
+            else (None, None, None)
+        )
+
     @property
     def virtual_type(self) -> "VirtualPackageType | None":
         """Return the type of virtual package, or None if not virtual.
 
         Classification is by extension only -- never by path segment.
-        ``.prompt.md``/``.instructions.md``/``.chatmode.md``/``.agent.md``
+        ``.prompt.md``/``.instructions.md``/``.agent.md``
         is FILE; everything else is SUBDIRECTORY (resolved at fetch time
         by probing for ``apm.yml``, ``SKILL.md``, ``plugin.json``, etc).
         Paths like ``collections/foo`` (no extension) are SUBDIRECTORY.
@@ -247,14 +282,7 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
         """Check if this is a virtual subdirectory package (e.g., Claude Skill).
 
         A subdirectory package is a virtual package whose ``virtual_path``
-        does not end in a recognized FILE extension. The actual on-disk
-        shape is resolved at fetch time -- ``apm.yml``, ``SKILL.md``,
-        ``plugin.json``, etc.
-
-        Examples:
-            - ComposioHQ/awesome-claude-skills/brand-guidelines -> True
-            - owner/repo/prompts/file.prompt.md -> False (is_virtual_file)
-            - owner/repo/collections/name -> True (resolved at fetch time)
+        does not end in a recognised FILE extension. Resolved at fetch time.
         """
         return self.virtual_type == VirtualPackageType.SUBDIRECTORY
 
@@ -324,7 +352,21 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
             is_virtual=self.is_virtual,
             virtual_path=self.virtual_path,
             registry_prefix=self.artifactory_prefix,
+            declaring_parent=self.declaring_parent,
+            anchored_local_path=self.anchored_local_path,
         )
+
+    def get_resolution_key(self) -> str:
+        """Return identity plus the declared ref constraint."""
+        if self.reference:
+            return f"{self.get_unique_key()}#{self.reference}"
+        return self.get_unique_key()
+
+    def get_cycle_key(self) -> str:
+        """Return physical local identity for recursion detection."""
+        if self.is_local and self.anchored_local_path:
+            return f"local:{self.anchored_local_path}"
+        return self.get_unique_key()
 
     def to_canonical(self) -> str:
         """Return the canonical scheme-free identity string for this dependency.
@@ -438,21 +480,6 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
 
         This is the single source of truth for where a package lives in apm_modules/.
 
-        For regular packages:
-            - GitHub: apm_modules/owner/repo/
-            - ADO: apm_modules/org/project/repo/
-
-        For virtual file/collection packages:
-            - GitHub: apm_modules/owner/<virtual-package-name>/
-            - ADO: apm_modules/org/project/<virtual-package-name>/
-
-        For subdirectory packages (Claude Skills, nested APM packages):
-            - GitHub: apm_modules/owner/repo/subdir/path/
-            - ADO: apm_modules/org/project/repo/subdir/path/
-
-        For local packages:
-            - apm_modules/_local/<directory-name>/
-
         Args:
             apm_modules_dir: Path to the apm_modules directory
 
@@ -475,7 +502,14 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
                 context="local package path",
                 reject_empty=True,
             )
-            result = apm_modules_dir / "_local" / pkg_dir_name
+            if self.declaring_parent:
+                import hashlib
+
+                identity = self.anchored_local_path or self.local_path
+                parent_slot = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+                result = apm_modules_dir / "_local" / parent_slot / pkg_dir_name
+            else:
+                result = apm_modules_dir / "_local" / pkg_dir_name
             ensure_path_within(result, apm_modules_dir)
             return result
 
@@ -647,12 +681,15 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
     def to_apm_yml_entry(self):
         """Return the entry to store in apm.yml.
 
-        For HTTP (insecure) deps, returns a dict with 'git' and 'allow_insecure' keys.
-        For deps with skill_subset, returns a dict with 'git' and 'skills' keys.
-        For all other deps, returns the canonical string (same as to_canonical()).
+        - Local path deps with optional fields: returns a dict with 'path'.
+        - HTTP (insecure) git deps: returns a dict with 'git' and 'allow_insecure' keys.
+        - Git deps with skill_subset or target_subset: returns a dict with 'git' plus
+          the applicable optional keys.
+        - All other deps: returns the canonical string (same as to_canonical()).
 
         Returns:
-            str or dict: String for simple deps; dict for HTTP or skill-subset deps.
+            str or dict: String for simple deps; dict for local-with-subsets, HTTP, or
+            skill/target-subset deps.
 
         Raises:
             ValueError: If this is an unresolved marketplace dependency.
@@ -662,9 +699,19 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
                 f"Cannot serialize unresolved marketplace dependency "
                 f"'{self.marketplace_plugin_name}@{self.marketplace_name}'"
             )
+        if self.is_local and self.local_path:
+            if self.skill_subset or self.target_subset or self.alias:
+                return local_path_apm_yml_entry(
+                    self.local_path,
+                    self.alias,
+                    self.skill_subset,
+                    self.target_subset,
+                )
+            return self.to_canonical()
         if self.is_insecure:
             host = self.host or default_host()
-            entry = {"git": f"http://{host}/{self.repo_url}"}
+            netloc = f"{host}:{self.port}" if self.port else host
+            entry = {"git": f"http://{netloc}/{self.repo_url}"}
             if self.reference:
                 entry["ref"] = self.reference
             if self.alias:
@@ -672,41 +719,41 @@ class DependencyReference(_ReferenceParseMixin, _ReferenceUrlMixin, _ReferenceSh
             entry["allow_insecure"] = self.allow_insecure
             if self.skill_subset:
                 entry["skills"] = sorted(self.skill_subset)
+            if self.target_subset:
+                entry["targets"] = sorted(self.target_subset)
             return entry
-        if self.skill_subset:
+        if self.skill_subset or self.target_subset:
             entry = {"git": self.get_identity()}
             if self.reference:
                 entry["ref"] = self.reference
             if self.alias:
                 entry["alias"] = self.alias
-            entry["skills"] = sorted(self.skill_subset)
+            if self.skill_subset:
+                entry["skills"] = sorted(self.skill_subset)
+            if self.target_subset:
+                entry["targets"] = sorted(self.target_subset)
             return entry
         return self.to_canonical()
 
     def to_github_url(self) -> str:
-        """Convert to full repository URL.
-
-        For Azure DevOps, generates: https://dev.azure.com/org/project/_git/repo
-        For GitHub, generates: https://github.com/owner/repo
-        For local packages, returns the local path.
-        """
+        """Convert to the canonical repository URL, or return a local path."""
         if self.is_local and self.local_path:
             return self.local_path
 
         host = self.host or default_host()
         netloc = f"{host}:{self.port}" if self.port else host
-
         scheme = "http" if self.is_insecure else "https"
-
         if self.is_azure_devops():
-            # ADO format: https://dev.azure.com/org/project/_git/repo
-            project = urllib.parse.quote(self.ado_project, safe="")
-            repo = urllib.parse.quote(self.ado_repo, safe="")
-            return f"https://{netloc}/{self.ado_organization}/{project}/_git/{repo}"
+            self.validate_provider_coordinates()
+            organization = self.ado_organization
+            ado_project = self.ado_project
+            ado_repo = self.ado_repo
+            project = urllib.parse.quote(ado_project, safe="")
+            repo = urllib.parse.quote(ado_repo, safe="")
+            return f"https://{netloc}/{organization}/{project}/_git/{repo}"
         elif self.artifactory_prefix:
             return f"{scheme}://{netloc}/{self.artifactory_prefix}/{self.repo_url}"
         else:
-            # Git host format: https://github.com/owner/repo
             return f"{scheme}://{netloc}/{self.repo_url}"
 
     def to_clone_url(self) -> str:

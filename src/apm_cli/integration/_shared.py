@@ -6,19 +6,32 @@ Extracted to satisfy the R0801 (duplicate-code) lint gate.
 from __future__ import annotations
 
 import builtins
+from dataclasses import dataclass
 from pathlib import Path
 
 from apm_cli.deps.lockfile import LockFile
 from apm_cli.runtime.utils import find_runtime_binary
 
 
-def _hermes_runtime_opted_in() -> bool:
+@dataclass(frozen=True)
+class _RegistryDepGroup:
+    """One group of registry deps sharing a single target registry endpoint."""
+
+    deps: list
+    names: list
+    dep_map: dict
+
+
+def _hermes_runtime_opted_in(_find_binary=None) -> bool:
     """Return ``True`` when Hermes MCP writes are opted into.
 
     Gate: the ``hermes`` experimental flag is enabled AND Hermes is actually
     present on the host (its home dir exists, or the ``hermes`` binary is on
     PATH).  Prevents surprise writes to ``~/.hermes/`` on hosts where Hermes
     was never installed.  Any import/path error is treated as "not opted in".
+
+    ``_find_binary`` is injectable so callers (e.g. the install orchestrator)
+    can pass their own module-level reference and preserve monkeypatch seams.
     """
     try:
         from apm_cli.core.experimental import is_enabled
@@ -26,7 +39,8 @@ def _hermes_runtime_opted_in() -> bool:
 
         if not is_enabled("hermes"):
             return False
-        return resolve_hermes_root().is_dir() or find_runtime_binary("hermes") is not None
+        binary_fn = _find_binary if _find_binary is not None else find_runtime_binary
+        return resolve_hermes_root().is_dir() or binary_fn("hermes") is not None
     except (ImportError, ValueError):
         return False
 

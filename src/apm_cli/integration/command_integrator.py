@@ -12,28 +12,28 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import frontmatter
+import yaml
 
+from apm_cli.integration._command_integrator_input import (
+    _extract_input_names,
+    _is_valid_input_name,  # noqa: F401 -- re-exported; tests import from this module
+)
 from apm_cli.integration.base_integrator import BaseIntegrator, IntegrationResult
 from apm_cli.security.gate import BLOCK_POLICY, SecurityGate
+from apm_cli.utils.atomic_io import write_text_lf
 from apm_cli.utils.path_security import (
     PathTraversalError,
     ensure_path_within,
     validate_path_segments,
 )
 from apm_cli.utils.paths import portable_relpath
+from apm_cli.utils.yaml_io import load_frontmatter
 
 if TYPE_CHECKING:
     from apm_cli.integration.targets import TargetProfile
     from apm_cli.utils.diagnostics import DiagnosticCollector
 
 logger = logging.getLogger(__name__)
-
-
-# Allowlist for argument names extracted from package-supplied 'input:' front-matter.
-# Restricts to identifiers that are safe to embed in YAML frontmatter and in
-# Claude command bodies as $name placeholders. Rejects YAML-significant
-# characters (newline, colon, quote, etc.) to prevent frontmatter injection.
-_INPUT_NAME_RE = re.compile(r"^[A-Za-z][\w-]{0,63}$")
 
 
 # Frontmatter keys preserved (or consumed) by the shared claude_command
@@ -67,72 +67,6 @@ _PRESERVED_COMMAND_KEYS_DISPLAY = frozenset(
 )
 
 
-def _is_valid_input_name(name: str) -> bool:
-    """Return True if *name* is a safe argument identifier."""
-    return bool(_INPUT_NAME_RE.match(name))
-
-
-def _extract_input_names(
-    input_spec: Any,
-) -> tuple[list[str], list[str]]:
-    """Extract argument names from an APM 'input' front-matter value.
-
-    Handles both formats:
-      - Simple list:  input: [name, category]
-      - Object list:  input:
-                        - feature_name: "desc"
-                        - feature_description: "desc"
-
-    Args:
-        input_spec: The raw value of the 'input' front-matter key.
-
-    Returns:
-        Tuple[List[str], List[str]]: (valid names in order, rejected raw entries).
-        Names are accepted only if they match ``^[A-Za-z][\\w-]{0,63}$``;
-        anything else (empty/whitespace, YAML-significant chars, oversize) is
-        rejected and reported back so the caller can surface a warning.
-    """
-    valid: list[str] = []
-    rejected: list[str] = []
-
-    def _accept(candidate: Any) -> None:
-        if not isinstance(candidate, str):
-            rejected.append(repr(candidate))
-            return
-        stripped = candidate.strip()
-        if not stripped:
-            return  # silently drop pure-whitespace entries
-        if _is_valid_input_name(stripped):
-            valid.append(stripped)
-        else:
-            rejected.append(stripped)
-
-    if input_spec is None:
-        return valid, rejected
-
-    if isinstance(input_spec, list):
-        for item in input_spec:
-            if isinstance(item, str):
-                _accept(item)
-            elif isinstance(item, dict):
-                for k in item.keys():  # noqa: SIM118
-                    _accept(k)
-            else:
-                rejected.append(repr(item))
-        return valid, rejected
-
-    if isinstance(input_spec, str):
-        _accept(input_spec)
-        return valid, rejected
-
-    if isinstance(input_spec, dict):
-        for k in input_spec.keys():  # noqa: SIM118
-            _accept(k)
-        return valid, rejected
-
-    return valid, rejected
-
-
 # Re-export for backward compat (tests import CommandIntegrationResult)
 CommandIntegrationResult = IntegrationResult
 
@@ -143,6 +77,9 @@ class CommandIntegrator(BaseIntegrator):
     Transforms .prompt.md files into Claude Code custom slash commands
     during package installation, following the same pattern as PromptIntegrator.
     """
+
+    # Deploys via write_text_lf -> compare adopt candidates in LF mode.
+    _LF_NORMALIZED_DEPLOY = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -201,7 +138,7 @@ class CommandIntegrator(BaseIntegrator):
         """
         warnings: list[str] = []
 
-        post = frontmatter.load(source)
+        post = load_frontmatter(source)
 
         # Extract command name from filename
         filename = source.name
@@ -522,7 +459,7 @@ class CommandIntegrator(BaseIntegrator):
             try:
                 from apm_cli.integration.prompt_integrator import _is_workflow_shape
 
-                _meta = frontmatter.load(str(prompt_file)).metadata
+                _meta = load_frontmatter(str(prompt_file)).metadata
             except Exception:
                 _meta = {}
             if _is_workflow_shape(_meta):
@@ -579,7 +516,19 @@ class CommandIntegrator(BaseIntegrator):
                 continue
 
             if mapping.format_id == "gemini_command":
-                self._write_gemini_command(prompt_file, target_path)
+                try:
+                    self._write_gemini_command(prompt_file, target_path)
+                except yaml.YAMLError as exc:
+                    if diagnostics is not None:
+                        diagnostics.warn(
+                            message=(
+                                f"Skipped command {prompt_file.name}: malformed or "
+                                f"over-budget YAML frontmatter ({exc})."
+                            ),
+                            package=getattr(getattr(package_info, "package", None), "name", ""),
+                        )
+                    files_skipped += 1
+                    continue
                 links_resolved = 0
                 written = True
                 had_dropped = False
@@ -589,14 +538,33 @@ class CommandIntegrator(BaseIntegrator):
                 # target-agnostic (no Claude branding for Cursor
                 # installs).  See the cursor-command-format TODO on
                 # KNOWN_TARGETS["cursor"]["commands"] in targets.py.
-                links_resolved, written, had_dropped = self.integrate_command(
-                    prompt_file,
-                    target_path,
-                    package_info,
-                    prompt_file,
-                    diagnostics=diagnostics,
-                    target_name=target.name,
-                )
+                try:
+                    links_resolved, written, had_dropped = self.integrate_command(
+                        prompt_file,
+                        target_path,
+                        package_info,
+                        prompt_file,
+                        diagnostics=diagnostics,
+                        target_name=target.name,
+                    )
+                except yaml.YAMLError as exc:
+                    # A malformed / over-budget frontmatter block must fail
+                    # CLOSED with a per-file diagnostic, never abort the whole
+                    # run.  ``apm install`` already degrades this way via the
+                    # per-package wrapper in install/template.py; the audit
+                    # drift-replay loop (install/drift.py::run_replay) has no
+                    # such catcher, so an unwrapped raise here would crash the
+                    # entire audit with a traceback.
+                    if diagnostics is not None:
+                        diagnostics.warn(
+                            message=(
+                                f"Skipped command {prompt_file.name}: malformed or "
+                                f"over-budget YAML frontmatter ({exc})."
+                            ),
+                            package=getattr(getattr(package_info, "package", None), "name", ""),
+                        )
+                    files_skipped += 1
+                    continue
             if not written:
                 # Critical post-transform finding -- defense-in-depth
                 # skip already surfaced via diagnostics.security().
@@ -680,7 +648,7 @@ class CommandIntegrator(BaseIntegrator):
         """
         import toml as _toml
 
-        post = frontmatter.load(source)
+        post = load_frontmatter(source)
 
         description = post.metadata.get("description", "")
         prompt_text = post.content.strip()
@@ -694,7 +662,7 @@ class CommandIntegrator(BaseIntegrator):
             doc = {"description": description, "prompt": prompt_text}
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_toml.dumps(doc), encoding="utf-8")
+        write_text_lf(target, _toml.dumps(doc))
 
     # ------------------------------------------------------------------
     # Legacy per-target API (DEPRECATED)

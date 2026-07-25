@@ -2,13 +2,15 @@
 
 ## Supported package layouts
 
-APM recognizes three layouts. The shape of the package root tells APM
+APM recognizes five layouts. The shape of the package root tells APM
 how to install it:
 
 | Root signal | Author intent | Install semantic |
 |---|---|---|
 | `.apm/` (with or without apm.yml) | Multiple independent primitives | Hoist each primitive into the consumer runtime dirs |
 | `SKILL.md` (alone, or with apm.yml = HYBRID) | One skill bundle | Copy whole tree to `<target>/skills/<name>/` |
+| `skills/<name>/SKILL.md` | Many skills in one repo | Promote each nested skill to `<target>/skills/<name>/` |
+| `hooks/*.json` only | Harness hook package | Deploy hooks to the target's hooks directory |
 | `plugin.json` / `.claude-plugin/` | Claude plugin collection | Dissect via plugin artifact mapping |
 
 The HYBRID layout (apm.yml + SKILL.md) is a single skill bundle that
@@ -29,6 +31,13 @@ backfills one from the other:
   is no apm.yml-side equivalent.
 - `name`, `version`, `license`, `dependencies`, `scripts` live
   exclusively in `apm.yml`.
+- `name` and `version` must be non-empty strings. Quote numeric versions so
+  YAML does not parse them as numbers.
+
+Use the standard `$schema` key when authoring against normative OpenAPM v0.1:
+`https://microsoft.github.io/apm/specs/schemas/manifest-v0.1.schema.json`.
+Omitting `$schema` selects APM's current working draft. Unknown schema
+identities fail closed rather than being interpreted as the working draft.
 
 Populate both descriptions when you ship a HYBRID package. `apm pack`
 warns when `apm.yml.description` is missing so listings do not
@@ -43,8 +52,8 @@ my-package/
     instructions/
       security.instructions.md
       python.instructions.md
-    chatmodes/
-      architect.chatmode.md
+    agents/
+      architect.agent.md
     contexts/
       codebase.context.md
     prompts/
@@ -60,12 +69,14 @@ my-package/
 
 ## Install-time discovery rules
 
-`apm pack` (export) is liberal: it collects primitives from both
-`.apm/<type>/` and root convention directories (`agents/`, `skills/`,
-`instructions/`, etc.). `apm install` (integration) is per-primitive
-and stricter. Authors who rely on root convention directories for
-instructions or prompts will produce bundles that pack but install
-silently incomplete.
+When `.apm/` exists, `apm pack` sources local primitives and hooks from
+`.apm/`. Without `.apm/`, supported plugin-native root directories
+(`agents/`, `skills/`, `commands/`, `instructions/`, `extensions/`, and
+hooks) remain pack sources, including after `apm init` writes
+`includes: auto`. Mixed layouts pack from `.apm/` and warn about skipped
+root sources. An explicit `includes:` list is exhaustive; invalid listed
+paths fail instead of falling back to implicit discovery. Prefer
+`.apm/<type>/` so pack and install use the same source layout.
 
 Per-primitive scan paths for `apm install`:
 
@@ -74,45 +85,52 @@ Per-primitive scan paths for `apm install`:
 | instruction | `.apm/instructions/` | No |
 | command (prompt) | `.apm/prompts/` | No |
 | hook | `.apm/hooks/` | Yes: `hooks/` |
-| agent | `.apm/agents/`, `.apm/chatmodes/` | Yes: `*.agent.md` and `*.chatmode.md` at root |
+| agent | `.apm/agents/` | Yes: `*.agent.md` at root |
 | skill | `.apm/skills/<name>/` | Yes: `skills/<name>/` (SKILL_BUNDLE or MARKETPLACE_PLUGIN) |
 
 **Recommendation for marketplace publishers:** use `.apm/<type>/` for
 every primitive. This is the only layout that is symmetric between
-`apm pack` and `apm install`. Authoring `instructions/` at the plugin
-root will pack cleanly but instructions will be silently dropped when
-consumers run `apm install`.
+`apm pack` and `apm install`.
 
 ## Hook files
 
 Packages can ship hooks (pre/post tool-use scripts) by placing JSON
-files under `hooks/` or `.apm/hooks/`.  When a package targets multiple
-tools, use target-specific filenames so each tool receives only its own
-hooks:
+files under `hooks/` or `.apm/hooks/`. Filename-based hook routing
+(`*-<harness>-hooks.json` and `hooks-<harness>.json`) is deprecated.
+Consumers should route a hook package with per-dependency `targets:`
+in their own `dependencies.apm` entry instead.
 
-| Filename pattern | Deployed to |
-|---|---|
-| `*-copilot-hooks.json` | GitHub Copilot only |
-| `*-cursor-hooks.json` | Cursor only |
-| `*-claude-hooks.json` | Claude Code only |
-| `*-codex-hooks.json` | Codex CLI only |
-| `*-gemini-hooks.json` | Gemini CLI only |
-| `*-antigravity-hooks.json` | Antigravity CLI only |
-| `*-windsurf-hooks.json` | Windsurf only |
-| `*-kiro-hooks.json` | Kiro only |
-| Any other name (e.g. `hooks.json`, `telemetry-hooks.json`) | All targets |
+Package-level `targets:` (top-level) selects the package's own
+compile/install runtimes; per-dependency `targets:` (inside a
+`dependencies.apm` entry) selects which active harnesses receive that
+dependency's target-scoped primitives. They compose via intersection. See
+`dependencies.md` for consumer syntax.
 
-Example directory tree for a multi-target hook package:
+### Migrating filename-routed hooks
 
+Keep hook filenames simple, then document the target set consumers
+should use:
+
+```yaml
+dependencies:
+  apm:
+    - git: owner/my-hooks-pkg
+      targets: [codex]
 ```
-my-hooks-pkg/
-  hooks/
-    hooks.json              # deployed to all targets
-    copilot-hooks.json      # Copilot only
-    cursor-hooks.json       # Cursor only
-    claude-hooks.json       # Claude Code only
-    kiro-hooks.json         # Kiro only
-```
+
+Before: encode the target in a filename such as `my-pkg-codex-hooks.json`.
+After: keep hook filenames generic and let the consumer set `targets: [codex]`.
+Combined deprecated stems such as `claude-codex-hooks.json` route to every
+named target token during the migration window.
+Stems with target tokens outside the trailing target suffix (for example
+`codex-launch-hooks.json`) fall back to universal or suffix routing and print a
+warning naming the ignored token.
+
+During the deprecation window, existing suffix-named hook files still
+route to their matching harness and emit an install-time warning. A
+consumer's per-dependency `targets:` list only narrows the active target
+set; filename routing still runs inside that set, so the two filters
+compose by intersection.
 
 APM automatically normalises event names per target (e.g. `postToolUse`
 becomes `PostToolUse` in Claude) and rewrites path variables
@@ -120,17 +138,30 @@ becomes `PostToolUse` in Claude) and rewrites path variables
 the correct target-specific form. Kiro materializes one JSON document per
 hook action under `.kiro/hooks/`.
 
+When a hook command references a script inside `hooks/` or `.apm/hooks/`,
+APM deploys that hook source bundle so sibling helper files resolve at
+runtime. Claude-family merged targets (Claude, Cursor, Codex, Gemini,
+Antigravity, and Windsurf), Copilot, and Kiro receive the same bundle.
+Root hook JSON descriptors, symlinks, and `.apm-pin` markers are not
+deployed. JavaScript and TypeScript hook bundles get a minimal
+`package.json` sidecar with the source package's Node `type` (defaulting
+to `commonjs`); shell-only bundles do not get a sidecar.
+
 ### Hook command paths: project-scope stays repo-relative
 
 `apm install` (project-scope, no `-g`) keeps hook `command` paths
 **repo-relative** in checked-in configs (`<repo>/.claude/settings.json`,
-`<repo>/.codex/hooks.json`, the `<repo>/.claude/apm-hooks.json`
-sidecar, and equivalents for Cursor / Gemini / Antigravity / Windsurf / Kiro) so clones,
-contributors, and CI runners do not see the installer's machine-local
-absolute prefix. `apm install -g` (user-scope, e.g.
+`<repo>/.codex/hooks.json`, and equivalents for Cursor / Gemini / Antigravity /
+Windsurf / Kiro). Native hook files contain only upstream schema fields; each
+merged target keeps APM reconciliation ownership in a sibling `apm-hooks.json`
+sidecar, so clones, contributors, and CI runners do not see the installer's
+machine-local absolute prefix. `apm install -g` (user-scope, e.g.
 `~/.claude/settings.json`) rewrites `${PLUGIN_ROOT}` and relative `./`
 references to absolute paths because the user-scope config is read
-without a fixed cwd. If a referenced hook script is missing at install
+without a fixed cwd. If a manifest in `hooks/` or `.apm/hooks/` uses
+`./hooks/<script>`, APM first resolves it from the hook file directory,
+then falls back to the package root to avoid deploying a doubled
+`hooks/hooks/` path. If a referenced hook script is missing at install
 time the installer emits a warning either way; user-scope additionally
 rewrites the unexpanded variable to an absolute source path so the hook
 fails loudly at runtime, while project-scope leaves the variable in
@@ -164,6 +195,9 @@ Both `apm.yml`'s `targets:`/`target:` and the `--target` CLI flag share the same
 Error messages always name the `apm.yml` path and the offending token, so the fix point is unambiguous. The list form (`targets: [a, b]`) is the recommended shape; the singular `target:` and CSV-string forms are supported indefinitely as sugar.
 
 The package-authored `targets:`/`target:` field overrides auto-detect but is itself overridden by an explicit `--target` flag at install/compile time. Run `apm targets` in the consumer's directory to see what the resolution chain produces.
+
+For one dependency's target-scoped primitive reach, use per-dependency
+`targets:` inside `dependencies.apm`; see `dependencies.md`.
 
 ## Manifest fields: `license:` (declared license for SBOM)
 
@@ -210,16 +244,24 @@ tags: [security, validation]
 ```
 
 `applyTo` accepts a single glob (`"**/*.py"`) or a comma-separated list
-(`"**/src/**,**/api/**"`). A YAML sequence (`applyTo: ['**/*.py']`) is also
-accepted; when multiple sequence elements are given, the first is used.
+(`"**/src/**,**/api/**"`). The comma-separated string form is the recommended
+way to specify multiple patterns, as it is portably expanded into target-specific
+YAML arrays/lists (under `paths:` / `globs:` / `fileMatchPattern:`) across
+Claude, Cursor, Windsurf, Kiro, and Antigravity.
+
+A YAML sequence (e.g., `applyTo: ['**/*.py', '**/tests/**/*.py']`) may work
+for some targets, but it is not portable: some converters ignore sequences or
+treat them as a string, while others (like Antigravity and Kiro) parse and
+expand them. For maximum portability, use a comma-separated string for multiple
+globs.
+
 Commas inside brace alternation (`**/*.{css,scss}`) are part of the glob
 and are NOT separators -- only top-level commas split the list. On Copilot
-the value is preserved verbatim; on Claude/Cursor/Windsurf/Kiro comma-lists are
-expanded to a YAML array under `paths:` / `globs:` / `fileMatchPattern:`.
+the value is preserved verbatim.
 
-### 2. Chatmode (`*.chatmode.md`)
+### 2. Agent (`*.agent.md`)
 
-Chat persona configuration.
+Chat persona configuration. Place in `.apm/agents/`.
 
 ```yaml
 ---
@@ -398,8 +440,9 @@ target is present. Authoring rules:
 - Deployed executables land on Claude Code's PATH and are invoked
   **without per-call confirmation** -- treat them as trusted code and
   keep them minimal.
-- Governance: a `bin_deploy` policy rule can deny deployment per package.
-  See the [policy schema](../../../../../docs/src/content/docs/reference/policy-schema.md#bin_deploy).
+- Governance: the org `executables.deny` policy can deny deployment per
+  package (the legacy `bin_deploy` rule remains a deprecated alias).
+  See the [policy schema](../../../../../docs/src/content/docs/reference/policy-schema.md#executables).
 
 ## Canvas extensions (experimental, Copilot-only)
 
@@ -412,7 +455,9 @@ On `apm install --target copilot`, APM deploys it verbatim to
 `.github/extensions/<name>/`. The `<name>` segment is validated strictly
 (`[A-Za-z0-9._-]+`, no leading/trailing dot, no `..`, no separators, no reserved
 names). It is **Copilot-only**. Dependency-provided canvases are executable code
-and are blocked unless the consumer passes `--trust-canvas-extensions`; a
+and are blocked unless the consumer adds the package to the `executables.allow`
+block in `apm.yml` (`allowExecutables` is a deprecated alias) and runs
+`apm approve <pkg>`; a
 first-party canvas in the root package deploys once the flag is on. With
 `--global`, a dependency canvas deploys to `~/.copilot/extensions/<name>/`
 (always requiring the trust flag; default `~/.copilot` only; first-party root
@@ -445,7 +490,9 @@ Section 7.5 is canonical for the full validation and override rules.
 The base may target any supported host -- GitHub.com, GitHub Enterprise,
 self-hosted GitLab, or Azure DevOps. For Azure DevOps, use a
 `https://dev.azure.com/{org}/{project}/_git` base; the `dev.azure.com` host is
-preserved through to the consumer and authenticated with `ADO_APM_PAT`:
+preserved through to the consumer. APM appends each repository name without a
+`.git` suffix. Authentication uses `ADO_APM_PAT` when set, or an Azure CLI
+bearer credential when the PAT is unset and `az` is signed in:
 
 ```yaml
 marketplace:
@@ -455,6 +502,12 @@ marketplace:
       source: agent-skills          # -> contoso/platform/_git/agent-skills
       ref: 3f2a9b1c
 ```
+
+`apm pack` emits remote repositories as `source: url` and remote
+subdirectories as `source: git-subdir`.
+`apm install <package>@<marketplace>` accepts both generated forms and preserves the
+package host, subdirectory, and ref even when the marketplace itself is
+registered from another host or a local path.
 
 ## Step-by-step: create and publish
 

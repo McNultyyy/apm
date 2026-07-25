@@ -6,6 +6,13 @@ All functions in this module are private to the marketplace package;
 
 The only external dependency is the shared config dir (lazy-imported at
 call time to avoid circular imports with client.py).
+
+RULE B: ``_cache_dir`` is accessed via the ``client`` facade so that tests
+which monkeypatch ``apm_cli.marketplace.client._cache_dir`` continue to
+intercept every call that reaches this module.  The module-level import is
+circular-import safe: ``client.py`` is already being loaded when this module
+is imported, so ``_c`` refers to the partially-initialised facade object and
+attribute lookups only happen at function-call time.
 """
 
 import contextlib
@@ -16,6 +23,9 @@ import os
 import re
 import time
 from urllib.parse import urlsplit
+
+# Facade reference for RULE B seam preservation (see module docstring).
+from . import client as _c
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +93,10 @@ def _cache_key(source) -> str:
         return f"url__{hashlib.sha256(source.url.encode()).hexdigest()[:16]}"
     if kind == "local":
         return f"local__{_sanitize_cache_name(source.name)}"
-    if kind == "git":
-        # Generic git: include host so a.com/o/r vs b.com/o/r never collapse.
+    if kind in ("git", "ado"):
+        # Generic git/ADO: include host so a.com/o/r vs b.com/o/r never collapse.
         host = _host_from_url(source.url) or source.host or "unknown"
-        return f"git__{_sanitize_cache_name(host)}__{_sanitize_cache_name(source.name)}"
+        return f"{kind}__{_sanitize_cache_name(host)}__{_sanitize_cache_name(source.name)}"
     normalized_host = (source.host or "github.com").lower()
     if normalized_host == "github.com":
         return source.name
@@ -94,11 +104,11 @@ def _cache_key(source) -> str:
 
 
 def _cache_data_path(name: str) -> str:
-    return os.path.join(_cache_dir(), f"{_sanitize_cache_name(name)}.json")
+    return os.path.join(_c._cache_dir(), f"{_sanitize_cache_name(name)}.json")
 
 
 def _cache_meta_path(name: str) -> str:
-    return os.path.join(_cache_dir(), f"{_sanitize_cache_name(name)}.meta.json")
+    return os.path.join(_c._cache_dir(), f"{_sanitize_cache_name(name)}.meta.json")
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +118,8 @@ def _cache_meta_path(name: str) -> str:
 
 def _read_cache(name: str) -> dict | None:
     """Read cached marketplace data if valid (not expired)."""
-    data_path = _cache_data_path(name)
-    meta_path = _cache_meta_path(name)
+    data_path = _c._cache_data_path(name)
+    meta_path = _c._cache_meta_path(name)
     if not os.path.exists(data_path) or not os.path.exists(meta_path):
         return None
     try:
@@ -128,7 +138,7 @@ def _read_cache(name: str) -> dict | None:
 
 def _read_stale_cache(name: str) -> dict | None:
     """Read cached data even if expired (stale-while-revalidate)."""
-    data_path = _cache_data_path(name)
+    data_path = _c._cache_data_path(name)
     if not os.path.exists(data_path):
         return None
     try:
@@ -147,8 +157,8 @@ def _write_cache(
     last_modified: str = "",
 ) -> None:
     """Write marketplace data and metadata to cache."""
-    data_path = _cache_data_path(name)
-    meta_path = _cache_meta_path(name)
+    data_path = _c._cache_data_path(name)
+    meta_path = _c._cache_meta_path(name)
     try:
         with open(data_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -167,7 +177,7 @@ def _write_cache(
 
 def _read_stale_meta(name: str) -> dict | None:
     """Read cache metadata even when the data cache is expired."""
-    meta_path = _cache_meta_path(name)
+    meta_path = _c._cache_meta_path(name)
     if not os.path.exists(meta_path):
         return None
     try:
@@ -179,6 +189,6 @@ def _read_stale_meta(name: str) -> dict | None:
 
 def _clear_cache(name: str) -> None:
     """Remove cached data for a marketplace."""
-    for path in (_cache_data_path(name), _cache_meta_path(name)):
+    for path in (_c._cache_data_path(name), _c._cache_meta_path(name)):
         with contextlib.suppress(OSError):
             os.remove(path)

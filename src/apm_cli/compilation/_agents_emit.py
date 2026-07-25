@@ -55,14 +55,14 @@ class StaleClaudeDetection(NamedTuple):
 
 
 def _hand_authored_claude_skip_message(
-    rel: str, *, dry_run: bool = False, preview: bool = False
+    rel: str, *, dry_run: bool = False, preview: bool = False, duplicate_context: bool = True
 ) -> str:
     """Build consistent skip guidance for hand-authored CLAUDE.md files."""
     prefix = "[dry-run] would skip removal" if preview or dry_run else "Skipped removal"
-    return (
-        f"{prefix} of {rel}: hand-authored file will not be deleted."
-        " Delete or rename it manually if duplicate context is unwanted."
-    )
+    message = f"{prefix} of {rel}: hand-authored file will not be deleted."
+    if duplicate_context:
+        message += " Delete or rename it manually if duplicate context is unwanted."
+    return message
 
 
 class _AgentsEmitMixin:
@@ -106,6 +106,38 @@ class _AgentsEmitMixin:
     # ------------------------------------------------------------------ #
     # CLAUDE.md compilation                                                #
     # ------------------------------------------------------------------ #
+
+    def _clean_stale_claude_md(
+        self,
+        all_warnings: list[str],
+        orphan_reason: str,
+        skip_instructions: bool,
+    ) -> None:
+        """Remove a stale APM-generated CLAUDE.md; warn for hand-authored files."""
+        from apm_cli.compilation import agents_compiler as _ac
+
+        det = self._detect_stale_claude_md()
+        if not det.exists:
+            return
+        if det.read_error is not None:
+            all_warnings.append(det.read_error)
+            self._log("warning", det.read_error)
+            return
+        if det.is_apm_managed:
+            try:
+                _ac.ensure_path_within(det.path, self.base_dir)
+                det.path.unlink()
+                self._log("success", f"Removed stale {det.rel} -- {orphan_reason}")
+            except (OSError, _ac.PathTraversalError) as exc:
+                warning = f"Could not remove {det.rel}: {exc!s}"
+                all_warnings.append(warning)
+                self._log("warning", warning)
+        else:
+            warning = _hand_authored_claude_skip_message(
+                det.rel, duplicate_context=skip_instructions
+            )
+            all_warnings.append(warning)
+            self._log("warning", warning)
 
     def _compile_claude_md(
         self,
@@ -156,21 +188,24 @@ class _AgentsEmitMixin:
 
         # Skip instructions in CLAUDE.md when they are already deployed to
         # .claude/rules/ by `apm install` (avoids duplicate context in Claude Code).
-        # --no-dedup / --force-instructions lets users opt out of this behaviour.
-        from .agents_compiler import _detect_deployed_instructions
+        # --force-instructions / --no-dedup lets users opt out of this behaviour.
+        from .agents_compiler import _build_expected_rule_filenames, _detect_deployed_instructions
 
         if config.no_dedup:
             skip_instructions = False
             self._log(
                 "progress",
-                "Including instructions in CLAUDE.md (--no-dedup overrides deduplication)",
+                "Including instructions in CLAUDE.md (--force-instructions overrides deduplication)",
                 symbol="info",
             )
         else:
+            expected_filenames = _build_expected_rule_filenames("claude", primitives)
+
             skip_instructions = _detect_deployed_instructions(
                 self.base_dir / ".claude" / "rules",
                 self.base_dir,
                 lambda msg: self._log("warning", msg),
+                expected_filenames=expected_filenames,
             )
             if skip_instructions:
                 self._log(
@@ -197,11 +232,14 @@ class _AgentsEmitMixin:
         all_warnings = self.warnings + claude_result.warnings
         all_errors = self.errors + claude_result.errors
 
-        # would_emit_no_claude_md is True when the formatter produced no CLAUDE.md
-        # files because skip_instructions fired (all content already in .claude/rules/).
-        # Used symmetrically in the dry-run preview block and the live-removal block so
-        # both paths share a single, precise emptiness signal.
-        would_emit_no_claude_md = len(claude_result.content_map) == 0 and skip_instructions
+        # Fires when content moved to .claude/rules/ or no source primitives remain.
+        # Dry-run preview, live removal, and formatter suppression share this signal.
+        would_emit_no_claude_md = len(claude_result.content_map) == 0
+        orphan_reason = (
+            "instructions now live in .claude/rules/"
+            if skip_instructions
+            else "no source primitives remain"
+        )
 
         # Handle dry-run mode
         if config.dry_run:
@@ -235,19 +273,22 @@ class _AgentsEmitMixin:
                         all_warnings.append(det.read_error)
                         self._log("warning", det.read_error)
                     elif det.is_apm_managed:
-                        removal_msg = (
-                            f"[dry-run] would remove stale {det.rel} -- instructions now"
-                            " live in .claude/rules/"
-                        )
+                        removal_msg = f"[dry-run] would remove stale {det.rel} -- {orphan_reason}"
                         preview_lines.append(f"  {removal_msg}")
                         self._log("progress", removal_msg, symbol="info")
                     else:
                         hand_authored_preview = _hand_authored_claude_skip_message(
-                            det.rel, preview=True
+                            det.rel,
+                            preview=True,
+                            duplicate_context=skip_instructions,
                         )
                         preview_lines.append(f"  {hand_authored_preview}")
                         all_warnings.append(
-                            _hand_authored_claude_skip_message(det.rel, dry_run=True)
+                            _hand_authored_claude_skip_message(
+                                det.rel,
+                                dry_run=True,
+                                duplicate_context=skip_instructions,
+                            )
                         )
                         self._log("progress", hand_authored_preview, symbol="info")
 
@@ -310,12 +351,15 @@ class _AgentsEmitMixin:
         stats["claude_files_written"] = files_written
 
         if would_emit_no_claude_md:
-            self._log(
-                "progress",
-                "CLAUDE.md not generated -- Claude Code reads .claude/rules/ directly,"
-                " no further action needed",
-                symbol="info",
-            )
+            if skip_instructions:
+                self._log(
+                    "progress",
+                    "CLAUDE.md not generated -- Claude Code reads .claude/rules/ directly,"
+                    " no further action needed",
+                    symbol="info",
+                )
+            else:
+                stats["claude_empty_due_to_no_primitives"] = True
             # Remove a stale APM-generated CLAUDE.md when --clean is set.
             # A hand-authored file (no CLAUDE_HEADER marker) is never deleted;
             # a warning is emitted instead to match the Copilot-root convention.
@@ -324,27 +368,7 @@ class _AgentsEmitMixin:
             # Gate on clean_orphaned so plain `apm compile` (no --clean) does NO
             # extra disk I/O and emits NO stale-file warnings (non-destructive by design).
             if config.clean_orphaned:
-                det = self._detect_stale_claude_md()
-                if det.exists:
-                    if det.read_error is not None:
-                        all_warnings.append(det.read_error)
-                        self._log("warning", det.read_error)
-                    elif det.is_apm_managed:
-                        try:
-                            _ac.ensure_path_within(det.path, self.base_dir)
-                            det.path.unlink()  # safe: containment + APM marker confirmed above
-                            self._log(
-                                "success",
-                                f"Removed stale {det.rel} -- instructions now live in .claude/rules/",
-                            )
-                        except (OSError, _ac.PathTraversalError) as exc:
-                            warning = f"Could not remove {det.rel}: {exc!s}"
-                            all_warnings.append(warning)
-                            self._log("warning", warning)
-                    else:
-                        warning = _hand_authored_claude_skip_message(det.rel)
-                        all_warnings.append(warning)
-                        self._log("warning", warning)
+                self._clean_stale_claude_md(all_warnings, orphan_reason, skip_instructions)
         elif distributed_compiler is None and files_written > 0 and not config.dry_run:
             # Single-file strategy bypasses the distributed display formatter
             # (which has no analysis to render). Emit a minimal progress line
@@ -544,31 +568,33 @@ class _AgentsEmitMixin:
             result.stats["copilot_root_instructions_unchanged"] = 0
             return result
 
-        if existing == content:
-            result.stats["copilot_root_instructions_written"] = 0
-            result.stats["copilot_root_instructions_unchanged"] = 1
+        if existing == content or config.dry_run:
+            if existing == content:
+                result.stats["copilot_root_instructions_unchanged"] = 1
+            result.stats.setdefault("copilot_root_instructions_written", 0)
+            result.stats.setdefault("copilot_root_instructions_unchanged", 0)
             return result
-
-        if config.dry_run:
-            return result
-
-        from ..security.gate import WARN_POLICY, SecurityGate
-
-        verdict = SecurityGate.scan_text(content, str(output_path), policy=WARN_POLICY)
-        actionable = verdict.critical_count + verdict.warning_count
-        if actionable:
-            if verdict.has_critical:
-                result.has_critical_security = True
-            result.warnings.append(
-                f"copilot-instructions.md contains {actionable} hidden character(s) "
-                f"-- run 'apm audit --file {output_path}' to inspect"
-            )
 
         try:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(content, encoding="utf-8")
+            from .output_writer import CompiledOutputPolicyError, CompiledOutputWriter
+
+            verdict = CompiledOutputWriter().write(output_path, content)
+            actionable = verdict.critical_count + verdict.warning_count
+            if actionable:
+                result.warnings.append(
+                    f"copilot-instructions.md contains {actionable} hidden character(s) "
+                    f"-- run 'apm audit --file {output_path}' to inspect"
+                )
             result.stats["copilot_root_instructions_written"] = 1
             result.stats["copilot_root_instructions_unchanged"] = 0
+            return result
+        except CompiledOutputPolicyError as exc:
+            result.has_critical_security = True
+            message = str(exc)
+            self.errors.append(message)
+            result.errors.append(message)
+            result.success = False
+            result.stats["copilot_root_instructions_written"] = 0
             return result
         except OSError as exc:
             message = f"Failed to write {output_path}: {exc}"

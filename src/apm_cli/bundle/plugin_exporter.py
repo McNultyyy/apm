@@ -30,7 +30,16 @@ from ..utils.archive import (
 )
 from ..utils.console import _rich_warning
 from ..utils.path_security import PathTraversalError, ensure_path_within, safe_rmtree
+from ._plugin_exporter_ops import (
+    _cache_would_contribute_hooks_or_mcp,
+    _cache_would_contribute_primitives,
+    _collect_deployed_components,
+    _collect_explicit_local_components,
+    _deployed_path_parts,  # noqa: F401 -- re-exported for test seam
+    _plugin_rel_for_deployed_path,  # noqa: F401 -- re-exported for test seam
+)
 from .packer import PackResult
+from .plugin_layout import PLUGIN_ROOT_DIRS, find_plugin_root_sources
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -110,8 +119,7 @@ def _collect_apm_components(apm_dir: Path) -> list[tuple[Path, str]]:
 
     # extensions/ -> extensions/ (canvas extensions, experimental Copilot-only).
     # Preserved verbatim so an offline bundle can carry a canvas; the files are
-    # inert until the consumer enables the ``canvas`` experimental flag AND
-    # passes ``--trust-canvas-extensions`` at install time.
+    # inert until the consumer approves the package via allowExecutables / ``apm approve``.
     _collect_recursive(apm_dir / "extensions", "extensions", components)
 
     return components
@@ -124,9 +132,47 @@ def _collect_root_plugin_components(project_root: Path) -> list[tuple[Path, str]
     ``skills/``, etc. at the repo root) have their files picked up here.
     """
     components: list[tuple[Path, str]] = []
-    for dir_name in ("agents", "skills", "commands", "instructions", "extensions"):
+    for dir_name in PLUGIN_ROOT_DIRS:
+        if dir_name == "hooks":
+            continue
         _collect_recursive(project_root / dir_name, dir_name, components)
     return components
+
+
+def _emit_pack_warning(message: str, logger=None) -> None:
+    """Send a pack warning through the command logger when available."""
+    if logger:
+        logger.warning(message)
+    else:
+        _rich_warning(message, symbol="warning")
+
+
+def _warn_skipped_root_components(project_root: Path, logger=None) -> None:
+    """Explain why plugin-native root sources are not packed."""
+    for source in find_plugin_root_sources(project_root):
+        if source == "hooks.json":
+            message = (
+                "Skipping root-level hooks.json because .apm/ is present. "
+                "Move publishable hook configuration to .apm/hooks/ or remove "
+                "hooks.json to silence this warning."
+            )
+        else:
+            message = (
+                f"Skipping root-level {source}/ because .apm/ is present. "
+                f"Move publishable files to .apm/{source}/ or remove {source}/ "
+                "to silence this warning."
+            )
+        _emit_pack_warning(message, logger)
+
+
+def _warn_no_local_primitives(logger=None) -> None:
+    """Explain how to recover from an empty APM-native source layout."""
+    _emit_pack_warning(
+        "No local primitives found. Expected content under .apm/. "
+        "Move plugin-native content into .apm/, or remove .apm/ to restore "
+        "root convention discovery.",
+        logger,
+    )
 
 
 def _collect_bare_skill(
@@ -177,7 +223,7 @@ def _collect_flat(
     rename=None,
 ) -> None:
     """Add every regular non-symlink file directly inside *src_dir*."""
-    if not src_dir.is_dir():
+    if src_dir.is_symlink() or not src_dir.is_dir():
         return
     for f in sorted(src_dir.iterdir()):
         if f.is_file() and not f.is_symlink():
@@ -193,7 +239,7 @@ def _collect_recursive(
     rename=None,
 ) -> None:
     """Add every regular non-symlink file under *src_dir*, preserving hierarchy."""
-    if not src_dir.is_dir():
+    if src_dir.is_symlink() or not src_dir.is_dir():
         return
     for f in sorted(src_dir.rglob("*")):
         if not f.is_file() or f.is_symlink():
@@ -246,7 +292,8 @@ def _collect_hooks_from_apm(apm_dir: Path) -> dict:
                 data = json.loads(f.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     _deep_merge(hooks, data, overwrite=False)
-            except (json.JSONDecodeError, OSError):
+            except (OSError, ValueError, RecursionError):
+                # Untrusted .apm/hooks/*.json: fail closed.
                 pass
     return hooks
 
@@ -261,7 +308,7 @@ def _collect_hooks_from_root(package_root: Path) -> dict:
             data = json.loads(hooks_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 _deep_merge(hooks, data, overwrite=False)
-        except (json.JSONDecodeError, OSError):
+        except (OSError, ValueError, RecursionError):
             pass
     # Directory
     hooks_dir = package_root / "hooks"
@@ -272,7 +319,7 @@ def _collect_hooks_from_root(package_root: Path) -> dict:
                     data = json.loads(f.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
                         _deep_merge(hooks, data, overwrite=False)
-                except (json.JSONDecodeError, OSError):
+                except (OSError, ValueError, RecursionError):
                     pass
     return hooks
 
@@ -356,7 +403,9 @@ def _has_marketplace_block(apm_yml_path: Path) -> bool:
     try:
         import yaml
 
-        data = yaml.safe_load(apm_yml_path.read_text(encoding="utf-8")) or {}
+        from apm_cli.utils.yaml_io import load_yaml
+
+        data = load_yaml(apm_yml_path) or {}
     except (OSError, yaml.YAMLError):
         return False
     return bool(data.get("marketplace"))
@@ -520,44 +569,74 @@ def export_plugin_bundle(
             ):
                 continue
 
-            install_path = _dep_install_path(dep, apm_modules_dir)
-            if not install_path.is_dir():
-                continue
-
             dep_name = dep.repo_url
 
-            # Collect from .apm/
-            dep_apm_dir = install_path / ".apm"
-            dep_components = _collect_apm_components(dep_apm_dir)
+            # Provenance rule: pack ONLY from lockfile-attested deployed_files.
+            # apm_modules is an unattested cache -- no bytes from it may enter.
+            install_path = _dep_install_path(dep, apm_modules_dir)
+            if dep.deployed_files:
+                dep_components = _collect_deployed_components(project_root, dep)
+                if dep.skill_subset and not dep_components:
+                    declared_skills = ", ".join(dep.skill_subset)
+                    raise ValueError(
+                        f"Cannot pack dependency {dep.repo_url}: the skills "
+                        f"recorded in apm.lock.yaml (skill_subset: {declared_skills}) "
+                        "were not found among its installed files. Run 'apm install' "
+                        "to re-deploy the expected skills, then pack again."
+                    )
+            elif _cache_would_contribute_primitives(install_path, dep):
+                raise ValueError(
+                    f"Cannot pack dependency {dep.repo_url}: the lockfile records "
+                    "no deployed files for it, but installed content that cannot "
+                    "be verified exists in the apm_modules cache (a stale or "
+                    "partial install). Run 'apm install' to record provenance in "
+                    "apm.lock.yaml, then pack again."
+                )
+            else:
+                dep_components = []
 
-            # Also collect root-level plugin-native dirs from the dep
-            dep_components.extend(_collect_root_plugin_components(install_path))
-
-            # Bare Claude skills: SKILL.md at dep root with no skills/ subdir
-            _collect_bare_skill(install_path, dep, dep_components)
+            # Transition warning: dependency hooks/MCP config is not attested.
+            if _cache_would_contribute_hooks_or_mcp(install_path):
+                _warn = (
+                    f"dependency {dep.repo_url} contributed hooks/MCP config that "
+                    "is not attested in apm.lock.yaml; it will NOT be packed. "
+                    "Attested primitives (skills/agents/etc.) are unaffected."
+                )
+                if logger:
+                    logger.warning(_warn)
+                else:
+                    _rich_warning(_warn, symbol="warning")
 
             _merge_file_map(file_map, dep_components, dep_name, force, collisions)
 
-            # Hooks -- deps merge (first wins among deps)
-            dep_hooks = _collect_hooks_from_apm(dep_apm_dir)
-            dep_hooks_root = _collect_hooks_from_root(install_path)
-            _deep_merge(dep_hooks, dep_hooks_root, overwrite=False)
-            _deep_merge(merged_hooks, dep_hooks, overwrite=False)
-
-            # MCP -- deps merge (first wins among deps)
-            dep_mcp = _collect_mcp(install_path)
-            _deep_merge(merged_mcp, dep_mcp, overwrite=False)
-
-    # 6. Collect own components (.apm/ and root-level)
+    # 6. Collect own components according to the local source authority.
     own_apm_dir = project_root / ".apm"
-    own_components = _collect_apm_components(own_apm_dir)
-    own_components.extend(_collect_root_plugin_components(project_root))
+    if isinstance(package.includes, list):
+        own_components, root_hooks = _collect_explicit_local_components(
+            project_root,
+            package.includes,
+        )
+    else:
+        own_components = _collect_apm_components(own_apm_dir)
+        root_hooks = _collect_hooks_from_apm(own_apm_dir)
+        if own_apm_dir.is_dir():
+            _warn_skipped_root_components(project_root, logger)
+        else:
+            own_components.extend(_collect_root_plugin_components(project_root))
+            root_hooks_top = _collect_hooks_from_root(project_root)
+            _deep_merge(root_hooks, root_hooks_top, overwrite=False)
+
+    if (
+        not isinstance(package.includes, list)
+        and own_apm_dir.is_dir()
+        and not own_components
+        and not root_hooks
+    ):
+        _warn_no_local_primitives(logger)
+
     _merge_file_map(file_map, own_components, pkg_name, force, collisions)
 
     # Hooks -- root package wins on key collision
-    root_hooks = _collect_hooks_from_apm(own_apm_dir)
-    root_hooks_top = _collect_hooks_from_root(project_root)
-    _deep_merge(root_hooks, root_hooks_top, overwrite=False)
     _deep_merge(merged_hooks, root_hooks, overwrite=True)
 
     # MCP -- root package wins on server-name collision

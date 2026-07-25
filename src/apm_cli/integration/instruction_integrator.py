@@ -13,18 +13,19 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
+from apm_cli.integration._instruction_converters import _ConverterMixin
 from apm_cli.integration.base_integrator import BaseIntegrator, IntegrationResult
 from apm_cli.integration.targets import RULE_FORMATS
+from apm_cli.utils.atomic_io import normalize_crlf_to_lf, write_text_lf
 from apm_cli.utils.console import _rich_echo
 from apm_cli.utils.path_security import ensure_path_within
 from apm_cli.utils.paths import portable_relpath
-from apm_cli.utils.patterns import parse_apply_to, yaml_double_quote
 
 if TYPE_CHECKING:
     from apm_cli.integration.targets import TargetProfile
 
 
-class InstructionIntegrator(BaseIntegrator):
+class InstructionIntegrator(_ConverterMixin, BaseIntegrator):
     """Handles integration of APM package instructions.
 
     Deploys .instructions.md files to target-specific directories:
@@ -34,6 +35,9 @@ class InstructionIntegrator(BaseIntegrator):
     * Claude Code: ``.claude/rules/`` (``.md`` format, applyTo: -> paths:)
     * Gemini CLI: compile-only (GEMINI.md) -- no per-file rule deployment
     """
+
+    # Deploys via write_text_lf -> compare adopt candidates in LF mode.
+    _LF_NORMALIZED_DEPLOY = True
 
     # Map format_id -> converter method.  Built once at class load time;
     # avoids rebuilding the dict on every ``_render_instruction`` call.
@@ -63,7 +67,7 @@ class InstructionIntegrator(BaseIntegrator):
         """
         content = source.read_text(encoding="utf-8")
         content, links_resolved = self.resolve_links(content, source, target)
-        target.write_text(content, encoding="utf-8")
+        write_text_lf(target, content)
         return links_resolved
 
     def _render_instruction(self, source: Path, target: Path, fmt: str) -> tuple[str, int]:
@@ -194,17 +198,23 @@ class InstructionIntegrator(BaseIntegrator):
                 new_content, links_resolved = self._render_instruction(
                     source_file, target_path, fmt
                 )
+                # Compare the on-disk bytes against the exact bytes
+                # write_text_lf would emit (LF-normalized). A text-mode
+                # read_text() comparison would collapse CRLF->LF and wrongly
+                # adopt a stale CRLF file left by a pre-fix install, pinning a
+                # platform-dependent hash in the lockfile (apm#1889).
                 if (
                     not force
                     and target_path.exists()
-                    and target_path.read_text(encoding="utf-8") == new_content
+                    and target_path.read_bytes()
+                    == normalize_crlf_to_lf(new_content).encode("utf-8")
                 ):
                     files_adopted += 1
                     target_paths.append(target_path)
                     if diagnostics is not None and getattr(diagnostics, "verbose", False):
                         _rich_echo(f"  [=] adopted-unchanged: {rel_path}", color="dim")
                     continue
-                target_path.write_text(new_content, encoding="utf-8")
+                write_text_lf(target_path, new_content)
                 total_links_resolved += links_resolved
                 files_integrated += 1
                 target_paths.append(target_path)
@@ -388,14 +398,14 @@ class InstructionIntegrator(BaseIntegrator):
             if self._is_apm_managed_copilot(existing):
                 # APM-managed: update or append this package's provenance section.
                 updated = self._update_copilot_managed(existing, pkg_source or "unknown", section)
-                target_path.write_text(updated, encoding="utf-8")
+                write_text_lf(target_path, updated)
                 return IntegrationResult(1, 0, 0, [target_path])
             norm_rel = rel_path.replace("\\", "/")
             if norm_rel in (managed_files or set()) or force:
                 # Either was managed on a previous run (pre-provenance format)
                 # or caller explicitly requested overwrite.
                 new_content = self._APM_COPILOT_HEADER + "\n" + section + "\n"
-                target_path.write_text(new_content, encoding="utf-8")
+                write_text_lf(target_path, new_content)
                 return IntegrationResult(1, 0, 0, [target_path])
             # User-authored file: emit collision warning and skip.
             self.check_collision(
@@ -404,7 +414,7 @@ class InstructionIntegrator(BaseIntegrator):
             return IntegrationResult(0, 0, 1, [])
 
         new_content = self._APM_COPILOT_HEADER + "\n" + section + "\n"
-        target_path.write_text(new_content, encoding="utf-8")
+        write_text_lf(target_path, new_content)
         return IntegrationResult(1, 0, 0, [target_path])
 
     # ------------------------------------------------------------------
@@ -461,60 +471,13 @@ class InstructionIntegrator(BaseIntegrator):
     # Cursor Rules (.mdc) support
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _convert_to_cursor_rules(content: str) -> str:
-        """Convert APM instruction content to Cursor Rules ``.mdc`` format.
-
-        Parses existing YAML frontmatter, maps ``applyTo`` → ``globs``,
-        extracts or generates a ``description``, and rewrites the
-        frontmatter in Cursor's expected format.
-        """
-        body = content
-        apply_to = ""
-        description = ""
-
-        # Parse existing frontmatter
-        fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n?", content, re.DOTALL)
-        if fm_match:
-            fm_block = fm_match.group(1)
-            body = content[fm_match.end() :]
-
-            for line in fm_block.splitlines():
-                line_stripped = line.strip()
-                if line_stripped.startswith("applyTo:"):
-                    apply_to = line_stripped[len("applyTo:") :].strip().strip("'\"")
-                elif line_stripped.startswith("description:"):
-                    description = line_stripped[len("description:") :].strip().strip("'\"")
-
-        # Generate description from first content sentence if missing
-        if not description:
-            for line in body.splitlines():
-                stripped = line.strip().lstrip("#").strip()
-                if stripped:
-                    description = stripped.split(".")[0].strip()
-                    break
-
-        # Build Cursor Rules frontmatter
-        parts = ["---"]
-        if description:
-            parts.append(f"description: {description}")
-        globs = parse_apply_to(apply_to)
-        if len(globs) == 1:
-            parts.append(f"globs: {yaml_double_quote(globs[0])}")
-        elif globs:
-            parts.append("globs:")
-            parts.extend(f"  - {yaml_double_quote(g)}" for g in globs)
-        parts.append("---")
-
-        return "\n".join(parts) + "\n\n" + body.lstrip("\n")
-
     def copy_instruction_cursor(self, source: Path, target: Path) -> int:
         """Copy instruction file converted to Cursor Rules format.
 
         Converts ``applyTo:`` → ``globs:`` frontmatter and resolves links.
         """
         content, links_resolved = self._render_instruction(source, target, "cursor_rules")
-        target.write_text(content, encoding="utf-8")
+        write_text_lf(target, content)
         return links_resolved
 
     # DEPRECATED: use integrate_instructions_for_target(KNOWN_TARGETS["cursor"], ...) instead.
@@ -560,50 +523,6 @@ class InstructionIntegrator(BaseIntegrator):
     # Windsurf Rules (.md with trigger/globs frontmatter)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _convert_to_windsurf_rules(content: str) -> str:
-        """Convert APM instruction content to Windsurf rules ``.md`` format.
-
-        Parses existing YAML frontmatter via ``yaml.safe_load``, maps
-        ``applyTo`` to Windsurf's ``trigger: glob`` + ``globs`` frontmatter.
-        Instructions without ``applyTo`` become ``trigger: always_on`` rules.
-
-        Ref: https://docs.windsurf.com/windsurf/cascade/memories
-        """
-        import yaml
-
-        body = content
-        apply_to = ""
-
-        # Parse existing frontmatter with yaml.safe_load for consistency with the other frontmatter parsers across integrators.
-        fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n?", content, re.DOTALL)
-        if fm_match:
-            body = content[fm_match.end() :]
-            try:
-                fm = yaml.safe_load(fm_match.group(1)) or {}
-            except Exception:
-                fm = {}
-            apply_to = str(fm.get("applyTo", "")).strip()
-
-        # Build Windsurf rules frontmatter
-        parts = ["---"]
-        # Sanitize: strip newlines to prevent frontmatter injection
-        # via crafted applyTo values (e.g. "**\ntrigger: always_on").
-        safe_apply_to = apply_to.replace("\n", " ").replace("\r", " ").strip()
-        globs = parse_apply_to(safe_apply_to)
-        if globs:
-            parts.append("trigger: glob")
-            if len(globs) == 1:
-                parts.append(f"globs: {yaml_double_quote(globs[0])}")
-            else:
-                parts.append("globs:")
-                parts.extend(f"  - {yaml_double_quote(g)}" for g in globs)
-        else:
-            parts.append("trigger: always_on")
-        parts.append("---")
-
-        return "\n".join(parts) + "\n\n" + body.lstrip("\n")
-
     def copy_instruction_windsurf(self, source: Path, target: Path) -> int:
         """Copy instruction file converted to Windsurf rules format.
 
@@ -611,108 +530,16 @@ class InstructionIntegrator(BaseIntegrator):
         and resolves links.
         """
         content, links_resolved = self._render_instruction(source, target, "windsurf_rules")
-        target.write_text(content, encoding="utf-8")
+        write_text_lf(target, content)
         return links_resolved
 
     # ------------------------------------------------------------------
     # Kiro Steering (.md with inclusion frontmatter)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _convert_to_kiro_steering(content: str) -> str:
-        """Convert APM instructions to Kiro steering format.
-
-        Kiro steering files use ``inclusion: always`` for unconditional
-        guidance and ``inclusion: fileMatch`` plus ``fileMatchPattern`` for
-        path-scoped guidance. APM's ``applyTo`` frontmatter is the source of
-        truth for that scoping.
-        """
-        import yaml
-
-        body = content
-        apply_to = ""
-
-        fm_match = re.match(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?", content, re.DOTALL)
-        if fm_match:
-            body = content[fm_match.end() :]
-            try:
-                fm = yaml.safe_load(fm_match.group(1)) or {}
-            except Exception:
-                fm = {}
-            raw_apply_to = fm.get("applyTo", "")
-            if isinstance(raw_apply_to, list):
-                apply_to = ",".join(str(item) for item in raw_apply_to)
-            else:
-                apply_to = str(raw_apply_to).strip()
-
-        safe_apply_to = apply_to.replace("\n", " ").replace("\r", " ").strip()
-        globs = parse_apply_to(safe_apply_to)
-
-        parts = ["---"]
-        if globs:
-            parts.append("inclusion: fileMatch")
-            if len(globs) == 1:
-                parts.append(f"fileMatchPattern: {yaml_double_quote(globs[0])}")
-            else:
-                parts.append("fileMatchPattern:")
-                parts.extend(f"  - {yaml_double_quote(g)}" for g in globs)
-        else:
-            parts.append("inclusion: always")
-        parts.append("---")
-
-        return "\n".join(parts) + "\n\n" + body.lstrip("\n")
-
     # ------------------------------------------------------------------
     # Claude Code Rules (.md with paths: frontmatter)
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _convert_to_claude_rules(content: str) -> str:
-        """Convert APM instruction content to Claude Code rules ``.md`` format.
-
-        Parses existing YAML frontmatter, maps ``applyTo`` to ``paths``
-        (YAML list), and rewrites the frontmatter in Claude's expected
-        format.  Instructions without ``applyTo`` become unconditional
-        rules (no ``paths`` key).
-
-        Ref: https://code.claude.com/docs/en/memory#organize-rules-with-claude%2Frules%2F
-        """
-        body = content
-        apply_to = ""
-
-        # Parse existing frontmatter
-        fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n?", content, re.DOTALL)
-        if fm_match:
-            fm_block = fm_match.group(1)
-            body = content[fm_match.end() :]
-
-            for line in fm_block.splitlines():
-                line_stripped = line.strip()
-                if line_stripped.startswith("applyTo:"):
-                    apply_to = line_stripped[len("applyTo:") :].strip().strip("'\"")
-
-        # Build Claude rules frontmatter (only when path-scoped)
-        globs = parse_apply_to(apply_to)
-        if globs:
-            parts = ["---", "paths:"]
-            parts.extend(f"  - {yaml_double_quote(g)}" for g in globs)
-            parts.append("---")
-            return "\n".join(parts) + "\n\n" + body.lstrip("\n")
-
-        # No applyTo -> unconditional rule, return body without frontmatter
-        return body.lstrip("\n")
-
-    @staticmethod
-    def _convert_to_antigravity_rules(content: str) -> str:
-        """Convert APM instruction content to Antigravity CLI rules format.
-
-        Strips YAML frontmatter (Antigravity rules are plain markdown with
-        no frontmatter) and returns the body as-is.
-        """
-        fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n?", content, re.DOTALL)
-        if fm_match:
-            return fm_match.string[fm_match.end() :].lstrip("\n")
-        return content
 
     def copy_instruction_claude(self, source: Path, target: Path) -> int:
         """Copy instruction file converted to Claude Code rules format.
@@ -720,7 +547,7 @@ class InstructionIntegrator(BaseIntegrator):
         Converts ``applyTo:`` to ``paths:`` frontmatter and resolves links.
         """
         content, links_resolved = self._render_instruction(source, target, "claude_rules")
-        target.write_text(content, encoding="utf-8")
+        write_text_lf(target, content)
         return links_resolved
 
     # DEPRECATED: use integrate_instructions_for_target(KNOWN_TARGETS["claude"], ...) instead.

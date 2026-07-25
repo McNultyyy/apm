@@ -2,6 +2,10 @@
 
 Extracted from client.py to keep that module under 800 lines.
 All names are re-exported from client.py so existing import paths keep working.
+
+RULE B: ``_http_get`` is accessed via the ``client`` facade inside
+``_fetch_url_direct`` so that tests which monkeypatch
+``apm_cli.marketplace.client._http_get`` continue to intercept the call.
 """
 
 from __future__ import annotations
@@ -15,6 +19,10 @@ from urllib.parse import urlsplit
 
 import requests
 
+# Facade reference for RULE B seam preservation (see module docstring).
+# Circular-import safe: ``client.py`` is already being loaded when this
+# module is imported; attribute lookups only happen at call time.
+from . import client as _c
 from .errors import MarketplaceFetchError
 
 logger = logging.getLogger(__name__)
@@ -130,7 +138,7 @@ def _fetch_url_direct(
 
     resp = None
     try:
-        resp = _http_get(url, headers=headers, timeout=30, stream=True)
+        resp = _c._http_get(url, headers=headers, timeout=30, stream=True)
     except requests.exceptions.RequestException as exc:
         raise MarketplaceFetchError(url, str(exc)) from exc
 
@@ -232,6 +240,16 @@ def _try_proxy_fetch(
     if content is None:
         return None
 
+    if len(content) > _active_max_json_bytes():
+        logger.debug(
+            "Proxy returned oversized marketplace.json for %s/%s %s (%d bytes)",
+            source.owner,
+            source.repo,
+            file_path,
+            len(content),
+        )
+        return None
+
     try:
         return json.loads(content)
     except (json.JSONDecodeError, ValueError):
@@ -244,8 +262,30 @@ def _try_proxy_fetch(
         return None
 
 
-def _parse_json_text(resp) -> dict:
+def _read_capped_json(resp, label: str) -> dict:
+    """Read and parse a streamed JSON API response under the byte ceiling.
+
+    The caller MUST issue the request with ``stream=True`` so ``iter_content``
+    enforces the cap incrementally. The response is closed when the read
+    finishes. Raises ``MarketplaceFetchError`` if the body is oversized and
+    ``ValueError`` if the body is not valid JSON.
+    """
     try:
-        return json.loads(resp.text)
-    except (json.JSONDecodeError, TypeError) as exc:
+        content_length = resp.headers.get("Content-Length", "")
+        if content_length:
+            max_bytes = _active_max_json_bytes()
+            with contextlib.suppress(ValueError):
+                if int(content_length) > max_bytes:
+                    raise MarketplaceFetchError(
+                        label,
+                        f"marketplace.json exceeds {max_bytes} bytes",
+                    )
+        raw = _read_bounded_response_bytes(resp, label, _active_max_json_bytes())
+    finally:
+        close = getattr(resp, "close", None)
+        if callable(close):
+            close()
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError, RecursionError) as exc:
         raise ValueError(f"Invalid JSON in marketplace file: {exc}") from exc

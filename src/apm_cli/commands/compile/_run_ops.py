@@ -4,6 +4,8 @@ Extracted to keep that module under 800 lines. Contains:
 - ``CompilationRunConfig`` -- frozen dataclass grouping compilation options
 - ``_run_compilation``     -- main compilation flow (resolves target, compiles,
                               reports results)
+- ``_handle_global_flag``  -- --global compilation of user-scope root contexts
+- ``_display_user_path``   -- render paths under HOME with tilde prefix
 
 Rule B (monkeypatch safety): any name that tests patch on the *original*
 ``cli`` module (``AgentsCompiler``, ``CompilationConfig``,
@@ -221,7 +223,142 @@ def _handle_single_file_success(logger, compiler, config, dry_run, output_str):
     return has_critical
 
 
-def _handle_distributed_success(logger, result, dry_run):
+def _display_user_path(path: Path) -> str:
+    """Render paths under HOME with a stable tilde prefix for CLI output."""
+    try:
+        rel = path.resolve().relative_to(Path.home().resolve())
+    except ValueError:
+        return str(path)
+    return f"~/{rel.as_posix()}"
+
+
+def _run_watch_mode(
+    logger,
+    target,
+    output: str,
+    chatmode,
+    no_links: bool,
+    dry_run: bool,
+    verbose: bool,
+    clean: bool,
+    source_root: Path | None = None,
+) -> None:
+    """Set up and run watch mode (``--watch`` flag).
+
+    Resolves the effective compile target using the same logic as the
+    one-shot path so that ``targets: [claude, cursor]`` in apm.yml does
+    not silently regress on every recompile (#1345), then delegates to
+    :func:`_watch_mode`.
+    """
+    # Late import to stay Rule B safe (tests patch on cli module).
+    from apm_cli.commands.compile import cli as _c
+
+    _resolve_effective_target = _c._resolve_effective_target
+    _watch_mode_fn = _c._watch_mode  # resolved via cli so test patches are visible
+
+    if clean:
+        logger.warning(
+            "--clean is ignored in watch mode; run 'apm compile --clean' "
+            "separately to remove orphaned outputs."
+        )
+    effective_target, _detection_reason, config_target = _resolve_effective_target(
+        target, source_root=source_root
+    )
+    _watch_mode_fn(
+        output,
+        chatmode,
+        no_links,
+        dry_run,
+        verbose=verbose,
+        effective_target=effective_target,
+        target_label_user=target,
+        target_label_config=config_target,
+        cli_target=target,
+    )
+
+
+def _handle_global_flag(dry_run: bool, logger) -> int:
+    """Handle --global compilation of user-scope root context files.
+
+    Returns 0 on success, 1 on error (for sys.exit).
+    """
+    from ...compilation import compile_user_root_contexts
+    from ...core.scope import InstallScope, get_apm_dir
+    from ...integration.targets import KNOWN_TARGETS
+
+    source_root = get_apm_dir(InstallScope.USER)
+    apm_modules = source_root / "apm_modules"
+    if not apm_modules.is_dir():
+        display_path = _display_user_path(apm_modules)
+        logger.error(
+            f"User-scope apm_modules not found: {display_path}. "
+            "Run 'apm install -g <package>' to install packages globally.",
+            symbol="error",
+        )
+        return 1
+
+    results = compile_user_root_contexts(
+        list(KNOWN_TARGETS.values()),
+        source_root,
+        dry_run=dry_run,
+        logger=None,
+    )
+
+    if not results:
+        logger.info(
+            "No user-scope targets produced output -- run 'apm install -g <package>' "
+            "to add global instructions.",
+            symbol="info",
+        )
+        return 0
+
+    has_error = False
+    written_count = 0
+    would_write_count = 0
+    unchanged_count = 0
+    for entry in results:
+        status = entry.status
+        tname = entry.target
+        path = entry.path
+        display_path = _display_user_path(path) if path is not None else None
+        if status == "written":
+            logger.success(f"{tname}: wrote {display_path}", symbol="check")
+            written_count += 1
+        elif status == "would-write":
+            logger.info(f"{tname}: would write {display_path} (dry-run)", symbol="preview")
+            would_write_count += 1
+        elif status == "unchanged":
+            logger.verbose_detail(f"{tname}: unchanged {display_path}")
+            unchanged_count += 1
+        elif status == "skipped-hand-authored":
+            logger.info(f"{tname}: skipped (hand-authored) {display_path}", symbol="info")
+        elif status == "skipped-no-instructions":
+            logger.verbose_detail(f"{tname}: skipped (no global instructions)")
+        elif status.startswith("error:"):
+            logger.error(f"{tname}: {status[6:]}", symbol="error")
+            has_error = True
+        if entry.has_critical_security:
+            has_error = True
+
+    if not has_error:
+        changed_count = written_count + would_write_count
+        if changed_count:
+            verb = "Would compile" if dry_run else "Compiled"
+            message = f"{verb} {changed_count} user-scope root context file(s)"
+            if unchanged_count:
+                message += f"; {unchanged_count} unchanged"
+            message += "."
+            if dry_run:
+                logger.info(message, symbol="preview")
+            else:
+                logger.success(message, symbol="check")
+        else:
+            logger.info("No user-scope root context files changed.", symbol="info")
+
+    return 1 if has_error else 0
+
+
+def _handle_distributed_success(logger, result, dry_run, clean=False):
     """Handle the distributed compilation success path.
 
     Returns ``True`` if critical security findings were detected.
@@ -238,6 +375,9 @@ def _handle_distributed_success(logger, result, dry_run):
     )
     if _files_written > 0:
         logger.success("Compilation completed successfully!", symbol="check")
+    elif clean and result.stats.get("claude_empty_due_to_no_primitives"):
+        # The compiler already reported the expected cleanup outcome.
+        pass
     else:
         logger.warning(
             "Compilation completed but produced no output "
@@ -378,7 +518,9 @@ def _run_compilation(
 
     if result.success:
         if config.strategy == "distributed" and not run_config.single_agents:
-            compile_has_critical = _handle_distributed_success(logger, result, dry_run)
+            compile_has_critical = _handle_distributed_success(
+                logger, result, dry_run, clean=run_config.clean
+            )
         else:
             single_critical = _handle_single_file_success(
                 logger, compiler, config, dry_run, run_config.output
@@ -421,5 +563,16 @@ def _run_compilation(
         )
         perf_stats.render_summary(logger, project_root=str(_src))
         sys.exit(1)
+
+    if result.success and not dry_run:
+        from ...install.manifest_reconcile import reconcile_project_deployed_state
+
+        reconcile_project_deployed_state(
+            Path(_src).resolve(),
+            explicit_target=effective_target,
+            deploy_root=Path(".").resolve(),
+            lock_root=Path(".").resolve(),
+            verbose=verbose,
+        )
 
     perf_stats.render_summary(logger, project_root=str(_src))

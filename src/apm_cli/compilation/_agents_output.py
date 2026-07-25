@@ -44,25 +44,14 @@ class _AgentsOutputMixin:
         except OSError as e:
             self.errors.append(f"Failed to write output file {output_path}: {e!s}")
 
-    def _write_output_file_with_config(
+    def _prepare_output_content_with_config(
         self,
         output_path: str,
         content: str,
         config: CompilationConfig,
-    ) -> None:
-        """Write generated content, honouring agents_md_mode from config.
-
-        In ``full`` mode (default) the entire file is replaced.
-        In ``managed_section`` mode only the text between the configured
-        start/end markers is replaced; everything else is preserved.
-
-        Args:
-            output_path (str): Path to write the output.
-            content (str): Generated content for this compilation.
-            config (CompilationConfig): Compilation configuration.
-        """
+    ) -> str:
+        """Build managed-section or full content without mutating disk."""
         from .managed_section import ManagedSectionError, apply_managed_section
-        from .output_writer import CompiledOutputWriter
 
         if config.agents_md_mode == "managed_section":
             target = Path(output_path)
@@ -88,6 +77,28 @@ class _AgentsOutputMixin:
                 "Supported values: 'full', 'managed_section'."
             )
 
+        return content
+
+    def _write_output_file_with_config(
+        self,
+        output_path: str,
+        content: str,
+        config: CompilationConfig,
+    ) -> None:
+        """Write generated content, honouring agents_md_mode from config.
+
+        In ``full`` mode (default) the entire file is replaced.
+        In ``managed_section`` mode only the text between the configured
+        start/end markers is replaced; everything else is preserved.
+
+        Args:
+            output_path (str): Path to write the output.
+            content (str): Generated content for this compilation.
+            config (CompilationConfig): Compilation configuration.
+        """
+        from .output_writer import CompiledOutputWriter
+
+        content = self._prepare_output_content_with_config(output_path, content, config)
         try:
             CompiledOutputWriter().write(Path(output_path), content)
         except OSError as e:
@@ -115,13 +126,13 @@ class _AgentsOutputMixin:
             "version": template_data.version,
         }
 
-    def _write_distributed_file(
+    def _prepare_distributed_file(
         self,
         agents_path: Path,
         content: str,
         config: CompilationConfig,
-    ) -> None:
-        """Write a distributed AGENTS.md file with constitution injection support.
+    ) -> str:
+        """Build one distributed AGENTS.md output without mutating disk.
 
         Args:
             agents_path (Path): Path to write the AGENTS.md file.
@@ -151,15 +162,25 @@ class _AgentsOutputMixin:
             # Sub-directory files are fully APM-generated and always overwritten.
             is_root = agents_path.parent.resolve() == self.base_dir.resolve()
             if is_root and config.agents_md_mode == "managed_section":
-                self._write_output_file_with_config(str(agents_path), final_content, config)
-                return
-
-            from .output_writer import CompiledOutputWriter
-
-            CompiledOutputWriter().write(agents_path, final_content)
+                return self._prepare_output_content_with_config(
+                    str(agents_path), final_content, config
+                )
+            return final_content
 
         except OSError as e:
-            raise OSError(f"Failed to write distributed AGENTS.md file {agents_path}: {e!s}")  # noqa: B904
+            raise OSError(f"Failed to prepare distributed AGENTS.md file {agents_path}: {e!s}")  # noqa: B904
+
+    def _write_distributed_file(
+        self,
+        agents_path: Path,
+        content: str,
+        config: CompilationConfig,
+    ) -> None:
+        """Write one distributed file through the canonical writer."""
+        from .output_writer import CompiledOutputWriter
+
+        final_content = self._prepare_distributed_file(agents_path, content, config)
+        CompiledOutputWriter().write(agents_path, final_content)
 
     def _display_placement_preview(self, distributed_result) -> None:
         """Display placement preview for --show-placement mode.

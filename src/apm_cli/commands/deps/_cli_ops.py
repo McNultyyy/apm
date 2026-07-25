@@ -78,7 +78,10 @@ def _show_scope_deps(scope_label, apm_dir, logger, console, has_rich, insecure_o
         console.print(table)
 
         if orphaned_packages:
-            logger.warning(f"{len(orphaned_packages)} orphaned package(s) found (not in apm.yml):")
+            logger.warning(
+                f"{len(orphaned_packages)} orphaned package(s) found "
+                "(not in resolved dependency graph):"
+            )
             for pkg in orphaned_packages:
                 logger.warning(f"  - {pkg}")
             logger.info("Run 'apm prune' to remove orphaned packages")
@@ -120,7 +123,10 @@ def _show_scope_deps(scope_label, apm_dir, logger, console, has_rich, insecure_o
                 )
 
         if orphaned_packages:
-            logger.warning(f"{len(orphaned_packages)} orphaned package(s) found (not in apm.yml):")
+            logger.warning(
+                f"{len(orphaned_packages)} orphaned package(s) found "
+                "(not in resolved dependency graph):"
+            )
             for pkg in orphaned_packages:
                 logger.warning(f"  - {pkg}")
             logger.info("Run 'apm prune' to remove orphaned packages")

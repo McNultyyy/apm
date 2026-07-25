@@ -1,8 +1,8 @@
 """Executable primitive approval gate (npm v12-inspired opt-in model).
 
-APM packages can declare three kinds of executable primitives -- hooks,
-MCP servers, and bin/ executables -- that run arbitrary code on the
-developer's machine.  When the consuming project declares an
+APM packages can declare four kinds of executable primitives -- hooks,
+MCP servers, bin/ executables, and canvas extensions -- that run arbitrary
+code on the developer's machine.  When the consuming project declares an
 ``allowExecutables`` block in its ``apm.yml``, this module enforces a
 deny-by-default policy: none of these primitives are deployed unless
 explicitly approved.  Projects that omit the block entirely get
@@ -23,18 +23,103 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Executable type constants used as keys in the allowExecutables block.
-EXEC_TYPE_HOOKS = "hooks"
-EXEC_TYPE_MCP = "mcp"  # Reserved for future enforcement.
-EXEC_TYPE_BIN = "bin"
+from ._exec_io import (
+    build_exec_trust_context,
+    load_project_executables,
+    load_user_executables,
+    parse_project_executables,
+    project_executables_gate_enabled,
+    save_user_executables,
+    write_project_executables,
+)
+from ._scan import scan_package_executables
 
-# Types with active enforcement in the install gate.  MCP is excluded
-# because MCPIntegrator does not yet honour the approval state --
-# surfacing it in the UI would create a false-assurance control.
-ENFORCED_EXEC_TYPES = (EXEC_TYPE_HOOKS, EXEC_TYPE_BIN)
+# ---------------------------------------------------------------------------
+# Re-exported helpers (canonical definitions in sibling private modules)
+# ---------------------------------------------------------------------------
+from ._trust_helpers import (
+    _map_grants,
+    _org_denies,
+    _shadowed_grants,
+    _strip_version,
+)
 
-# All recognised exec-type keys (for manifest validation).
-ALL_EXEC_TYPES = (EXEC_TYPE_HOOKS, EXEC_TYPE_MCP, EXEC_TYPE_BIN)
+# ---------------------------------------------------------------------------
+# Re-exported constants and dataclasses (canonical definitions in _types.py)
+# ---------------------------------------------------------------------------
+from ._types import (
+    ALL_EXEC_TYPES,
+    ENFORCED_EXEC_TYPES,
+    EXEC_TYPE_BIN,
+    EXEC_TYPE_CANVAS,
+    EXEC_TYPE_HOOKS,
+    EXEC_TYPE_MCP,
+    LAYER_DEFAULT_DENY,
+    LAYER_ENFORCE_DEGRADED,
+    LAYER_GATE_DISABLED,
+    LAYER_ORG_DENY,
+    LAYER_ORG_DENY_ALL,
+    LAYER_ORG_RECOMMEND,
+    LAYER_PROJECT_ALLOW,
+    LAYER_PROJECT_DENY,
+    LAYER_USER_ALLOW,
+    LAYER_USER_DENY,
+    TRUST_ABSENT,
+    TRUST_DENIED,
+    TRUST_DEPLOYED,
+    TRUST_GATED,
+    ExecDecision,
+    ExecTrustContext,
+)
+
+# Public API for this module (including re-exports from siblings).
+__all__ = [
+    "ALL_EXEC_TYPES",
+    "ENFORCED_EXEC_TYPES",
+    "EXEC_TYPE_BIN",
+    "EXEC_TYPE_CANVAS",
+    "EXEC_TYPE_HOOKS",
+    "EXEC_TYPE_MCP",
+    "LAYER_DEFAULT_DENY",
+    "LAYER_ENFORCE_DEGRADED",
+    "LAYER_GATE_DISABLED",
+    "LAYER_ORG_DENY",
+    "LAYER_ORG_DENY_ALL",
+    "LAYER_ORG_RECOMMEND",
+    "LAYER_PROJECT_ALLOW",
+    "LAYER_PROJECT_DENY",
+    "LAYER_USER_ALLOW",
+    "LAYER_USER_DENY",
+    "TRUST_ABSENT",
+    "TRUST_DENIED",
+    "TRUST_DEPLOYED",
+    "TRUST_GATED",
+    "ExecDecision",
+    "ExecTrustContext",
+    "ExecutableDeclaration",
+    "build_approval_key",
+    "build_effective_exec_map",
+    "build_exec_trust_context",
+    "effective_allow_executables",
+    "exec_status_for_declaration",
+    "filter_mcp_by_allow_executables",
+    "is_any_type_approved",
+    "is_package_approved",
+    "load_project_executables",
+    "load_user_executables",
+    "materialize_exec_map",
+    "parse_allow_executables",
+    "parse_project_executables",
+    "project_executables_gate_enabled",
+    "prompt_executable_approval",
+    "read_bundle_allow_executables",
+    "resolve_exec_decision",
+    "save_user_executables",
+    "scan_package_executables",
+    "warn_allow_executables_alias_once",
+    "write_allow_executables",
+    "write_project_executables",
+]
 
 
 @dataclass(frozen=True)
@@ -51,9 +136,11 @@ class ExecutableDeclaration:
         hook_count: Number of hook files discovered.
         mcp_count: Number of MCP server entries discovered.
         bin_count: Number of bin/ executables discovered.
+        canvas_count: Number of canvas extensions discovered.
         hook_details: Per-hook summaries for ``inspect`` display.
         mcp_details: Per-MCP-server summaries.
         bin_details: Per-binary summaries.
+        canvas_details: Per-canvas summaries.
     """
 
     package_key: str
@@ -63,14 +150,18 @@ class ExecutableDeclaration:
     hook_count: int = 0
     mcp_count: int = 0
     bin_count: int = 0
+    canvas_count: int = 0
     hook_details: list[str] = field(default_factory=list)
     mcp_details: list[str] = field(default_factory=list)
     bin_details: list[str] = field(default_factory=list)
+    canvas_details: list[str] = field(default_factory=list)
 
     @property
     def has_executables(self) -> bool:
         """Return True if this package declares enforced executable primitives."""
-        return self.hook_count > 0 or self.bin_count > 0
+        return (
+            self.hook_count > 0 or self.bin_count > 0 or self.mcp_count > 0 or self.canvas_count > 0
+        )
 
     @property
     def exec_types(self) -> list[str]:
@@ -78,8 +169,12 @@ class ExecutableDeclaration:
         types: list[str] = []
         if self.hook_count > 0:
             types.append(EXEC_TYPE_HOOKS)
+        if self.mcp_count > 0:
+            types.append(EXEC_TYPE_MCP)
         if self.bin_count > 0:
             types.append(EXEC_TYPE_BIN)
+        if self.canvas_count > 0:
+            types.append(EXEC_TYPE_CANVAS)
         return types
 
     def summary_line(self) -> str:
@@ -87,8 +182,12 @@ class ExecutableDeclaration:
         parts: list[str] = []
         if self.hook_count:
             parts.append(f"{self.hook_count} hook(s)")
+        if self.mcp_count:
+            parts.append(f"{self.mcp_count} MCP server(s)")
         if self.bin_count:
             parts.append(f"{self.bin_count} bin executable(s)")
+        if self.canvas_count:
+            parts.append(f"{self.canvas_count} canvas extension(s)")
         return ", ".join(parts)
 
 
@@ -109,7 +208,7 @@ def is_package_approved(
             consuming project's ``apm.yml``.  ``None`` means no block
             exists (nothing approved).
         package_key: The approval key (e.g. ``owner/repo#v1.0``).
-        exec_type: One of ``hooks``, ``mcp``, ``bin``.
+        exec_type: One of ``hooks``, ``mcp``, ``bin``, ``canvas``.
 
     Returns:
         ``True`` only when the block contains a matching entry with
@@ -137,6 +236,80 @@ def is_any_type_approved(
 
 
 # -------------------------------------------------------------------
+# Unified executable-trust resolver (issue #1873)
+# -------------------------------------------------------------------
+#
+# One deny-wins, first-match-wins precedence ladder, shared by the
+# install gate AND the policy audit so the two never guess independently.
+# Constants, dataclasses, and low-level helpers are in _types.py and
+# _trust_helpers.py; re-exported above for backward-compatible imports.
+
+
+def resolve_exec_decision(
+    ctx: ExecTrustContext,
+    package_key: str,
+    exec_type: str,
+) -> ExecDecision:
+    """Resolve the trust decision for one (package, exec_type) pair.
+
+    Implements the #1873 deny-wins, first-match-wins ladder:
+
+      1. ORG deny_all / deny           -> DENIED (absolute ceiling)
+      2. USER deny                     -> DENIED (narrowing)
+         PROJECT deny                  -> DENIED (committed narrowing)
+      3/4. ORG enforce                 -> v1 fail-safe degrade to recommend
+      5. PROJECT allow                 -> ALLOWED
+      6. USER allow                    -> ALLOWED
+      7. ORG recommend                 -> ALLOWED (user-overridable)
+      8. (no match)                    -> DENIED, secure-by-default (approvable)
+
+    v1 NEVER force-executes: ``enforce`` carries no provenance check and
+    degrades to ``recommend`` so it stays overridable by a USER deny.
+    """
+    if not ctx.gate_enabled:
+        return ExecDecision(True, LAYER_GATE_DISABLED, TRUST_DEPLOYED)
+
+    name = _strip_version(package_key)
+
+    # 1. ORG deny ceiling (absolute).
+    denied, layer = _org_denies(ctx, name, exec_type)
+    if denied:
+        return ExecDecision(False, layer, TRUST_DENIED, _shadowed_grants(ctx, name, exec_type))
+
+    # 2. USER deny / PROJECT deny (narrowing; both win over any grant).
+    if _map_grants(ctx.user_deny, package_key, exec_type):
+        return ExecDecision(
+            False, LAYER_USER_DENY, TRUST_DENIED, _shadowed_grants(ctx, name, exec_type)
+        )
+    if _map_grants(ctx.project_deny, package_key, exec_type):
+        return ExecDecision(
+            False, LAYER_PROJECT_DENY, TRUST_DENIED, _shadowed_grants(ctx, name, exec_type)
+        )
+
+    enforce_active = name in ctx.org_enforce
+
+    # 5. PROJECT allow (overridable only by an upstream deny, handled above).
+    if _map_grants(ctx.project_allow, package_key, exec_type):
+        return ExecDecision(True, LAYER_PROJECT_ALLOW, TRUST_DEPLOYED)
+
+    # 6. USER allow.
+    if _map_grants(ctx.user_allow, package_key, exec_type):
+        return ExecDecision(True, LAYER_USER_ALLOW, TRUST_DEPLOYED)
+
+    # 7. ORG recommend (or degraded enforce). Both default-allow, overridable.
+    if name in ctx.org_recommend or enforce_active:
+        layer = (
+            LAYER_ENFORCE_DEGRADED
+            if enforce_active and name not in ctx.org_recommend
+            else LAYER_ORG_RECOMMEND
+        )
+        return ExecDecision(True, layer, TRUST_DEPLOYED)
+
+    # 8. Secure-by-default: denied but approvable (gated, not hard-denied).
+    return ExecDecision(False, LAYER_DEFAULT_DENY, TRUST_GATED)
+
+
+# -------------------------------------------------------------------
 # Approval key construction
 # -------------------------------------------------------------------
 
@@ -152,99 +325,6 @@ def build_approval_key(package_name: str, version: str) -> str:
     if not version:
         return package_name
     return f"{package_name}#{version}"
-
-
-# -------------------------------------------------------------------
-# Package scanning
-# -------------------------------------------------------------------
-
-
-def scan_package_executables(
-    install_path: Path,
-    package_name: str,
-    package_version: str,
-    *,
-    is_transitive: bool = False,
-    parent_name: str | None = None,
-) -> ExecutableDeclaration:
-    """Scan a materialised package directory for executable primitives.
-
-    Checks for:
-    - ``.apm/hooks/*.json`` and ``hooks/*.json`` -- hook definitions
-      (mirrors :meth:`HookIntegrator.find_hook_files`)
-    - ``bin/`` directory -- bin executables
-    - MCP is declared in the package's ``apm.yml`` under
-      ``dependencies.mcp``, not as files -- so we parse that instead.
-
-    Returns an :class:`ExecutableDeclaration` (may have zero counts if
-    the package declares no executables).
-    """
-    key = build_approval_key(package_name, package_version)
-
-    # 1. Hooks: .apm/hooks/*.json and hooks/*.json (aligned with
-    #    HookIntegrator.find_hook_files -- only JSON files are actionable).
-    hook_files: list[Path] = []
-    for hook_dir in [install_path / ".apm" / "hooks", install_path / "hooks"]:
-        if hook_dir.is_dir():
-            hook_files.extend(
-                sorted(f for f in hook_dir.glob("*.json") if f.is_file() and not f.is_symlink())
-            )
-    hook_details = [f.name for f in hook_files]
-
-    # 2. Bin executables: top-level bin/ AND .apm/skills/*/bin/
-    bin_files: list[Path] = []
-    for bin_dir in [install_path / "bin"]:
-        if bin_dir.is_dir():
-            bin_files.extend(
-                f for f in bin_dir.iterdir() if f.is_file() and not f.name.startswith(".")
-            )
-    # Also scan skill-level bin/ directories
-    apm_skills = install_path / ".apm" / "skills"
-    if apm_skills.is_dir():
-        for skill_dir in apm_skills.iterdir():
-            skill_bin = skill_dir / "bin"
-            if skill_bin.is_dir():
-                bin_files.extend(
-                    f for f in skill_bin.iterdir() if f.is_file() and not f.name.startswith(".")
-                )
-    bin_files = sorted(set(bin_files))
-    bin_details = [f.name for f in bin_files]
-
-    # 3. MCP servers: parse from apm.yml dependencies.mcp
-    mcp_count = 0
-    mcp_details: list[str] = []
-    apm_yml = install_path / "apm.yml"
-    if apm_yml.is_file():
-        try:
-            from ..utils.yaml_io import load_yaml
-
-            data = load_yaml(apm_yml)
-            if isinstance(data, dict):
-                deps = data.get("dependencies", {})
-                if isinstance(deps, dict):
-                    mcp_list = deps.get("mcp", [])
-                    if isinstance(mcp_list, list):
-                        mcp_count = len(mcp_list)
-                        for entry in mcp_list:
-                            if isinstance(entry, str):
-                                mcp_details.append(entry)
-                            elif isinstance(entry, dict):
-                                mcp_details.append(entry.get("name", str(entry)))
-        except Exception:
-            pass  # Non-fatal: if we cannot parse, treat as zero MCP
-
-    return ExecutableDeclaration(
-        package_key=key,
-        package_name=package_name,
-        is_transitive=is_transitive,
-        parent_name=parent_name,
-        hook_count=len(hook_files),
-        mcp_count=mcp_count,
-        bin_count=len(bin_files),
-        hook_details=hook_details,
-        mcp_details=mcp_details,
-        bin_details=bin_details,
-    )
 
 
 # -------------------------------------------------------------------
@@ -271,14 +351,16 @@ def prompt_executable_approval(
     Args:
         declarations: Executable declarations for packages that need
             approval (already filtered to only those with executables).
-        allow_executables: Existing ``allowExecutables`` block from
-            ``apm.yml`` (merged into result for packages already approved).
+        allow_executables: Existing approvals map (project ``apm.yml``
+            ``allowExecutables`` overlaid with user-local
+            ``~/.apm/approvals.yml``); merged into result for packages
+            already approved.
         trust_all: When True, auto-approve everything without prompting.
         no_executables: When True, deny everything without prompting.
 
     Returns:
-        Updated ``allowExecutables`` dict ready to write back to
-        ``apm.yml``.
+        Updated approvals dict ready to persist to the user-local
+        ``~/.apm/approvals.yml``.
 
     Raises:
         SystemExit: In non-interactive mode when unapproved executables
@@ -309,17 +391,15 @@ def prompt_executable_approval(
 
     # Non-interactive (CI): hard error
     if not _is_interactive():
-        _rich_warning(
-            f"{len(pending)} package(s) declare executable primitives "
-            "but are not approved in allowExecutables:"
-        )
+        _rich_warning(f"{len(pending)} package(s) ship executables that are not trusted yet:")
         for decl in pending:
             provenance = "(transitive)" if decl.is_transitive else "(direct)"
             _rich_echo(f"  {decl.package_key} {provenance}: {decl.summary_line()}")
         _rich_echo("")
         _rich_info(
-            "Run 'apm approve <package>' to approve, "
-            "or add entries to allowExecutables in apm.yml.",
+            "Trust the org-vetted set: apm approve --recommended  |  "
+            "Trust one: apm approve <package>  |  "
+            "Inspect: apm policy explain <package>",
             symbol="info",
         )
         sys.exit(1)
@@ -381,7 +461,7 @@ def parse_allow_executables(data: dict[str, Any]) -> dict[str, dict[str, bool]] 
     if not isinstance(raw, dict):
         raise ValueError(
             "allowExecutables must be a mapping of "
-            "package keys to {hooks: bool, mcp: bool, bin: bool}"
+            "package keys to {hooks: bool, mcp: bool, bin: bool, canvas: bool}"
         )
 
     result: dict[str, dict[str, bool]] = {}
@@ -420,6 +500,12 @@ def write_allow_executables(
 
     Reads the existing YAML, updates the ``allowExecutables`` key, and
     writes it back using the standard ``dump_yaml`` helper.
+
+    Note: this writes only the project gate opt-in signal
+    (``allowExecutables: {}``) and the CI/automated-context approvals that are
+    intentionally committed.  Personal, machine-local consent lives in
+    ``~/.apm/config.json`` under ``executables: {allow, deny}`` (see
+    :func:`save_user_executables`); there is no standalone approvals file.
     """
     from ..utils.yaml_io import dump_yaml, load_yaml
 
@@ -433,3 +519,224 @@ def write_allow_executables(
         del data["allowExecutables"]
 
     dump_yaml(data, manifest_path)
+
+
+def materialize_exec_map(ctx: ExecTrustContext) -> dict[str, dict[str, bool]] | None:
+    """Materialise the deny-wins effective allow-map from a trust context.
+
+    Returns ``None`` when the gate is disabled; otherwise every candidate
+    package key is run through :func:`resolve_exec_decision` and only ALLOWED
+    ``(key, exec_type)`` pairs are emitted, each also under its version-blind
+    name so the gate's exact-membership lookup matches any installed version.
+    """
+    if not ctx.gate_enabled:
+        return None
+
+    candidate_keys: set[str] = set()
+    candidate_keys |= set(ctx.project_allow) | set(ctx.project_deny)
+    candidate_keys |= set(ctx.user_allow) | set(ctx.user_deny)
+    candidate_keys |= set(ctx.org_recommend) | set(ctx.org_deny) | set(ctx.org_enforce)
+    candidate_keys |= set(ctx.org_bin_deny)
+
+    result: dict[str, dict[str, bool]] = {}
+    for key in candidate_keys:
+        for exec_type in ALL_EXEC_TYPES:
+            if not resolve_exec_decision(ctx, key, exec_type).allowed:
+                continue
+            result.setdefault(key, {})[exec_type] = True
+            name = _strip_version(key)
+            if name != key:
+                result.setdefault(name, {})[exec_type] = True
+    return result
+
+
+def exec_status_for_declaration(
+    ctx: ExecTrustContext,
+    candidate_keys: list[str],
+    exec_types: tuple[str, ...],
+) -> str | None:
+    """Return the lockfile ``exec_status`` for a package's declared executables.
+
+    Resolves every declared exec type across the candidate keys and folds the
+    decisions into ONE worst-case trust state for the lockfile field:
+
+    * any declared type hard-DENIED   -> ``denied``
+    * else any declared type not allowed -> ``gated_pending_approval``
+    * else (all declared types allowed)  -> ``deployed``
+
+    Returns ``None`` when the package declares no executables (the audit then
+    treats it as trusted) or when the gate is disabled.
+    """
+    if not exec_types or not ctx.gate_enabled:
+        return None
+
+    worst = TRUST_DEPLOYED
+    for exec_type in exec_types:
+        best = None
+        for key in candidate_keys:
+            decision = resolve_exec_decision(ctx, key, exec_type)
+            if decision.allowed:
+                best = TRUST_DEPLOYED
+                break
+            # Prefer the more severe of denied/gated across candidate keys.
+            if decision.trust_state == TRUST_DENIED:
+                best = TRUST_DENIED
+            elif best is None:
+                best = TRUST_GATED
+        if best == TRUST_DENIED:
+            return TRUST_DENIED
+        if best == TRUST_GATED:
+            worst = TRUST_GATED
+    return worst
+
+
+def build_effective_exec_map(
+    *,
+    policy: Any | None,
+    project_data: dict[str, Any] | None,
+) -> dict[str, dict[str, bool]] | None:
+    """Materialise the deny-wins effective allow-map consumed by the install gate.
+
+    This is the #1873 replacement for the legacy ``{**project, **user}``
+    user-wins merge. See :func:`materialize_exec_map` for the emission rules.
+
+    Returns ``None`` when the gate is disabled (backward-compatible: every
+    executable deploys), mirroring :attr:`ExecTrustContext.gate_enabled`.
+    """
+    ctx = build_exec_trust_context(policy=policy, project_data=project_data)
+    return materialize_exec_map(ctx)
+
+
+def effective_allow_executables(
+    project_allow_executables: dict[str, dict[str, bool]] | None,
+) -> dict[str, dict[str, bool]] | None:
+    """Return the effective allow-map for an install run (deny-wins).
+
+    Back-compat shim around :func:`build_effective_exec_map`: the historical
+    ``{**project, **user}`` user-wins merge is replaced by the #1873 deny-wins
+    precedence. Callers that only have the legacy ``allowExecutables`` block
+    (no org policy) reach the resolver through here; the install template uses
+    :func:`build_effective_exec_map` directly so the org-deny ceiling applies.
+
+    Returns ``None`` when the gate is disabled (no block), preserving the
+    backward-compatible "deploy everything" behaviour.
+    """
+    if isinstance(project_allow_executables, dict):
+        data: dict[str, Any] = {"allowExecutables": project_allow_executables}
+    else:
+        # ``allow_executables`` is ``dict | None`` by contract; any other shape
+        # (an absent/unparsed in-memory signal) means "no project layer".
+        data = {}
+    return build_effective_exec_map(policy=None, project_data=data)
+
+
+def filter_mcp_by_allow_executables(
+    mcp_deps: list,
+    project_allow_execs: dict | None,
+    logger: Any,
+) -> list:
+    """Filter MCP deps not approved in allowExecutables. Returns filtered list."""
+    if project_allow_execs is None or not mcp_deps:
+        return mcp_deps
+    _allow_execs = effective_allow_executables(project_allow_execs)
+    if _allow_execs is None:
+        return mcp_deps
+    _filtered = []
+    for _dep in mcp_deps:
+        _slug = _dep.name
+        # Fail-closed: keep a server only when it carries a name AND that name
+        # is approved.  A falsy/missing name is treated as NOT approved so an
+        # unnamed dep can never slip past the gate.
+        if _slug and is_package_approved(_allow_execs, _slug, EXEC_TYPE_MCP):
+            _filtered.append(_dep)
+        elif _slug:
+            logger.verbose_detail(
+                f"Skipping MCP server from '{_slug}': executables not trusted yet. "
+                f"Run 'apm approve {_slug}' to trust it."
+            )
+        else:
+            logger.verbose_detail(
+                "Skipping an unnamed MCP server: executables not trusted yet. "
+                "Identify it in apm.yml and run 'apm approve <package>' to trust it."
+            )
+    if len(_filtered) < len(mcp_deps):
+        logger.warning(
+            f"Filtered {len(mcp_deps) - len(_filtered)} MCP server(s) whose "
+            "executables are not trusted yet.",
+            symbol="warning",
+        )
+    return _filtered
+
+
+def read_bundle_allow_executables(apm_yml_path: Path, logger: Any) -> dict | None:
+    """Read allowExecutables from apm.yml for bundle install. Fail-closed on error."""
+    try:
+        from ..utils.yaml_io import load_yaml  # local import avoids circular at module init
+
+        if not apm_yml_path.is_file():
+            return None
+        data = load_yaml(apm_yml_path)
+        if isinstance(data, dict):
+            return parse_allow_executables(data)
+        return None
+    except Exception as exc:
+        logger.warning(
+            f"Could not read allowExecutables from apm.yml: {exc}. "
+            "Treating as fully enforced with no approvals.",
+            symbol="warning",
+        )
+        return {}
+
+
+# -------------------------------------------------------------------
+# Unified vocabulary layer (issue #1873): one noun ``executables``
+# -------------------------------------------------------------------
+#
+# Canonical definitions in _exec_io.py (parse_project_executables,
+# load_user_executables, save_user_executables, build_exec_trust_context,
+# load_project_executables, write_project_executables) -- re-exported
+# above for backward-compatible imports.
+
+
+_ALIAS_DEPRECATION_WARNED = False
+
+
+def warn_allow_executables_alias_once(logger: Any | None = None) -> None:
+    """Emit the ``allowExecutables`` deprecation warning at most once per run.
+
+    The deprecated ``allowExecutables`` block in ``apm.yml`` still works (it
+    folds into ``executables.allow``), but writers should migrate. This warns
+    a single time on ``apm install`` / ``apm approve`` so the message is
+    actionable without spamming once per package (#1873).
+    """
+    global _ALIAS_DEPRECATION_WARNED
+    if _ALIAS_DEPRECATION_WARNED:
+        return
+    _ALIAS_DEPRECATION_WARNED = True
+    msg = (
+        "'allowExecutables' in apm.yml is deprecated; it now maps to "
+        "'executables.allow'. It will migrate automatically on your next "
+        "'apm approve'/'apm deny'."
+    )
+    if logger is not None:
+        logger.warning(msg, symbol="warning")
+        return
+    from ..utils.console import _rich_warning
+
+    _rich_warning(msg)
+
+
+def _user_config_file() -> Path:
+    """Return the path to the user-local JSON config (override seam in tests)."""
+    from .. import config
+
+    return Path(config.CONFIG_FILE)
+
+
+def _legacy_approvals_path() -> Path:
+    """Return the path to the deprecated ``~/.apm/approvals.yml`` store.
+
+    Read-only: the file is migrated into ``~/.apm/config.json`` on first read
+    and deleted. There is no writer for this path anymore (#1873).
+    """
+    return Path.home() / ".apm" / "approvals.yml"

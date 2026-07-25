@@ -42,16 +42,17 @@ from __future__ import annotations
 
 import builtins
 import contextlib
-import sys
 import time
+from functools import wraps
 from typing import TYPE_CHECKING
 
-from ..models.results import InstallResult
+from ..models.results import InstallDisposition, InstallResult
 from ..utils.console import _rich_error
 from ..utils.diagnostics import DiagnosticCollector
 from ..utils.path_security import PathTraversalError
-from .errors import AuthenticationError, DirectDependencyError
+from .errors import AuthenticationError, DirectDependencyError, InstallFailureAlreadyRendered
 from .pipeline_preflight import _preflight_auth_check
+from .transaction import InstallTransaction
 
 if TYPE_CHECKING:
     from ..core.auth import AuthResolver
@@ -108,12 +109,13 @@ def _enforce_require_hashes(ctx) -> None:
     policy = getattr(policy_fetch, "policy", None) if policy_fetch else None
     if policy is None:
         return
-    if not policy.security.integrity.require_hashes:
-        return
 
     from ..deps.lockfile import LockFile, get_lockfile_path
-    from .integrity import enforce_require_hashes
+    from .integrity import enforce_require_hashes, require_hashes_enabled
     from .phases.policy_gate import PolicyViolationError
+
+    if not require_hashes_enabled(policy.security.integrity):
+        return
 
     apm_dir = getattr(ctx, "apm_dir", None) or ctx.project_root
     lockfile_path = get_lockfile_path(apm_dir)
@@ -233,7 +235,9 @@ def _resolve_managed_files(apm_dir, diagnostics):
                     "Re-run with 'apm install --update' to re-resolve "
                     "through the registry, or unset PROXY_REGISTRY_ONLY."
                 )
-                sys.exit(1)
+                raise InstallFailureAlreadyRendered(
+                    "Proxy-only lockfile contains direct VCS dependencies"
+                )
 
         # Supply chain warning: registry-proxy entries without a
         # content_hash cannot be verified on re-install.
@@ -328,6 +332,64 @@ def _run_skill_path_migration(ctx) -> None:
                 )
 
 
+def _transactional_pipeline(run):
+    """Supply a compatibility transaction and rollback every exceptional exit."""
+
+    @wraps(run)
+    def wrapped(*args, **kwargs):
+        transaction = kwargs.get("transaction")
+        owns_transaction = transaction is None
+        if transaction is None:
+            from ..core.scope import InstallScope, get_manifest_path, get_modules_dir
+
+            scope = kwargs.get("scope") or InstallScope.PROJECT
+            try:
+                manifest_path = get_manifest_path(scope)
+                modules_dir = get_modules_dir(scope)
+            except (AttributeError, TypeError):
+                from pathlib import Path
+
+                manifest_path = Path.cwd() / "apm.yml"
+                modules_dir = Path.cwd() / "apm_modules"
+            transaction = InstallTransaction(
+                manifest_path=manifest_path,
+                apm_modules_dir=modules_dir,
+                validation=None,
+                logger=kwargs.get("logger"),
+            )
+            kwargs["transaction"] = transaction
+        try:
+            result = run(*args, **kwargs)
+        except BaseException:
+            transaction.rollback()
+            raise
+        if result is None:
+            result = InstallResult()
+        if owns_transaction:
+            result = transaction.complete(result)
+        return result
+
+    return wrapped
+
+
+def _init_integrate_ctx(ctx, logger, apm_dir, verbose: bool) -> None:
+    """Populate integrate-phase context attributes from resolved pipeline state.
+
+    Sets diagnostics, drains transitive failures, creates the installed-packages
+    accumulator, and resolves managed_files / registry_config.  Extracted from
+    ``run_install_pipeline`` to satisfy the PLR0915 statement-count budget.
+    """
+    diagnostics = logger.diagnostics if logger is not None else DiagnosticCollector(verbose=verbose)
+    for dep_display, fail_msg in ctx.transitive_failures:
+        diagnostics.error(fail_msg, package=dep_display)
+    managed_files, registry_config = _resolve_managed_files(apm_dir, diagnostics)
+    ctx.diagnostics = diagnostics
+    ctx.registry_config = registry_config
+    ctx.managed_files = managed_files
+    ctx.installed_packages = []
+
+
+@_transactional_pipeline
 def run_install_pipeline(  # noqa: PLR0913, RUF100
     apm_package: APMPackage,
     update_refs: bool = False,
@@ -352,7 +414,7 @@ def run_install_pipeline(  # noqa: PLR0913, RUF100
     plan_callback=None,
     refresh: bool = False,
     lockfile_only: bool = False,
-    trust_canvas: bool = False,
+    transaction: InstallTransaction | None = None,
 ):
     """Install APM package dependencies.
 
@@ -472,7 +534,7 @@ def run_install_pipeline(  # noqa: PLR0913, RUF100
         legacy_skill_paths=legacy_skill_paths,
         refresh=refresh,
         lockfile_only=lockfile_only,
-        trust_canvas=trust_canvas,
+        transaction=transaction,
     )
 
     # ------------------------------------------------------------------
@@ -521,10 +583,16 @@ def run_install_pipeline(  # noqa: PLR0913, RUF100
     if plan_callback is not None:
         from .plan import build_update_plan
 
-        plan = build_update_plan(_early_lockfile, ctx.deps_to_install)
+        complete_dep_keys = ctx.update_plan_complete_dep_keys if ctx.only_packages else None
+        plan = build_update_plan(
+            _early_lockfile,
+            ctx.deps_to_install,
+            complete_resolved_dep_keys=complete_dep_keys,
+        )
         proceed = plan_callback(plan)
         if not proceed:
-            return InstallResult()
+            transaction.rollback()
+            return InstallResult(disposition=InstallDisposition.CANCELLED)
 
     ctx.tui.__enter__()
     try:
@@ -587,30 +655,9 @@ def run_install_pipeline(  # noqa: PLR0913, RUF100
         # integrate, cleanup, lockfile) continue using bare-name locals.
         # Future S-phases will fold them into the context one by one.
         # --------------------------------------------------------------
-        transitive_failures = ctx.transitive_failures
-
-        # Reuse the logger's DiagnosticCollector when available so that
-        # diagnostics recorded earlier in the pipeline (e.g. warn-mode
-        # policy violations pushed by ``logger.policy_violation()`` from
-        # the policy_gate phase, which runs BEFORE this point) surface
-        # in the final install summary.  Block-mode violations also flow
-        # through here, but the pipeline aborts via PolicyViolationError
-        # before render_summary() runs, so the inline ``[x]`` print is
-        # what users see -- no duplication.
-        diagnostics = (
-            logger.diagnostics if logger is not None else DiagnosticCollector(verbose=verbose)
-        )
-
-        # Drain transitive failures collected during resolution into diagnostics
-        for dep_display, fail_msg in transitive_failures:
-            diagnostics.error(fail_msg, package=dep_display)
-
-        # Collect installed packages for lockfile generation
-        from ..deps.installed_package import InstalledPackage
-
-        installed_packages: builtins.list[InstalledPackage] = []
-
-        managed_files, registry_config = _resolve_managed_files(apm_dir, diagnostics)
+        # Drain transitive failures, set up DiagnosticCollector, initialise
+        # installed_packages accumulator, and resolve managed_files/registry_config.
+        _init_integrate_ctx(ctx, logger, apm_dir, verbose)
 
         # --------------------------------------------------------------
         # Phase 4 (#171): Parallel package pre-download
@@ -623,12 +670,6 @@ def run_install_pipeline(  # noqa: PLR0913, RUF100
         # --------------------------------------------------------------
         # Phase 5: Sequential integration loop + root primitives
         # --------------------------------------------------------------
-        # Populate ctx with locals needed by the integrate phase.
-        ctx.diagnostics = diagnostics
-        ctx.registry_config = registry_config
-        ctx.managed_files = managed_files
-        ctx.installed_packages = installed_packages
-
         from .phases import integrate as _integrate_phase
 
         ctx.tui.start_phase("integrate", total=len(ctx.deps_to_install) or 1)
@@ -644,6 +685,12 @@ def run_install_pipeline(  # noqa: PLR0913, RUF100
             raise DirectDependencyError(
                 "One or more direct dependencies failed validation. Run with --verbose for details."
             )
+
+        from .outcome import result_from_install_context
+
+        precommit_result = result_from_install_context(ctx)
+        if precommit_result.disposition is InstallDisposition.FAILED:
+            return precommit_result
 
         # Update .gitignore only for project-scoped installs, not in lockfile_only mode.
         if scope == InstallScope.PROJECT and not lockfile_only:
@@ -727,6 +774,8 @@ def run_install_pipeline(  # noqa: PLR0913, RUF100
     except DirectDependencyError:
         # #946: same pattern -- surface the message as-is instead of
         # double-wrapping it through the generic RuntimeError below.
+        raise
+    except InstallFailureAlreadyRendered:
         raise
     except PathTraversalError:
         # Path-safety violation in SKILL_BUNDLE or other nested

@@ -19,7 +19,6 @@ from pathlib import Path
 
 from apm_cli.core.null_logger import NullCommandLogger
 from apm_cli.deps.lockfile import LockFile, get_lockfile_path
-from apm_cli.integration._shared import deduplicate_deps
 from apm_cli.integration.mcp_config_clean import (
     _clean_claude_config as _clean_claude_config,
 )
@@ -29,10 +28,17 @@ from apm_cli.integration.mcp_config_clean import (
 from apm_cli.integration.mcp_config_clean import (
     _clean_toml_mcp_config as _clean_toml_mcp_config,
 )
+from apm_cli.integration.mcp_config_view import (
+    _collect_transitive_compat,
+    _deduplicate,
+    _get_server_configs,
+    _get_server_provenance,
+)
 from apm_cli.integration.mcp_vscode import (
     _is_vscode_available as _is_vscode_available,
 )
 from apm_cli.runtime.utils import find_runtime_binary
+from apm_cli.utils.atomic_io import write_text_lf
 from apm_cli.utils.console import (
     _get_console,  # noqa: F401 -- re-exported; mcp_integrator_install imports this via lazy import
     _rich_success,
@@ -61,13 +67,11 @@ class MCPIntegrator:
         logger=None,
         diagnostics=None,
     ) -> list:
-        """Collect MCP deps from resolved packages (see mcp_runtime_ops.collect_transitive)."""
-        from apm_cli.integration import mcp_runtime_ops
-
-        return mcp_runtime_ops.collect_transitive(
+        """Compatibility delegate for canonical MCP source traversal."""
+        return _collect_transitive_compat(
             apm_modules_dir,
-            lock_path=lock_path,
-            trust_private=trust_private,
+            lock_path,
+            trust_private,
             logger=logger,
             diagnostics=diagnostics,
         )
@@ -83,7 +87,7 @@ class MCPIntegrator:
         Root deps are listed before transitive, so root overlays take
         precedence.
         """
-        return deduplicate_deps(deps)
+        return _deduplicate(deps)
 
     # ------------------------------------------------------------------
     # Server info helpers
@@ -243,13 +247,12 @@ class MCPIntegrator:
     @staticmethod
     def get_server_configs(mcp_deps: list) -> builtins.dict:
         """Extract server configs as {name: config_dict} from MCP dependencies."""
-        configs: builtins.dict = {}
-        for dep in mcp_deps:
-            if hasattr(dep, "to_dict") and hasattr(dep, "name"):
-                configs[dep.name] = dep.to_dict()
-            elif isinstance(dep, str):
-                configs[dep] = {"name": dep}
-        return configs
+        return _get_server_configs(mcp_deps)
+
+    @staticmethod
+    def get_server_provenance(mcp_deps: list) -> builtins.dict:
+        """Extract transitive provenance as {name: declaring_package} from MCP deps."""
+        return _get_server_provenance(mcp_deps)
 
     @staticmethod
     def _append_drifted_to_install_list(
@@ -519,7 +522,7 @@ class MCPIntegrator:
                     for name in removed:
                         del servers[name]
                     if removed:
-                        intellij_mcp.write_text(_json.dumps(config, indent=2), encoding="utf-8")
+                        write_text_lf(intellij_mcp, _json.dumps(config, indent=2))
                         for name in removed:
                             _rich_success(
                                 f"Removed stale MCP server '{name}' from {intellij_mcp}",
@@ -578,18 +581,10 @@ class MCPIntegrator:
         lock_path: Path | None = None,
         *,
         mcp_configs: builtins.dict | None = None,
+        mcp_target_servers: builtins.dict | None = None,
+        mcp_config_provenance: builtins.dict | None = None,
     ) -> None:
-        """Update the lockfile with the current set of APM-managed MCP server names.
-
-        Accepts the lock path directly to avoid a redundant disk read when the
-        caller already has it.
-
-        Args:
-            mcp_server_names: Set of MCP server names to persist.
-            lock_path: Path to the lockfile.  Defaults to ``apm.lock.yaml`` in CWD.
-            mcp_configs: Keyword-only.  When provided, overwrites ``mcp_configs``
-                         in the lockfile (used for drift-detection baseline).
-        """
+        """Update the lockfile with the current set of APM-managed MCP server names."""
         if lock_path is None:
             lock_path = get_lockfile_path(Path.cwd())
         if not lock_path.exists():
@@ -602,6 +597,25 @@ class MCPIntegrator:
             lockfile.mcp_servers = sorted(mcp_server_names)
             if mcp_configs is not None:
                 lockfile.mcp_configs = mcp_configs
+            if mcp_target_servers is not None:
+                from apm_cli.core.deployment_ledger import DeploymentLedgerCodec
+
+                DeploymentLedgerCodec.replace_mcp_target_servers(
+                    lockfile,
+                    {
+                        target: sorted(servers)
+                        for target, servers in sorted(mcp_target_servers.items())
+                        if servers
+                    },
+                )
+            if mcp_config_provenance is not None:
+                lockfile.mcp_config_provenance = mcp_config_provenance
+            if lockfile.mcp_config_provenance:
+                lockfile.mcp_config_provenance = {
+                    name: pkg
+                    for name, pkg in lockfile.mcp_config_provenance.items()
+                    if name in lockfile.mcp_configs
+                }
             if lockfile.is_semantically_equivalent(existing_lockfile):
                 _log.debug("MCP lockfile unchanged -- skipping write")
                 return
@@ -735,7 +749,7 @@ class MCPIntegrator:
         )
 
     @staticmethod
-    def install(
+    def install(  # noqa: PLR0913
         mcp_deps: list,
         runtime: str = None,  # noqa: RUF013
         exclude: str = None,  # noqa: RUF013
@@ -744,34 +758,13 @@ class MCPIntegrator:
         stored_mcp_configs: dict = None,  # noqa: RUF013
         project_root=None,
         user_scope: bool = False,
-        explicit_target: str | None = None,
+        explicit_target: str | list[str] | None = None,
         logger=None,
         diagnostics=None,
         scope=None,
+        managed_target_servers: builtins.dict | None = None,
     ) -> int:
-        """Install MCP dependencies.
-
-        Args:
-            mcp_deps: List of MCP dependency entries (registry strings or
-                MCPDependency objects).
-            runtime: Target specific runtime only.
-            exclude: Exclude specific runtime from installation.
-            verbose: Show detailed installation information.
-            apm_config: The parsed apm.yml configuration dict (optional).
-                When not provided, the method loads it from disk.
-            stored_mcp_configs: Previously stored MCP configs from lockfile
-                for diff-aware installation.  When provided, servers whose
-                manifest config has changed are re-applied automatically.
-            project_root: Project root for repo-local runtime configs.
-            user_scope: Whether runtime configuration is being resolved at user scope.
-            explicit_target: Explicit target selected by CLI or manifest.
-            scope: InstallScope (PROJECT or USER). When USER, only
-                runtimes whose adapter declares ``supports_user_scope``
-                are targeted; workspace-only runtimes are skipped.
-
-        Returns:
-            Number of MCP servers newly configured or updated.
-        """
+        """Install MCP dependencies."""
         from apm_cli.integration.mcp_integrator_install import run_mcp_install
 
         return run_mcp_install(
@@ -787,4 +780,5 @@ class MCPIntegrator:
             logger=logger,
             diagnostics=diagnostics,
             scope=scope,
+            managed_target_servers=managed_target_servers,
         )

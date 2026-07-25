@@ -25,27 +25,40 @@ Supports:
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import subprocess
 import threading  # noqa: F401
+import time  # noqa: F401 -- seam: _discovery_cache.py uses _d.time.time() to allow test patching
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse  # noqa: F401 -- re-exported seam for test patches
 
 import requests
 
-from ..cache.url_normalize import SCP_LIKE_RE
 from ..utils.github_host import (
     is_azure_devops_hostname,
-    is_visualstudio_legacy_hostname,
 )
 from ._discovery_ado import (
     _fetch_ado_contents as _fetch_ado_contents,
 )
 from ._discovery_ado import (
     _fetch_from_ado_repo as _fetch_from_ado_repo,
+)
+from ._discovery_ado import (
+    _get_token_for_host as _get_token_for_host,
+)
+from ._discovery_ado import (
+    _is_github_host as _is_github_host,
+)
+from ._discovery_ado import (
+    _load_from_file as _load_from_file,
+)
+from ._discovery_ado import (
+    _parse_remote_url as _parse_remote_url,
+)
+from ._discovery_ado import (
+    _parse_scheme_remote_url as _parse_scheme_remote_url,
 )
 from ._discovery_cache import (
     CACHE_SCHEMA_VERSION as CACHE_SCHEMA_VERSION,
@@ -60,7 +73,13 @@ from ._discovery_cache import (
     POLICY_CACHE_DIR as POLICY_CACHE_DIR,
 )
 from ._discovery_cache import (
+    _cache_entry_files_exist as _cache_entry_files_exist,
+)
+from ._discovery_cache import (
     _cache_key as _cache_key,
+)
+from ._discovery_cache import (
+    _cache_only_policy_result as _cache_only_policy_result,
 )
 from ._discovery_cache import (
     _CacheEntry as _CacheEntry,
@@ -99,16 +118,28 @@ from ._discovery_cache import (
     _stale_fallback_or_error as _stale_fallback_or_error,
 )
 from ._discovery_cache import (
+    _unverifiable_cache_pin as _unverifiable_cache_pin,
+)
+from ._discovery_cache import (
     _verify_hash_pin as _verify_hash_pin,
 )
 from ._discovery_cache import (
     _write_cache as _write_cache,
+)
+from ._discovery_cache import (
+    policy_cache_available as policy_cache_available,
 )
 from ._discovery_chain import (
     _derive_leaf_host as _derive_leaf_host,
 )
 from ._discovery_chain import (
     _extract_extends_host as _extract_extends_host,
+)
+from ._discovery_chain import (
+    _fetch_chain_parent as _fetch_chain_parent,
+)
+from ._discovery_chain import (
+    _resolve_ado_parent_ref as _resolve_ado_parent_ref,
 )
 from ._discovery_chain import (
     _resolve_and_persist_chain as _resolve_and_persist_chain,
@@ -119,6 +150,18 @@ from ._discovery_chain import (
 from ._discovery_chain import (
     _validate_extends_host as _validate_extends_host,
 )
+from ._discovery_github import (
+    _call_github_api as _call_github_api,
+)
+from ._discovery_github import (
+    _decode_github_content as _decode_github_content,
+)
+from ._discovery_github import (
+    _fetch_github_contents as _fetch_github_contents,
+)
+from ._discovery_github import (
+    _parse_github_repo_ref as _parse_github_repo_ref,
+)
 from .parser import PolicyValidationError, load_policy
 from .project_config import (
     ProjectPolicyConfigError,
@@ -128,13 +171,9 @@ from .schema import ApmPolicy
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Policy repo discovery: cascading candidate repos per host profile
-# ---------------------------------------------------------------------------
 
 # Candidate repo names in precedence order (first valid policy wins).
-# Host profiles select which candidates are valid for a given git host.
-_DEFAULT_POLICY_REPOS: tuple[str, ...] = (".github", ".apm", "_apm")
+_DEFAULT_POLICY_REPOS: tuple[str, ...] = (".github-private", ".github", ".apm", "_apm")
 _ADO_POLICY_REPOS: tuple[str, ...] = ("_apm",)
 
 # ADO project name for the policy repo (ADO requires a project container).
@@ -190,6 +229,13 @@ class PolicyFetchResult:
     raw_bytes_hash: str | None = None
     expected_hash: str | None = None  # The pin that was checked, if any
 
+    # -- Warnings (informational messages from discovery) --
+    warnings: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.warnings is None:
+            self.warnings = []
+
     @property
     def found(self) -> bool:
         return self.policy is not None
@@ -198,6 +244,9 @@ class PolicyFetchResult:
 def discover_policy_with_chain(
     project_root: Path,
     *,
+    policy_override: str | None = None,
+    no_cache: bool = False,
+    cache_only: bool = False,
     expected_hash: str | None = None,
 ) -> PolicyFetchResult:
     """Discover policy with full inheritance chain resolution.
@@ -211,6 +260,12 @@ def discover_policy_with_chain(
     ----------
     project_root:
         Project root directory (used for git-remote org extraction and cache).
+    policy_override:
+        Optional override for the policy source (file path, URL, or org ref).
+    no_cache:
+        Skip the cache and always fetch fresh from the network.
+    cache_only:
+        Only serve from cache; never fetch from the network.
     expected_hash:
         Optional pin in ``"<algo>:<hex>"`` form (sourced from
         ``policy.hash`` in the project's ``apm.yml``). When set, the
@@ -239,6 +294,8 @@ def discover_policy_with_chain(
         return PolicyFetchResult(outcome="disabled")
 
     # -- Resolve project-side hash pin (#827) --------------------------
+    # Must happen before cache_only shortcut so an invalid pin triggers
+    # hash_mismatch even in offline / cache-only mode.
     if expected_hash is None:
         try:
             pin = read_project_policy_hash_pin(project_root)
@@ -251,17 +308,70 @@ def discover_policy_with_chain(
         if pin is not None:
             expected_hash = pin.normalized
 
+    # -- Local file override + cache_only: fetch file, then resolve chain offline
+    if policy_override:
+        local_path = Path(policy_override)
+        if local_path.exists() and local_path.is_file():
+            fetch_result = discover_policy(
+                project_root,
+                policy_override=policy_override,
+                no_cache=True,
+                expected_hash=expected_hash,
+            )
+            if fetch_result.policy is not None and fetch_result.policy.extends is not None:
+                _resolve_and_persist_chain(
+                    fetch_result,
+                    project_root,
+                    no_cache=no_cache,
+                    cache_only=cache_only,
+                )
+            return fetch_result
+
+    # -- Cache-only mode ------------------------------------------------
+    # Short-circuit: if no cache files exist at all, we cannot serve from
+    # cache and the git subprocess call in _auto_discover is unnecessary.
+    # Return a result that still honours project-side policy settings
+    # (fetch_failure_default and expected_hash) without making any
+    # network or subprocess calls.
+    if cache_only and not (policy_override and Path(policy_override).is_file()):
+        if not _any_policy_cache_exists(project_root):
+            if expected_hash is not None:
+                return PolicyFetchResult(
+                    source="",
+                    outcome="hash_mismatch",
+                    error="Policy hash pin cannot be verified without cached policy bytes",
+                    expected_hash=expected_hash,
+                )
+            return PolicyFetchResult(outcome="absent")
+    if cache_only:
+        return discover_policy(
+            project_root,
+            policy_override=policy_override,
+            no_cache=False,
+            cache_only=True,
+            expected_hash=expected_hash,
+        )
+
     # -- Base discovery ------------------------------------------------
-    fetch_result = discover_policy(project_root, expected_hash=expected_hash)
+    fetch_result = discover_policy(
+        project_root,
+        policy_override=policy_override,
+        no_cache=no_cache,
+        expected_hash=expected_hash,
+    )
 
     # -- Chain resolution if leaf has extends: -------------------------
     if (
         fetch_result.policy is not None
-        and fetch_result.outcome in ("found", "cached_stale")
         and fetch_result.policy.extends is not None
         and not fetch_result.cached  # Don't re-resolve if served from cache
     ):
-        _resolve_and_persist_chain(fetch_result, project_root)
+        _resolve_and_persist_chain(
+            fetch_result,
+            project_root,
+            no_cache=no_cache,
+            cache_only=cache_only,
+        )
 
     return fetch_result
 
@@ -271,22 +381,20 @@ def discover_policy(
     *,
     policy_override: str | None = None,
     no_cache: bool = False,
+    cache_only: bool = False,
     expected_hash: str | None = None,
 ) -> PolicyFetchResult:
     """Discover and load the applicable policy for a project.
 
     Resolution order:
     1. If policy_override is a local file path -> load from file
-    2. If policy_override is an https:// URL -> fetch from URL
-       (http:// is rejected for security)
+    2. If policy_override is an https:// URL -> fetch from URL (http:// is rejected)
     3. If policy_override is "org" -> auto-discover from project's git remote
-    4. If policy_override is "owner/repo" (or "host/owner/repo")
-       -> fetch from that repo via GitHub Contents API
+    4. If policy_override is "owner/repo" -> fetch from that repo via GitHub Contents API
     5. If policy_override is None -> auto-discover from project's git remote
 
     The optional ``expected_hash`` (``"<algo>:<hex>"``) pins the leaf
-    policy bytes; mismatches return ``outcome="hash_mismatch"`` and
-    must always be treated fail-closed by callers.
+    policy bytes; mismatches return ``outcome="hash_mismatch"`` (fail-closed).
     """
     if policy_override:
         path = Path(policy_override)
@@ -310,61 +418,30 @@ def discover_policy(
                 policy_override,
                 project_root,
                 no_cache=no_cache,
+                cache_only=cache_only,
                 expected_hash=expected_hash,
             )
 
     # Auto-discover from git remote
-    return _auto_discover(project_root, no_cache=no_cache, expected_hash=expected_hash)
-
-
-def _load_from_file(path: Path, *, expected_hash: str | None = None) -> PolicyFetchResult:
-    """Load policy from a local file."""
-    try:
-        content = path.read_text(encoding="utf-8")
-    except Exception as e:
-        return PolicyFetchResult(
-            error=f"Failed to read {path}: {e}",
-            outcome="cache_miss_fetch_fail",
-        )
-
-    source_label = f"file:{path}"
-    mismatch = _verify_hash_pin(content, expected_hash, source_label)
-    if mismatch is not None:
-        return mismatch
-
-    try:
-        policy, _warnings = load_policy(content)
-        outcome = "empty" if _is_policy_empty(policy) else "found"
-        actual_hash = (
-            _compute_hash_normalized(content, expected_hash) if expected_hash is not None else None
-        )
-        return PolicyFetchResult(
-            policy=policy,
-            source=source_label,
-            outcome=outcome,
-            raw_bytes_hash=actual_hash,
-            expected_hash=expected_hash,
-        )
-    except PolicyValidationError as e:
-        return PolicyFetchResult(error=f"Invalid policy file {path}: {e}", outcome="malformed")
+    return _auto_discover(
+        project_root,
+        no_cache=no_cache,
+        cache_only=cache_only,
+        expected_hash=expected_hash,
+    )
 
 
 def _auto_discover(
     project_root: Path,
     *,
     no_cache: bool = False,
+    cache_only: bool = False,
     expected_hash: str | None = None,
 ) -> PolicyFetchResult:
     """Auto-discover policy by cascading through candidate repos.
 
-    1. Run git remote get-url origin
-    2. Parse org + host from URL
-    3. Select host profile to determine candidate repos
-    4. Try each candidate in precedence order (.github > .apm > _apm)
-       - 404/absent -> continue to next candidate
-       - Error (auth, timeout, malformed) -> fail-closed immediately
-       - Found -> return (first match wins)
-    5. All candidates exhausted -> outcome="absent"
+    Tries .github-private > .github > .apm > _apm in order; returns the first
+    match or outcome="absent" if all are absent.
     """
     org_and_host = _extract_org_from_git_remote(project_root)
     if org_and_host is None:
@@ -376,6 +453,20 @@ def _auto_discover(
     org, host = org_and_host
     candidates = _policy_repo_candidates(host)
     is_ado = is_azure_devops_hostname(host)
+
+    # cache_only: serve from cache for the first candidate that has one
+    if cache_only:
+        for candidate_repo in candidates:
+            repo_ref = f"{org}/{candidate_repo}"
+            if host and host != "github.com":
+                repo_ref = f"{host}/{repo_ref}"
+            result = _cache_only_policy_result(repo_ref, project_root)
+            if result.outcome != "not_found":
+                return result
+        return PolicyFetchResult(
+            error="No cached policy available (cache_only=True)",
+            outcome="absent",
+        )
 
     for candidate_repo in candidates:
         logger.debug("Trying org policy repo candidate %s on host %s", candidate_repo, host)
@@ -416,6 +507,20 @@ def _auto_discover(
     )
 
 
+def _any_policy_cache_exists(project_root: Path) -> bool:
+    """Return True if any cached policy entry exists for this project.
+
+    Scans ``apm_modules/.policy-cache/`` for ``*.yml`` files with a
+    matching ``*.meta.json`` sidecar -- the pair that the cache writer
+    always creates.  This check requires no git subprocess call and is
+    safe to use in air-gapped / offline environments.
+    """
+    cache_dir = _get_cache_dir(project_root)
+    if not cache_dir.is_dir():
+        return False
+    return any((cache_dir / f"{p.stem}.meta.json").is_file() for p in cache_dir.glob("*.yml"))
+
+
 def _extract_org_from_git_remote(
     project_root: Path,
 ) -> tuple[str, str] | None:
@@ -442,60 +547,6 @@ def _extract_org_from_git_remote(
         return None
 
 
-def _parse_remote_url(url: str) -> tuple[str, str] | None:
-    """Parse a git remote URL into (org, host).
-
-    Accepts SCP-style SSH URLs with any username (not just ``git@``), so
-    EMU/GHE deployments that use a non-``git`` SSH user parse correctly.
-    Also handles Azure DevOps SSH URLs (``v3/`` path prefix).
-
-    Returns None if URL can't be parsed.
-    """
-    if not url:
-        return None
-
-    scp_match = SCP_LIKE_RE.match(url)
-    if scp_match:
-        host = scp_match.group("host")
-        path_part = scp_match.group("path")
-        try:
-            parts = path_part.rstrip("/").removesuffix(".git").split("/")
-            parts = [p for p in parts if p]
-            if not parts:
-                return None
-            if host == "ssh.dev.azure.com" and parts[0] == "v3" and len(parts) >= 2:
-                return (parts[1], host)
-            return (parts[0], host)
-        except (ValueError, IndexError):
-            return None
-
-    if "://" in url:
-        return _parse_scheme_remote_url(url)
-
-    return None
-
-
-def _parse_scheme_remote_url(url: str) -> tuple[str, str] | None:
-    """Parse a scheme-style remote URL (``https://host/org/...``).
-
-    Azure DevOps legacy ``*.visualstudio.com`` hosts encode the org in the
-    hostname rather than the path, so they are handled before the generic
-    path-based extraction.
-    """
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        path_parts = parsed.path.strip("/").removesuffix(".git").rstrip("/").split("/")
-        if is_visualstudio_legacy_hostname(host):
-            return (host[: -len(".visualstudio.com")], host)
-        if host and path_parts and path_parts[0]:
-            return (path_parts[0], host)
-    except Exception:
-        return None
-
-    return None
-
-
 def _fetch_from_url(
     url: str,
     project_root: Path,
@@ -519,6 +570,7 @@ def _fetch_from_url(
                 outcome=outcome,
                 raw_bytes_hash=cache_entry.raw_bytes_hash or None,
                 expected_hash=expected_hash,
+                warnings=cache_entry.warnings,
             )
 
     fetch_error: str | None = None
@@ -560,17 +612,27 @@ def _fetch_from_url(
         return mismatch
 
     try:
-        policy, _warnings = load_policy(content)
+        policy, warnings = load_policy(content)
     except PolicyValidationError as e:
         return PolicyFetchResult(
             error=f"Invalid policy from {url}: {e}",
             source=source_label,
             outcome="malformed",
+            warnings=e.warnings,
         )
 
     chain_refs = [url]
     actual_hash = _compute_hash_normalized(content, expected_hash)
-    _write_cache(url, policy, project_root, chain_refs=chain_refs, raw_bytes_hash=actual_hash)
+    # Defer cache write for policies with extends: -- chain resolver writes merged cache.
+    if not policy.extends:
+        _write_cache(
+            url,
+            policy,
+            project_root,
+            chain_refs=chain_refs,
+            raw_bytes_hash=actual_hash,
+            warnings=warnings,
+        )
     outcome = "empty" if _is_policy_empty(policy) else "found"
     return PolicyFetchResult(
         policy=policy,
@@ -578,6 +640,44 @@ def _fetch_from_url(
         outcome=outcome,
         raw_bytes_hash=actual_hash,
         expected_hash=expected_hash,
+        warnings=warnings,
+    )
+
+
+def _fetch_from_repo_cache_only(
+    repo_ref: str,
+    project_root: Path,
+    cache_entry: object,  # _CacheEntry | None
+    expected_hash: str | None,
+    source_label: str,
+) -> PolicyFetchResult:
+    """Serve a repo policy from cache without hitting the network."""
+    if expected_hash is not None and _unverifiable_cache_pin(repo_ref, project_root, expected_hash):
+        return PolicyFetchResult(
+            source=source_label,
+            outcome="hash_mismatch",
+            error=f"Cached policy hash does not match pin {expected_hash}",
+        )
+    entry = cache_entry
+    if entry is None:
+        entry = _read_cache_entry(repo_ref, project_root, expected_hash=expected_hash)
+    if entry is None:
+        # Fail-closed when a hash pin is required but no cache entry to verify against.
+        if expected_hash is not None:
+            return PolicyFetchResult(
+                source=source_label,
+                outcome="hash_mismatch",
+                error=f"No cached policy to verify against pin {expected_hash}",
+            )
+        return PolicyFetchResult(source=source_label, outcome="absent")
+    return PolicyFetchResult(
+        policy=entry.policy,
+        source=entry.source,
+        cached=True,
+        cache_stale=True,
+        cache_age_seconds=entry.age_seconds,
+        outcome="cached_stale",
+        warnings=entry.warnings,
     )
 
 
@@ -586,6 +686,7 @@ def _fetch_from_repo(
     project_root: Path,
     *,
     no_cache: bool = False,
+    cache_only: bool = False,
     expected_hash: str | None = None,
 ) -> PolicyFetchResult:
     """Fetch apm-policy.yml from a GitHub repo via Contents API.
@@ -607,16 +708,21 @@ def _fetch_from_repo(
                 outcome=outcome,
                 raw_bytes_hash=cache_entry.raw_bytes_hash or None,
                 expected_hash=expected_hash,
+                warnings=cache_entry.warnings,
             )
+
+    if cache_only:
+        return _fetch_from_repo_cache_only(
+            repo_ref, project_root, cache_entry, expected_hash, source_label
+        )
 
     content, error = _fetch_github_contents(repo_ref, "apm-policy.yml")
 
-    if error:
-        if "404" in error:
-            return PolicyFetchResult(source=source_label, outcome="absent")
-        return _stale_fallback_or_error(cache_entry, error, source_label, "cache_miss_fetch_fail")
-
-    if content is None:
+    if error or content is None:
+        if error and "404" not in error:
+            return _stale_fallback_or_error(
+                cache_entry, error, source_label, "cache_miss_fetch_fail"
+            )
         return PolicyFetchResult(source=source_label, outcome="absent")
 
     garbage_result = _detect_garbage(content, repo_ref, source_label, cache_entry)
@@ -628,17 +734,27 @@ def _fetch_from_repo(
         return mismatch
 
     try:
-        policy, _warnings = load_policy(content)
+        policy, warnings = load_policy(content)
     except PolicyValidationError as e:
         return PolicyFetchResult(
             error=f"Invalid policy in {repo_ref}: {e}",
             source=source_label,
             outcome="malformed",
+            warnings=e.warnings,
         )
 
     chain_refs = [repo_ref]
     actual_hash = _compute_hash_normalized(content, expected_hash)
-    _write_cache(repo_ref, policy, project_root, chain_refs=chain_refs, raw_bytes_hash=actual_hash)
+    # Defer cache write for policies with extends: -- chain resolver writes merged cache.
+    if not policy.extends:
+        _write_cache(
+            repo_ref,
+            policy,
+            project_root,
+            chain_refs=chain_refs,
+            raw_bytes_hash=actual_hash,
+            warnings=warnings,
+        )
     outcome = "empty" if _is_policy_empty(policy) else "found"
     return PolicyFetchResult(
         policy=policy,
@@ -646,117 +762,5 @@ def _fetch_from_repo(
         outcome=outcome,
         raw_bytes_hash=actual_hash,
         expected_hash=expected_hash,
+        warnings=warnings,
     )
-
-
-# ---------------------------------------------------------------------------
-# GitHub API helpers -- decomposed to keep _fetch_github_contents <= 8 returns
-# ---------------------------------------------------------------------------
-
-
-def _parse_github_repo_ref(repo_ref: str) -> tuple[str, str, str] | None:
-    """Parse repo_ref into (host, owner, repo_path), or None if invalid."""
-    parts = repo_ref.split("/")
-    if len(parts) == 2:
-        return ("github.com", parts[0], parts[1])
-    if len(parts) >= 3:
-        return (parts[0], parts[1], "/".join(parts[2:]))
-    return None
-
-
-def _decode_github_content(data: dict, repo_ref: str) -> tuple[str | None, str | None]:
-    """Decode GitHub API response body to (content_str, error_str)."""
-    if data.get("encoding") == "base64" and data.get("content"):
-        content = base64.b64decode(data["content"]).decode("utf-8")
-        return content, None
-    if data.get("content"):
-        return data["content"], None
-    return None, f"Unexpected response format from {repo_ref}"
-
-
-def _call_github_api(
-    api_url: str,
-    headers: dict,
-    repo_ref: str,
-) -> tuple[str | None, str | None]:
-    """Call GitHub Contents API and return (content_str, error_str)."""
-    try:
-        resp = requests.get(api_url, headers=headers, timeout=10, allow_redirects=False)
-    except requests.exceptions.Timeout:
-        return None, f"Timeout fetching policy from {repo_ref}"
-    except requests.exceptions.ConnectionError:
-        return None, f"Connection error fetching policy from {repo_ref}"
-    except Exception as e:
-        return None, f"Error fetching policy from {repo_ref}: {e}"
-
-    if resp.status_code == 404:
-        return None, "404: Policy file not found"
-    if resp.status_code == 403:
-        return None, f"403: Access denied to {repo_ref}"
-    if 300 <= resp.status_code < 400:
-        location = resp.headers.get("Location", "<no Location header>")
-        return None, (f"Refusing HTTP redirect ({resp.status_code}) from {api_url} to {location}")
-    if resp.status_code != 200:
-        return None, f"HTTP {resp.status_code} fetching policy from {repo_ref}"
-    return _decode_github_content(resp.json(), repo_ref)
-
-
-def _fetch_github_contents(
-    repo_ref: str,
-    file_path: str,
-) -> tuple[str | None, str | None]:
-    """Fetch file contents from GitHub API.
-
-    Returns (content_string, error_string). One will be None.
-    """
-    parsed = _parse_github_repo_ref(repo_ref)
-    if parsed is None:
-        return None, f"Invalid repo reference: {repo_ref}"
-
-    host, owner, repo = parsed
-    if host == "github.com":
-        api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path}"
-    else:
-        api_url = f"https://{host}/api/v3/repos/{owner}/{repo}/contents/{file_path}"
-
-    headers = {"Accept": "application/vnd.github.v3+json"}
-    token = _get_token_for_host(host)
-    if token:
-        headers["Authorization"] = f"token {token}"
-
-    return _call_github_api(api_url, headers, repo_ref)
-
-
-def _is_github_host(host: str) -> bool:
-    """Return True if *host* is a known GitHub-family hostname."""
-    if host == "github.com":
-        return True
-    if host.endswith(".ghe.com"):
-        return True
-    gh_host = os.environ.get("GITHUB_HOST", "")
-    if gh_host and host == gh_host:  # noqa: SIM103
-        return True
-    return False
-
-
-def _get_token_for_host(host: str) -> str | None:
-    """Get authentication token for a given host.
-
-    Environment-variable tokens (GITHUB_TOKEN, GITHUB_APM_PAT, GH_TOKEN)
-    are only returned when *host* is a recognized GitHub-family hostname.
-    For other hosts the token manager + git credential helpers are used.
-    """
-    try:
-        from ..core.token_manager import GitHubTokenManager
-
-        manager = GitHubTokenManager()
-        return manager.get_token_with_credential_fallback("modules", host)
-    except Exception as exc:
-        logger.debug("Token manager failed for %s: %s", host, exc)
-        if _is_github_host(host):
-            return (
-                os.environ.get("GITHUB_TOKEN")
-                or os.environ.get("GITHUB_APM_PAT")
-                or os.environ.get("GH_TOKEN")
-            )
-        return None

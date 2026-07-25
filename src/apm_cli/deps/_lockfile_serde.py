@@ -10,11 +10,106 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ..models.apm_package import DependencyReference
+
 if TYPE_CHECKING:
-    from ..models.apm_package import DependencyReference
     from .lockfile import LockedDependency
 
-_ALLOWED_HOST_TYPES = {"gitlab"}
+_ALLOWED_HOST_TYPES: set[str] | None = None
+
+_ALLOWED_EXEC_STATUS = {"deployed", "gated_pending_approval", "denied", "absent"}
+
+
+class LockfileFormatError(ValueError):
+    """Raised when a lockfile container does not match its schema."""
+
+
+class UnsupportedLockfileVersionError(LockfileFormatError):
+    """Raised when a lockfile declares a version this client cannot read."""
+
+
+def _get_allowed_host_types() -> set[str]:
+    global _ALLOWED_HOST_TYPES
+    if _ALLOWED_HOST_TYPES is None:
+        try:
+            from ..core.host_providers import accepted_host_types
+
+            _ALLOWED_HOST_TYPES = set(accepted_host_types())
+        except Exception:
+            _ALLOWED_HOST_TYPES = {"gitlab"}
+    return _ALLOWED_HOST_TYPES
+
+
+def _validate_lockfile_container(data: object) -> dict[str, Any]:
+    """Validate version and top-level container shapes before construction."""
+    # Defer to lockfile.py's accessor -- the constant is owned there (#1078).
+    from .lockfile import _get_supported_versions
+
+    _supported_versions = _get_supported_versions()
+    if not isinstance(data, dict):
+        raise LockfileFormatError("Lockfile root must be a mapping")
+    data = dict(data)
+    version = data.get("lockfile_version", "1")
+    if not isinstance(version, str) or version not in _supported_versions:
+        supported = ", ".join(sorted(_supported_versions))
+        raise UnsupportedLockfileVersionError(
+            f"Unsupported lockfile version {version!r}; supported versions: {supported}"
+        )
+    list_fields = (
+        "dependencies",
+        "deployments",
+        "mcp_servers",
+        "lsp_servers",
+        "local_deployed_files",
+    )
+    mapping_fields = (
+        "mcp_configs",
+        "mcp_target_servers",
+        "mcp_config_provenance",
+        "lsp_configs",
+        "local_deployed_file_hashes",
+    )
+    for field_name in list_fields:
+        if field_name in data and data[field_name] is None:
+            data[field_name] = []
+        elif field_name in data and not isinstance(data[field_name], list):
+            raise LockfileFormatError(f"Lockfile field {field_name!r} must be a list")
+    for field_name in mapping_fields:
+        if field_name in data and data[field_name] is None:
+            data[field_name] = {}
+        elif field_name in data and not isinstance(data[field_name], dict):
+            raise LockfileFormatError(f"Lockfile field {field_name!r} must be a mapping")
+    for index, dependency in enumerate(data.get("dependencies", [])):
+        if not isinstance(dependency, dict):
+            raise LockfileFormatError(f"Lockfile dependency at index {index} must be a mapping")
+    for target, servers in (data.get("mcp_target_servers") or {}).items():
+        if not isinstance(target, str) or not isinstance(servers, list):
+            raise LockfileFormatError(
+                "Lockfile mcp_target_servers values must be string-to-list mappings"
+            )
+    if "deployments" in data:
+        from ..core.deployment_ledger import DeploymentLedgerCodec
+
+        try:
+            DeploymentLedgerCodec.validate_rows(data["deployments"])
+        except ValueError as exc:
+            raise LockfileFormatError(str(exc)) from exc
+    return data
+
+
+def _normalize_exec_status(raw: Any) -> str | None:
+    """Validate and normalize the optional executable-trust status."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("lockfile exec_status must be a non-empty string")
+    value = raw.strip()
+    if value not in _ALLOWED_EXEC_STATUS:
+        raise ValueError(
+            f"Unsupported lockfile exec_status: {raw}. Supported values: "
+            f"{', '.join(sorted(_ALLOWED_EXEC_STATUS))}"
+        )
+    return value
 
 
 def _normalize_lockfile_host_type(raw: Any) -> str | None:
@@ -24,10 +119,10 @@ def _normalize_lockfile_host_type(raw: Any) -> str | None:
     if not isinstance(raw, str) or not raw.strip():
         raise ValueError("lockfile host_type must be a non-empty string")
     value = raw.strip().lower()
-    if value not in _ALLOWED_HOST_TYPES:
+    allowed = _get_allowed_host_types()
+    if value not in allowed:
         raise ValueError(
-            f"Unsupported lockfile host_type: {raw}. Supported values: "
-            f"{', '.join(sorted(_ALLOWED_HOST_TYPES))}"
+            f"Unsupported lockfile host_type: {raw}. Supported values: {', '.join(sorted(allowed))}"
         )
     return value
 
@@ -66,7 +161,14 @@ def locked_dependency_from_dict(
         if _p_int is not None and 1 <= _p_int <= 65535:
             port = _p_int
 
-    host_type = _normalize_lockfile_host_type(data.get("host_type"))
+    import sys
+
+    _lockfile_mod = sys.modules.get("apm_cli.deps.lockfile")
+    _normalize_ht = (
+        getattr(_lockfile_mod, "_normalize_lockfile_host_type", None)
+        or _normalize_lockfile_host_type
+    )
+    host_type = _normalize_ht(data.get("host_type"))
 
     # Recognised keys this build knows about. Anything else is captured
     # as ``_unknown_fields`` so a re-emit preserves forward-introduced
@@ -105,10 +207,27 @@ def locked_dependency_from_dict(
         "resolved_tag",
         "resolved_at",
         "declared_license",
+        "declaring_parent",
+        "anchored_local_path",
+        "target_subset",
+        "exec_status",
+        "name",
         # legacy migration key handled above
         "deployed_skills",
     }
-    unknown_fields = {k: v for k, v in data.items() if k not in _known_keys}
+    unknown_fields = {
+        k: v
+        for k, v in data.items()
+        if k not in _known_keys and not DependencyReference.is_transient_provider_field(k)
+    }
+
+    import sys
+
+    _lockfile_mod2 = sys.modules.get("apm_cli.deps.lockfile")
+    _normalize_es = (
+        getattr(_lockfile_mod2, "_normalize_exec_status", None) or _normalize_exec_status
+    )
+    exec_status = _normalize_es(data.get("exec_status"))
 
     return cls(
         repo_url=data["repo_url"],
@@ -143,6 +262,11 @@ def locked_dependency_from_dict(
         resolved_tag=data.get("resolved_tag"),
         resolved_at=data.get("resolved_at"),
         declared_license=data.get("declared_license"),
+        declaring_parent=data.get("declaring_parent"),
+        anchored_local_path=data.get("anchored_local_path"),
+        target_subset=list(data.get("target_subset") or []),
+        exec_status=exec_status,
+        name=data.get("name"),
         _unknown_fields=unknown_fields,
     )
 
@@ -157,6 +281,8 @@ def locked_dependency_from_ref(
     registry_config=None,
     registry_resolution=None,
     git_semver_resolution=None,
+    package_name: str | None = None,
+    package_version: str | None = None,
 ) -> LockedDependency:
     """Create a :class:`LockedDependency` from a DependencyReference.
 
@@ -218,14 +344,29 @@ def locked_dependency_from_ref(
     else:
         source = None
 
-    # When a git-semver resolution is present, prefer the concrete
-    # resolved tag for ``resolved_ref`` (so subsequent installs see a
-    # literal tag, not the original range). The original constraint
-    # is preserved in the dedicated ``constraint`` field.
+    # Prefer the concrete resolved identifier for ``resolved_ref`` so that
+    # ``build_update_plan`` can detect real version changes by comparing
+    # old_ref (locked concrete) vs new_ref (freshly resolved concrete).
+    # Registry deps: store the resolved version (e.g. "1.0.3"), not the
+    # range ("^1.0.0").  Git-semver deps: store the resolved tag.  Both
+    # preserve the original selector in their dedicated fields
+    # (``version`` / ``constraint`` respectively).
     if git_semver_resolution is not None:
         resolved_ref_val: str | None = git_semver_resolution.resolved_tag
+    elif registry_resolution is not None:
+        resolved_ref_val = registry_resolution.version
     else:
         resolved_ref_val = dep_ref.reference
+
+    dep_ref.validate_provider_coordinates()
+    if registry_resolution is not None:
+        version_value = registry_resolution.version
+    elif git_semver_resolution is not None:
+        version_value = git_semver_resolution.resolved_version
+    elif source != "registry":
+        version_value = package_version
+    else:
+        version_value = None
 
     return cls(
         repo_url=dep_ref.repo_url,
@@ -235,26 +376,23 @@ def locked_dependency_from_ref(
         registry_prefix=registry_prefix,
         resolved_commit=resolved_commit,
         resolved_ref=resolved_ref_val,
-        version=(
-            registry_resolution.version
-            if registry_resolution is not None
-            else (
-                git_semver_resolution.resolved_version
-                if git_semver_resolution is not None
-                else None
-            )
-        ),
+        version=version_value,
         virtual_path=dep_ref.virtual_path,
         is_virtual=dep_ref.is_virtual,
         depth=depth,
         resolved_by=resolved_by,
         source=source,
         local_path=dep_ref.local_path if dep_ref.is_local else None,
+        declaring_parent=dep_ref.declaring_parent if dep_ref.is_local else None,
+        anchored_local_path=dep_ref.anchored_local_path if dep_ref.is_local else None,
         is_dev=is_dev,
         is_insecure=dep_ref.is_insecure,
         allow_insecure=dep_ref.allow_insecure,
         skill_subset=sorted(dep_ref.skill_subset)
         if isinstance(getattr(dep_ref, "skill_subset", None), list)
+        else [],
+        target_subset=sorted(dep_ref.target_subset)
+        if isinstance(getattr(dep_ref, "target_subset", None), list)
         else [],
         resolved_url=(
             registry_resolution.resolved_url if registry_resolution is not None else None
@@ -271,4 +409,5 @@ def locked_dependency_from_ref(
         resolved_at=(
             git_semver_resolution.resolved_at if git_semver_resolution is not None else None
         ),
+        name=package_name,
     )

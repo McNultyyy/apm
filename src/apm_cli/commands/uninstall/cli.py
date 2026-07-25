@@ -2,20 +2,17 @@
 
 import builtins
 import sys
-import traceback
 
 import click
 
 from ...constants import APM_YML_FILENAME
 from ...core.command_logger import CommandLogger
-from ...models.apm_package import APMPackage
+from ._orphan_ops import _persist_uninstall_state
 from .engine import (
-    _cleanup_stale_mcp,
     _cleanup_transitive_orphans,
     _dry_run_uninstall,
     _parse_dependency_entry,
     _remove_packages_from_disk,
-    _sync_integrations_after_uninstall,
     _validate_uninstall_packages,
 )
 
@@ -40,12 +37,14 @@ def _collect_deployed_files(packages_to_remove, actual_orphans, lockfile):
     return BaseIntegrator.normalize_managed_files(all_deployed_files) or builtins.set()
 
 
-def _update_lockfile_after_remove(
-    lockfile, packages_to_remove, actual_orphans, lockfile_path, logger
-):
-    """Update or delete the lockfile after package removal."""
+def _update_lockfile_after_remove(lockfile, packages_to_remove, actual_orphans):
+    """Mutate lockfile in memory after package removal; returns True if changed.
+
+    Does NOT write to disk -- the caller is responsible for the deferred write
+    after all in-memory mutations (ledger reconciliation, MCP state) agree.
+    """
     if not lockfile:
-        return
+        return False
     lockfile_updated = False
     for pkg in packages_to_remove:
         try:
@@ -60,16 +59,7 @@ def _update_lockfile_after_remove(
         if orphan_key in lockfile.dependencies:
             del lockfile.dependencies[orphan_key]
             lockfile_updated = True
-    if lockfile_updated:
-        try:
-            if lockfile.dependencies:
-                lockfile.write(lockfile_path)
-            else:
-                lockfile_path.unlink(missing_ok=True)
-        except Exception:
-            logger.warning(
-                "Failed to update lockfile -- it may be out of sync with uninstalled packages."
-            )
+    return lockfile_updated
 
 
 @click.command(help="Remove APM packages, their integrated files, and apm.yml entries")
@@ -135,12 +125,23 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
 
         logger.start(f"Uninstalling {len(packages)} package(s)...")
 
+        # Fire pre-uninstall lifecycle scripts
+        _fire_uninstall_scripts(
+            "pre-uninstall",
+            packages=packages,
+            scope=scope,
+            manifest_path=manifest_path,
+            logger=logger,
+            verbose=verbose,
+            deploy_root=deploy_root,
+        )
+
         # Read current apm.yml
-        from ...utils.yaml_io import dump_yaml, load_yaml
+        from ...utils.yaml_io import dump_yaml_roundtrip, load_yaml_roundtrip
 
         apm_yml_path = manifest_path
         try:
-            data = load_yaml(apm_yml_path) or {}
+            data = load_yaml_roundtrip(apm_yml_path) or {}
         except Exception as e:
             logger.error(f"Failed to read {apm_yml_path}: {e}")
             sys.exit(1)
@@ -186,7 +187,7 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
         # Step 2: Dry run
         modules_dir = get_modules_dir(scope)
         if dry_run:
-            _dry_run_uninstall(packages_to_remove, modules_dir, logger)
+            _dry_run_uninstall(packages_to_remove, modules_dir, logger, apm_yml_path)
             return
 
         # Step 3: Remove from apm.yml
@@ -207,7 +208,7 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
             if not data["devDependencies"] and not had_dev_section:
                 del data["devDependencies"]
         try:
-            dump_yaml(data, apm_yml_path)
+            dump_yaml_roundtrip(data, apm_yml_path)
             logger.success(f"Updated {apm_yml_path} (removed {len(packages_to_remove)} package(s))")
         except Exception as e:
             logger.error(f"Failed to write {apm_yml_path}: {e}")
@@ -230,62 +231,26 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
         # Step 7: Collect deployed files for removed packages (before lockfile mutation)
         all_deployed_files = _collect_deployed_files(packages_to_remove, actual_orphans, lockfile)
 
-        # Step 8: Update lockfile
-        _update_lockfile_after_remove(
-            lockfile, packages_to_remove, actual_orphans, lockfile_path, logger
+        # Step 8: Mutate dependency state in memory. Persistence happens once
+        # after survivor ownership, hashes, ledger, and MCP state agree.
+        lockfile_updated = _update_lockfile_after_remove(
+            lockfile, packages_to_remove, actual_orphans
         )
 
-        # Step 9: Sync integrations
-        cleaned = {
-            "prompts": 0,
-            "agents": 0,
-            "skills": 0,
-            "commands": 0,
-            "hooks": 0,
-            "instructions": 0,
-        }
-        try:
-            apm_package = APMPackage.from_apm_yml(manifest_path)
-            cleaned = _sync_integrations_after_uninstall(
-                apm_package,
-                deploy_root,
-                all_deployed_files,
-                logger,
-                user_scope=scope is InstallScope.USER,
-            )
-        except Exception as _sync_err:
-            # Surface why integration cleanup failed instead of swallowing
-            # silently. Previously a bare `except: pass` here masked
-            # Windows-only failures where the DB row was never deleted on
-            # `apm uninstall --target copilot-app`.
-            logger.warning(f"Integration cleanup failed: {type(_sync_err).__name__}: {_sync_err}")
-            # Preserve the traceback under verbose for diagnosing
-            # platform-specific failures without spamming default output.
-            logger.verbose_detail(traceback.format_exc().rstrip())
-            logger.verbose_detail(
-                "Some integrated files may remain. Run `apm install --force` to resync."
-            )
-
-        for label, count in cleaned.items():
-            if count > 0:
-                logger.progress(f"Cleaned up {count} integrated {label}", symbol="check")
-                logger.verbose_detail(f"    Removed {count} deployed {label} file(s)")
-
-        # Step 10: MCP cleanup
-        try:
-            apm_package = APMPackage.from_apm_yml(manifest_path)
-            _cleanup_stale_mcp(
-                apm_package,
-                lockfile,
-                lockfile_path,
-                _pre_uninstall_mcp_servers,
-                modules_dir=get_modules_dir(scope),
-                project_root=deploy_root,
-                user_scope=scope is InstallScope.USER,
-                scope=scope,
-            )
-        except Exception:
-            logger.warning("MCP cleanup during uninstall failed")
+        # Steps 9-10: Sync integrations, reconcile lockfile state, MCP cleanup,
+        # and flush the deferred lockfile write.
+        _persist_uninstall_state(
+            manifest_path=manifest_path,
+            deploy_root=deploy_root,
+            all_deployed_files=all_deployed_files,
+            lockfile=lockfile,
+            lockfile_path=lockfile_path,
+            lockfile_updated=lockfile_updated,
+            scope=scope,
+            logger=logger,
+            pre_mcp_servers=_pre_uninstall_mcp_servers,
+            modules_dir=modules_dir,
+        )
 
         # Final summary
         summary_lines = [f"Removed {len(packages_to_remove)} package(s) from apm.yml"]
@@ -296,6 +261,59 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
         if packages_not_found:
             logger.warning(f"Note: {len(packages_not_found)} package(s) were not found in apm.yml")
 
+        # Fire post-uninstall lifecycle scripts
+        _fire_uninstall_scripts(
+            "post-uninstall",
+            packages=packages_to_remove,
+            scope=scope,
+            manifest_path=manifest_path,
+            logger=logger,
+            verbose=verbose,
+            deploy_root=deploy_root,
+        )
+
     except Exception as e:
         logger.error(f"Error uninstalling packages: {e}")
         sys.exit(1)
+
+
+def _fire_uninstall_scripts(
+    event_name: str,
+    *,
+    packages,
+    scope,
+    manifest_path,
+    logger,
+    verbose: bool,
+    deploy_root,
+) -> None:
+    """Build a script runner and fire an uninstall lifecycle event.
+
+    Best-effort: all exceptions are swallowed so scripts never block
+    the uninstall flow.
+    """
+    import contextlib
+
+    with contextlib.suppress(Exception):
+        from apm_cli.core.lifecycle_scripts import (
+            LifecycleEvent,
+            PackageInfo,
+            build_runner_from_context,
+        )
+
+        runner = build_runner_from_context(
+            logger=logger,
+            verbose=verbose,
+            project_root=str(deploy_root),
+        )
+
+        pkg_infos = [PackageInfo(name=str(pkg)) for pkg in packages]
+        scope_name = scope.value if hasattr(scope, "value") else str(scope)
+        event = LifecycleEvent.create(
+            event=event_name,
+            packages=pkg_infos,
+            scope=scope_name,
+            working_directory=str(deploy_root),
+        )
+
+        runner.fire(event_name, event)

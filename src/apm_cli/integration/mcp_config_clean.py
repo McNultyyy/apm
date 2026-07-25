@@ -9,7 +9,13 @@ through ``mcp_integrator`` so the module-level patch target
 import builtins
 import json
 import logging
+from collections.abc import MutableMapping
 from pathlib import Path
+
+import tomlkit
+from tomlkit.exceptions import TOMLKitError
+
+from apm_cli.utils.atomic_io import atomic_write_text, write_text_lf
 
 _log = logging.getLogger(__name__)
 
@@ -57,7 +63,7 @@ def _clean_json_mcp_config(
             text = json.dumps(config, indent=2)
             if trailing_newline:
                 text += "\n"
-            config_path.write_text(text, encoding="utf-8")
+            write_text_lf(config_path, text)
             for name in removed:
                 msg = f"Removed stale MCP server '{name}' from {label}"
                 if use_rich:
@@ -94,15 +100,15 @@ def _clean_toml_mcp_config(
     if not config_path.exists():
         return 0
     try:
-        import toml as _toml
-
-        config = _toml.loads(config_path.read_text(encoding="utf-8"))
+        config = tomlkit.parse(config_path.read_text(encoding="utf-8"))
         servers = config.get("mcp_servers", {})
+        if not isinstance(servers, MutableMapping):
+            return 0
         removed = [n for n in stale_names if n in servers]
         for name in removed:
             del servers[name]
         if removed:
-            config_path.write_text(_toml.dumps(config), encoding="utf-8")
+            atomic_write_text(config_path, tomlkit.dumps(config), new_file_mode=0o600)
             for name in removed:
                 msg = f"Removed stale MCP server '{name}' from {label}"
                 if use_rich:
@@ -110,7 +116,7 @@ def _clean_toml_mcp_config(
                 elif logger is not None:
                     logger.progress(msg)
         return len(removed)
-    except Exception:
+    except (OSError, TOMLKitError, UnicodeDecodeError):
         _log.debug("Failed to clean stale MCP servers from %s", label, exc_info=True)
         return 0
 
@@ -151,7 +157,7 @@ def _clean_claude_config(
         for name in removed:
             del servers[name]
         if removed:
-            config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+            write_text_lf(config_path, json.dumps(config, indent=2) + "\n")
             for name in removed:
                 logger.progress(f"Removed stale MCP server '{name}' from {label}")
         return len(removed)

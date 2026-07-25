@@ -7,9 +7,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from click.testing import CliRunner
-
-from apm_cli.cli import cli
 from apm_cli.integration.hook_integrator import HookIntegrator
 from apm_cli.integration.instruction_integrator import InstructionIntegrator
 from apm_cli.integration.skill_integrator import SkillIntegrator
@@ -47,24 +44,6 @@ def _make_package_info(
         installed_at=datetime.now().isoformat(),
         package_type=package_type,
     )
-
-
-def test_kiro_is_discoverable_in_target_help() -> None:
-    runner = CliRunner()
-
-    install = runner.invoke(cli, ["install", "--help"])
-    compile_result = runner.invoke(cli, ["compile", "--help"])
-
-    expected_all_targets = "copilot+claude+cursor+opencode+codex+gemini+windsurf+kiro"
-    install_help = "".join(install.output.split())
-    compile_help = "".join(compile_result.output.split())
-
-    assert install.exit_code == 0
-    assert compile_result.exit_code == 0
-    assert expected_all_targets in install_help
-    assert expected_all_targets in compile_help
-    assert "ClaudeCode" in install_help
-    assert "Windsurf" in install_help
 
 
 def test_kiro_runtime_discovered_in_user_scope_without_project_dir(tmp_path: Path) -> None:
@@ -227,22 +206,32 @@ def test_kiro_hooks_expand_each_apm_hook_to_individual_json(tmp_path: Path) -> N
     assert result.scripts_copied == 2
 
     pre_tool = tmp_path / ".kiro" / "hooks" / "hookify-hooks-pretooluse-1.json"
-    prompt_submit = tmp_path / ".kiro" / "hooks" / "hookify-hooks-promptsubmit-1.json"
+    prompt_submit = tmp_path / ".kiro" / "hooks" / "hookify-hooks-userpromptsubmit-1.json"
     assert pre_tool.exists()
     assert prompt_submit.exists()
 
     pre_data = json.loads(pre_tool.read_text(encoding="utf-8"))
-    assert pre_data["when"] == {"type": "preToolUse"}
-    assert pre_data["then"]["type"] == "runCommand"
-    assert pre_data["then"]["command"] == "python .kiro/hooks/hookify/hooks/check.py"
-    assert pre_data["description"] == "Validate before tool use"
-    assert "hooks" not in pre_data
+    assert pre_data == {
+        "version": "v1",
+        "hooks": [
+            {
+                "name": "hookify PreToolUse 1",
+                "trigger": "PreToolUse",
+                "action": {
+                    "type": "command",
+                    "command": "python .kiro/hooks/hookify/hooks/check.py",
+                },
+            }
+        ],
+    }
     if sys.platform != "win32":
         assert pre_tool.stat().st_mode & 0o777 == 0o600
 
     prompt_data = json.loads(prompt_submit.read_text(encoding="utf-8"))
-    assert prompt_data["when"] == {"type": "promptSubmit"}
-    assert prompt_data["then"]["command"] == "python .kiro/hooks/hookify/hooks/prompt.py"
+    assert prompt_data["hooks"][0]["trigger"] == "UserPromptSubmit"
+    assert prompt_data["hooks"][0]["action"]["command"] == (
+        "python .kiro/hooks/hookify/hooks/prompt.py"
+    )
     if sys.platform != "win32":
         assert prompt_submit.stat().st_mode & 0o777 == 0o600
 
@@ -250,7 +239,66 @@ def test_kiro_hooks_expand_each_apm_hook_to_individual_json(tmp_path: Path) -> N
     assert (tmp_path / ".kiro" / "hooks" / "hookify" / "hooks" / "prompt.py").exists()
 
 
-def test_kiro_hooks_convert_prompt_actions_to_ask_agent(tmp_path: Path) -> None:
+def test_kiro_deploys_hook_directory_siblings_and_package_module_type(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".kiro").mkdir()
+    package_dir = tmp_path / "ponytail"
+    hooks_dir = package_dir / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (package_dir / "package.json").write_text(
+        json.dumps({"type": "commonjs"}),
+        encoding="utf-8",
+    )
+    (hooks_dir / "ponytail.js").write_text(
+        "const config = require('./ponytail-config');\nconsole.log(config.message);\n",
+        encoding="utf-8",
+    )
+    (hooks_dir / "ponytail-config.js").write_text(
+        "module.exports = { message: 'ok' };\n",
+        encoding="utf-8",
+    )
+    (hooks_dir / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "node ${PLUGIN_ROOT}/hooks/ponytail.js",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = HookIntegrator().integrate_hooks_for_target(
+        KNOWN_TARGETS["kiro"],
+        _make_package_info(package_dir, "ponytail"),
+        tmp_path,
+    )
+
+    deployed_root = tmp_path / ".kiro" / "hooks" / "ponytail" / "hooks"
+    deployed_script = deployed_root / "ponytail.js"
+    deployed_sibling = deployed_root / "ponytail-config.js"
+    deployed_package_json = deployed_root / "package.json"
+    assert result.files_integrated == 1
+    assert result.scripts_copied == 1
+    assert deployed_script.exists()
+    assert deployed_sibling.exists()
+    assert json.loads(deployed_package_json.read_text(encoding="utf-8")) == {"type": "commonjs"}
+    assert deployed_script in result.target_paths
+    assert deployed_sibling in result.target_paths
+    assert deployed_package_json in result.target_paths
+
+
+def test_kiro_hooks_convert_prompt_actions_to_v1_agent(tmp_path: Path) -> None:
     (tmp_path / ".kiro").mkdir()
     package_dir = tmp_path / "prompt-hooks"
     hooks_dir = package_dir / "hooks"
@@ -277,13 +325,21 @@ def test_kiro_hooks_convert_prompt_actions_to_ask_agent(tmp_path: Path) -> None:
         tmp_path,
     )
 
-    target = tmp_path / ".kiro" / "hooks" / "prompt-hooks-hooks-promptsubmit-1.json"
+    target = tmp_path / ".kiro" / "hooks" / "prompt-hooks-hooks-userpromptsubmit-1.json"
     assert result.files_integrated == 1
     data = json.loads(target.read_text(encoding="utf-8"))
-    assert data["when"] == {"type": "promptSubmit"}
-    assert data["then"] == {
-        "type": "askAgent",
-        "prompt": "Review the submitted prompt for policy drift.",
+    assert data == {
+        "version": "v1",
+        "hooks": [
+            {
+                "name": "prompt-hooks UserPromptSubmit 1",
+                "trigger": "UserPromptSubmit",
+                "action": {
+                    "type": "agent",
+                    "prompt": "Review the submitted prompt for policy drift.",
+                },
+            }
+        ],
     }
     if sys.platform != "win32":
         assert target.stat().st_mode & 0o777 == 0o600

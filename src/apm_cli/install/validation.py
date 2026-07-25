@@ -21,6 +21,9 @@ _local_path_failure_reason
     Return a human-readable reason when a local-path dep fails validation.
 _local_path_no_markers_hint
     Scan a local directory for nested installable packages and hint the user.
+_generic_host_ambiguous_subpath_hint
+    Return a GITLAB_HOST/APM_GITLAB_HOSTS hint when an unrecognised FQDN
+    swallowed a subpath into a single (non-existent) repo path.
 """
 
 import re
@@ -28,8 +31,18 @@ from pathlib import Path
 
 import requests
 
+from ..deps.github_rate_limit import GitHubThrottleError, raise_for_github_throttle
 from ..utils.console import _rich_echo, _rich_info, _rich_warning
-from ..utils.github_host import default_host, is_ado_auth_failure_signal
+from ..utils.github_host import (
+    default_host,
+    is_github_hostname,
+    is_gitlab_hostname,
+)
+
+# Stage-2 line-budget split: ADO/GHES/generic-git probe lives in its own module.
+# Re-exported here so ``apm_cli.install.validation._validate_ado_git_package``
+# patch targets remain byte-identical.
+from ._validation_git_probe import _validate_ado_git_package
 from .errors import AuthenticationError
 
 # ---------------------------------------------------------------------------
@@ -41,6 +54,15 @@ from .errors import AuthenticationError
 # failures from auth / 404 / network errors so the user is not pushed down
 # the PAT troubleshooting path for a CA-trust problem.
 _TLS_ERROR_PREFIX = "TLS verification failed"
+
+
+class _GitHubRestStatusError(RuntimeError):
+    """Preserve a failed GitHub REST response status across auth fallback."""
+
+    def __init__(self, status_code: int, reason: str) -> None:
+        self.status_code = status_code
+        self.reason = reason
+        super().__init__(f"GitHub API returned HTTP {status_code}: {reason}")
 
 
 def _is_tls_failure(exc: BaseException) -> bool:
@@ -58,6 +80,49 @@ def _is_tls_failure(exc: BaseException) -> bool:
     return False
 
 
+def _inconclusive_github_probe_detail(exc: BaseException) -> str | None:
+    """Describe failures that leave repository accessibility unproven."""
+    if _is_tls_failure(exc):
+        return None
+    if isinstance(exc, _GitHubRestStatusError):
+        if exc.status_code == 408 or 500 <= exc.status_code < 600:
+            return f"HTTP {exc.status_code}"
+        return None
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "request timeout"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "connection failure"
+    return None
+
+
+def _allow_download_after_inconclusive_github_probe(
+    exc: BaseException,
+    host_display: str,
+    verbose_log,
+) -> bool:
+    """Let the downloader decide only when the REST probe was inconclusive."""
+    detail = _inconclusive_github_probe_detail(exc)
+    if detail is None:
+        return False
+    if verbose_log:
+        verbose_log(
+            f"GitHub API pre-flight for {host_display} was inconclusive ({detail}); "
+            "continuing because the download step will verify repository access"
+        )
+    return True
+
+
+def _log_rate_limit_allow(host_display: str, verbose_log, logger) -> None:
+    """Note that a throttled probe is allowed through to the download step."""
+    if logger:
+        logger.info(
+            f"GitHub API rate limit hit while checking {host_display}; skipping the "
+            "pre-flight accessibility probe and letting the download step confirm the package"
+        )
+    if verbose_log:
+        verbose_log(f"rate limit reached for {host_display}; proceeding to download")
+
+
 def _log_tls_failure(host_display: str, exc: BaseException, verbose_log, logger) -> None:
     """Surface a TLS verification failure with an actionable CA-trust hint.
 
@@ -66,9 +131,10 @@ def _log_tls_failure(host_display: str, exc: BaseException, verbose_log, logger)
     Verbose: also include the host name and the underlying exception text.
     """
     logger.warning(
-        "TLS verification failed -- if you're behind a corporate proxy or "
-        "firewall, set the REQUESTS_CA_BUNDLE environment variable to the "
-        "path of your organisation's CA bundle (a PEM file) and retry. "
+        "TLS verification failed -- APM uses the system trust store by default. "
+        "If you're behind a corporate proxy or firewall, make sure your "
+        "organisation's CA is installed in the OS trust store, or set "
+        "REQUESTS_CA_BUNDLE to a readable PEM bundle and retry. "
         "See: https://microsoft.github.io/apm/troubleshooting/ssl-issues/"
     )
     if verbose_log:
@@ -94,6 +160,38 @@ def _local_path_failure_reason(dep_ref):
         return "path is not a directory"
     # Directory exists but has no package markers
     return "no apm.yml, SKILL.md, or plugin.json found"
+
+
+def _generic_host_ambiguous_subpath_hint(dep_ref) -> str | None:
+    """Return an actionable hint when an unrecognised FQDN swallowed a subpath.
+
+    Mirrors GHES (``GITHUB_HOST``): a self-hosted GitLab instance is only
+    classified as GitLab-class -- which enables the repo/subpath boundary
+    probe for nested groups -- once the user points ``GITLAB_HOST`` or
+    ``APM_GITLAB_HOSTS`` at it (issue #2066). Without that, parse-time
+    detection has no way to know where the repo ends and the subpath
+    begins, so it folds the whole remaining path into ``repo_url``, which
+    then fails validation as a single (non-existent) repository. Surface
+    *why* instead of a bare "not accessible" so the user knows to
+    configure the host rather than suspect a permissions problem.
+    """
+    host = dep_ref.host
+    if not host or dep_ref.is_local or dep_ref.is_virtual:
+        return None
+    if is_github_hostname(host) or dep_ref.is_azure_devops() or is_gitlab_hostname(host):
+        return None
+    segments = [seg for seg in dep_ref.repo_url.split("/") if seg]
+    if len(segments) <= 2:
+        return None
+    return (
+        f"'{host}' was treated as a single repository path "
+        f"('{dep_ref.repo_url}') because it isn't recognised as GitHub, "
+        f"Azure DevOps, or GitLab. If this is a self-hosted GitLab instance, "
+        f"set GITLAB_HOST={host} (or add it to the comma-separated "
+        f"APM_GITLAB_HOSTS) and re-run to enable repo/subpath resolution for "
+        f"nested groups. Otherwise, use an explicit 'git:' + 'path:' entry "
+        f"in apm.yml."
+    )
 
 
 def _local_path_no_markers_hint(local_dir, logger=None):
@@ -243,293 +341,6 @@ def _validate_virtual_package(
     return result
 
 
-def _validate_ado_git_package(
-    dep_ref,
-    auth_resolver,
-    verbose_log,
-    package: str,
-    logger,
-) -> bool:
-    """Validate an ADO, GHES, or generic-git-host package via ``git ls-remote``.
-
-    Handles:
-    - Proxy-only short-circuit (``PROXY_REGISTRY_ONLY=1``)
-    - Host classification (GitLab, generic, ADO/GHES)
-    - Authenticated URL construction with the correct auth scheme
-    - Strict vs. fallback protocol ordering (``APM_ALLOW_PROTOCOL_FALLBACK``)
-    - ADO bearer-token fallback when a PAT is rejected
-    - Typed ``AuthenticationError`` for auth failures on managed hosts
-
-    Returns True when the repo is reachable, False otherwise.
-    Raises ``AuthenticationError`` for auth failures on non-generic managed hosts.
-    """
-    import os
-    import subprocess
-
-    from apm_cli.deps.github_downloader import GitHubPackageDownloader
-    from apm_cli.deps.transport_selection import is_fallback_allowed
-    from apm_cli.utils.github_host import is_azure_devops_hostname, is_github_hostname
-
-    from ..deps.registry_proxy import is_enforce_only
-
-    if is_enforce_only():
-        # PROXY_REGISTRY_ONLY=1: skip direct git ls-remote probe for ADO/GHES.
-        # The download step will surface a proxy 404 if the package is absent.
-        if logger:
-            logger.info(
-                "Skipping direct git ls-remote for"
-                f" {dep_ref.host or 'remote'}: proxy-only mode is active"
-            )
-        return True
-
-    # Determine host type before building the URL so we know whether to
-    # embed a token.  Generic (non-GitHub, non-ADO) hosts are excluded
-    # from APM-managed auth; they rely on git credential helpers via the
-    # relaxed validate_env below. GitLab hosts are managed when classified
-    # as GitLab because they need oauth2 HTTPS token formatting.
-    is_gitlab = (
-        auth_resolver.classify_host(
-            dep_ref.host,
-            port=dep_ref.port,
-            host_type=dep_ref.host_type,
-        ).kind
-        == "gitlab"
-    )
-    is_generic = (
-        not is_github_hostname(dep_ref.host)
-        and not is_azure_devops_hostname(dep_ref.host)
-        and not is_gitlab
-    )
-
-    # For GHES / ADO: resolve per-dependency auth up front so the URL
-    # carries an embedded token and avoids triggering OS credential
-    # helper popups during git ls-remote validation.
-    _url_token = None
-    _dep_ctx = None
-    _auth_scheme = "basic"
-    if not is_generic:
-        _dep_ctx = auth_resolver.resolve_for_dep(dep_ref)
-        _url_token = _dep_ctx.token
-        _auth_scheme = getattr(_dep_ctx, "auth_scheme", "basic") or "basic"
-
-    ado_downloader = GitHubPackageDownloader(auth_resolver=auth_resolver)
-    # Set the host
-    if dep_ref.host:
-        ado_downloader.github_host = dep_ref.host
-
-    # Build authenticated URL using the resolved per-dep token.
-    # #1015: pass auth_scheme so bearer tokens use extraheader
-    # injection instead of embedding a ~1.5KB JWT in the userinfo.
-    package_url = ado_downloader._build_repo_url(
-        dep_ref.repo_url,
-        use_ssh=False,
-        dep_ref=dep_ref,
-        token=_url_token,
-        auth_scheme=_auth_scheme,
-    )
-
-    explicit_scheme = (getattr(dep_ref, "explicit_scheme", None) or "").lower() or None
-    is_insecure = bool(getattr(dep_ref, "is_insecure", False))
-
-    # Strict-by-default cross-protocol policy (issue microsoft/apm#992):
-    # an explicit ``http://`` / ``https://`` / ``ssh://`` URL is honored
-    # exactly and does NOT silently fall back to a different protocol.
-    # This mirrors the strict default of ``_clone_with_fallback`` /
-    # :class:`TransportSelector` and prevents the foot-gun where a user
-    # types ``https://corp-bitbucket.example/...`` and the validation
-    # pre-check silently retries SSH on port 22, masking the real HTTPS
-    # failure (auth/redirect/etc.) behind a 30s SSH timeout. The
-    # ``APM_ALLOW_PROTOCOL_FALLBACK=1`` env var (the same escape-hatch
-    # the clone path honors) restores the legacy permissive chain.
-    allow_fallback_env = is_fallback_allowed()
-
-    # For generic hosts (not GitHub, not ADO), relax the env so native
-    # credential helpers (macOS Keychain, credential-store,
-    # manager-core, SSH agent, etc.) can work.  Config isolation
-    # (GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1) is only
-    # enforced for insecure plaintext HTTP connections where
-    # credential leakage is a real risk; HTTPS connections need
-    # access to user-configured helpers in ~/.gitconfig.  This
-    # matches _clone_with_fallback() and git_reference_resolver.
-    if is_generic:
-        validate_env = ado_downloader._build_noninteractive_git_env(
-            preserve_config_isolation=is_insecure,
-            suppress_credential_helpers=is_insecure,
-        )
-    else:
-        # #1015: merge _dep_ctx.git_env (bearer-aware GIT_CONFIG_*
-        # overrides) into the subprocess env so `git ls-remote`
-        # actually sends the Authorization header for AAD tokens.
-        _ctx_git_env = getattr(_dep_ctx, "git_env", {}) if _dep_ctx else {}
-        validate_env = {**os.environ, **ado_downloader.git_env, **_ctx_git_env}
-
-    # Build the probe order. Non-generic hosts (GHES/ADO) always probe
-    # a single authenticated URL. Generic hosts:
-    #   - explicit https/http  -> web URL only (strict)
-    #   - explicit ssh         -> SSH URL only (strict)
-    #   - shorthand (no scheme) -> legacy [SSH, HTTPS] chain
-    # ``APM_ALLOW_PROTOCOL_FALLBACK=1`` re-appends the opposite scheme
-    # for the explicit cases to match clone semantics exactly.
-    if is_generic:
-        ssh_url = ado_downloader._build_repo_url(dep_ref.repo_url, use_ssh=True, dep_ref=dep_ref)
-        if explicit_scheme in ("http", "https"):
-            urls_to_try: list[str] = (
-                [package_url] if not allow_fallback_env else [package_url, ssh_url]
-            )
-        elif explicit_scheme == "ssh":
-            urls_to_try = [ssh_url] if not allow_fallback_env else [ssh_url, package_url]
-        else:
-            # Shorthand has no user-stated transport; keep the legacy
-            # SSH-first chain so existing flows (e.g. SSH-key users on
-            # corporate hosts) keep validating successfully.
-            urls_to_try = [ssh_url, package_url]
-    elif is_gitlab and explicit_scheme == "ssh":
-        # Issue #1501: mirror the generic-host explicit-ssh arm so
-        # GitLab refs typed as ``git@gitlab.com:...`` or ``ssh://...``
-        # probe SSH first instead of demanding GITLAB_APM_PAT for an
-        # HTTPS probe. ``APM_ALLOW_PROTOCOL_FALLBACK=1`` mirrors
-        # ``_clone_with_fallback`` (SSH-first, HTTPS-second). The
-        # ``package_url`` fallback is built earlier with token=None
-        # when no GitLab PAT is resolved, so it embeds no credential
-        # (no token leak via git ls-remote trace output).
-        ssh_url = ado_downloader._build_repo_url(dep_ref.repo_url, use_ssh=True, dep_ref=dep_ref)
-        urls_to_try = [ssh_url] if not allow_fallback_env else [ssh_url, package_url]
-    else:
-        urls_to_try = [package_url]
-
-    if verbose_log:
-        attempt_word = "attempt" if len(urls_to_try) == 1 else "attempts"
-        verbose_log(f"Trying git ls-remote for {dep_ref.host} ({len(urls_to_try)} {attempt_word})")
-
-    def _scheme_of(url: str) -> str:
-        return url.split("://", 1)[0] if "://" in url else "ssh"
-
-    def _log_attempt_result(probe_url: str, run_result) -> None:
-        """Per-attempt sanitized verbose logging.
-
-        The previous implementation only logged the final attempt's
-        result, which masked the actual failure (typically the HTTPS
-        leg) behind the SSH-fallback timeout. Logging each attempt
-        gives users the diagnostic data they need to act.
-        """
-        if not verbose_log:
-            return
-        scheme = _scheme_of(probe_url)
-        if run_result.returncode == 0:
-            verbose_log(f"git ls-remote ({scheme}) rc=0 for {package}")
-            return
-        raw_stderr = (run_result.stderr or "").strip()[:200]
-        stderr_snippet = ado_downloader._sanitize_git_error(raw_stderr)
-        for env_var in ("GIT_ASKPASS", "GIT_CONFIG_GLOBAL"):
-            env_val = validate_env.get(env_var, "")
-            if env_val:
-                stderr_snippet = stderr_snippet.replace(env_val, "***")
-        verbose_log(f"git ls-remote ({scheme}) rc={run_result.returncode}: {stderr_snippet}")
-
-    result = None
-    for probe_url in urls_to_try:
-        cmd = ["git", "ls-remote", "--heads", "--exit-code", probe_url]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=30,
-            env=validate_env,
-        )
-        _log_attempt_result(probe_url, result)
-        if result.returncode == 0:
-            break
-
-    # ADO bearer fallback: if PAT was rejected (rc != 0 with auth-failure
-    # signal) AND the dep is on Azure DevOps AND we resolved a PAT,
-    # silently retry with az-cli bearer token.
-    if (
-        result is not None
-        and result.returncode != 0
-        and dep_ref.is_azure_devops()
-        and _url_token is not None  # we had a PAT
-        and is_ado_auth_failure_signal(result.stderr or "")
-    ):
-        try:
-            from apm_cli.core.azure_cli import AzureCliBearerError, get_bearer_provider
-
-            provider = get_bearer_provider()
-            if provider.is_available():
-                try:
-                    bearer = provider.get_bearer_token()
-                    bearer_url = ado_downloader._build_repo_url(
-                        dep_ref.repo_url,
-                        use_ssh=False,
-                        dep_ref=dep_ref,
-                        token=None,
-                        auth_scheme="bearer",
-                    )
-                    # SECURITY: build a CLEAN env via _build_git_env(scheme="bearer")
-                    # rather than {**validate_env, **build_ado_bearer_git_env(bearer)}.
-                    # validate_env still carries the PAT-context GIT_CONFIG_*
-                    # entries from _ctx_git_env; merging the bearer env on top
-                    # would keep the rejected PAT visible in the child-process
-                    # env (visible in /proc/<pid>/environ on Linux). _build_git_env
-                    # explicitly skips GIT_TOKEN for scheme="bearer" and emits
-                    # only the bearer-specific GIT_CONFIG_* injection.
-                    bearer_env = auth_resolver._build_git_env(
-                        bearer, scheme="bearer", host_kind="ado"
-                    )
-                    cmd = ["git", "ls-remote", "--heads", "--exit-code", bearer_url]
-                    bearer_result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        timeout=30,
-                        env=bearer_env,
-                    )
-                    if bearer_result.returncode == 0:
-                        # Emit deferred stale-PAT warning via resolver
-                        auth_resolver.emit_stale_pat_diagnostic(dep_ref.host or "dev.azure.com")
-                        if verbose_log:
-                            verbose_log(
-                                f"git ls-remote rc=0 for {package} (via AAD bearer fallback)"
-                            )
-                        return True
-                except AzureCliBearerError:
-                    pass
-        except ImportError:
-            pass
-
-    # Per-attempt verbose logging is emitted inside the probe loop
-    # (and by the bearer-fallback branch above), so the result is
-    # already on screen by the time we get here. Stderr is sanitized
-    # via ``GitHubPackageDownloader._sanitize_git_error`` to scrub
-    # any token-bearing URLs / env values before logging.
-
-    # #1015: distinguish auth failures from non-auth failures (DNS,
-    # timeout, repo-truly-not-found 404). Auth failures get a typed
-    # exception with actionable diagnostics; non-auth failures keep
-    # the legacy False return so the caller can word its own message.
-    if result.returncode != 0 and not is_generic:
-        if is_ado_auth_failure_signal(result.stderr or ""):
-            _host = dep_ref.host or "dev.azure.com"
-            _org = (
-                dep_ref.repo_url.split("/")[0]
-                if dep_ref.repo_url and "/" in dep_ref.repo_url
-                else None
-            )
-            _diag = auth_resolver.build_error_context(
-                _host,
-                "validate",
-                org=_org,
-                dep_url=dep_ref.repo_url,
-            )
-            raise AuthenticationError(
-                f"Authentication failed for {_host}",
-                diagnostic_context=_diag,
-            )
-
-    return result.returncode == 0
-
-
 def _validate_github_package(
     dep_ref,
     auth_resolver,
@@ -590,10 +401,8 @@ def _validate_github_package(
             verbose_log(f"API {api_url} -> {resp.status_code}")
         if resp.ok:
             return True
-        if resp.status_code == 404 and token:
-            # 404 with token could mean no access -- raise to trigger fallback
-            raise RuntimeError(f"API returned {resp.status_code}")
-        raise RuntimeError(f"API returned {resp.status_code}: {resp.reason}")
+        raise_for_github_throttle(resp, host_info.display_name)
+        raise _GitHubRestStatusError(resp.status_code, resp.reason)
 
     try:
         return auth_resolver.try_with_fallback(
@@ -608,10 +417,17 @@ def _validate_github_package(
             unauth_first=True,
             verbose_callback=verbose_log,
         )
+    except GitHubThrottleError:
+        _log_rate_limit_allow(host_info.display_name, verbose_log, logger)
+        return True
     except Exception as exc:
         if _is_tls_failure(exc):
             _log_tls_failure(host_info.display_name, exc, verbose_log, logger)
             return False
+        if _allow_download_after_inconclusive_github_probe(
+            exc, host_info.display_name, verbose_log
+        ):
+            return True
         if verbose_log:
             try:
                 ctx = auth_resolver.build_error_context(
@@ -687,7 +503,8 @@ def _validate_parse_failure_fallback(
             return True
         if verbose_log:
             verbose_log(f"API fallback -> {resp.status_code} {resp.reason}")
-        raise RuntimeError(f"API returned {resp.status_code}")
+        raise_for_github_throttle(resp, host_info.display_name)
+        raise _GitHubRestStatusError(resp.status_code, resp.reason)
 
     try:
         return auth_resolver.try_with_fallback(
@@ -698,11 +515,16 @@ def _validate_parse_failure_fallback(
             unauth_first=True,
             verbose_callback=verbose_log,
         )
+    except GitHubThrottleError:
+        _log_rate_limit_allow(host, verbose_log, logger)
+        return True
     except Exception as exc:
         if _is_tls_failure(exc):
             # See note above: logged once here, skip auth context render.
             _log_tls_failure(host, exc, verbose_log, logger)
             return False
+        if _allow_download_after_inconclusive_github_probe(exc, host, verbose_log):
+            return True
         if verbose_log:
             try:
                 ctx = auth_resolver.build_error_context(
@@ -787,6 +609,11 @@ def _validate_package_exists(package, verbose=False, auth_resolver=None, logger=
         # #1015: let auth failures propagate to the caller for proper
         # rendering -- the outer try/except is only for parse failures.
         raise
+    except GitHubThrottleError:
+        # A virtual-file probe carries a typed throttle through its local
+        # validation helpers so it cannot become a generic false negative.
+        _log_rate_limit_allow(dep_ref.host or default_host(), verbose_log, logger)
+        return True
     except Exception:
         # If parsing fails, assume it's a regular GitHub package
         return _validate_parse_failure_fallback(package, auth_resolver, verbose_log, logger)

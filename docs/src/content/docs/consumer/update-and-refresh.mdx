@@ -24,10 +24,12 @@ They are managed by separate commands. Pick the right one.
 apm update
 ```
 
-Re-resolves every dependency in `apm.yml` to its latest matching Git
-reference, prints the planned changes, and prompts for consent before
-rewriting `apm.lock.yaml` and redeploying primitives. Pass one or more
-package names (`apm update org/pkg-a org/pkg-b`) to refresh only those.
+Re-resolves every dependency in `apm.yml` to its latest matching version or ref,
+prints the planned changes, and prompts for consent before applying ref changes
+and redeploying primitives. If refs are unchanged but the locked
+`apm_modules/` cache is empty, APM [restores it without
+prompting](../../reference/cli/update/). Pass one or more package names
+(`apm update org/pkg-a org/pkg-b`) to refresh only those.
 
 Useful flags:
 

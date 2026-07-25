@@ -19,6 +19,7 @@ from apm_cli.utils.path_security import (
     validate_path_segments,
 )
 
+from .hook_native_formats import _to_claude_hook_entries
 from .hook_transforms import (
     _APM_HOOKS_SIDECAR,
     _reinject_apm_source_from_sidecar,
@@ -33,14 +34,17 @@ _log = logging.getLogger("apm_cli.integration.hook_integrator")
 # ---------------------------------------------------------------------------
 
 
+def _root_local_identity_root(package_info, project_root: Path | None) -> Path | None:
+    """Return the project root used to identify root-local packages."""
+    return getattr(package_info, "root_local_project_root", None) or project_root
+
+
 def _is_root_local_package(package_info, project_root: Path | None) -> bool:
     """Return True when *package_info* represents the project's own .apm content."""
-    if project_root is None:
+    identity_root = _root_local_identity_root(package_info, project_root)
+    if identity_root is None:
         return False
-    try:
-        return Path(package_info.install_path).resolve() == Path(project_root).resolve()
-    except (OSError, RuntimeError):
-        return False
+    return Path(package_info.install_path).resolve() == Path(identity_root).resolve()
 
 
 def _safe_source_name(value: str | None, fallback: str = "_local") -> str:
@@ -99,7 +103,8 @@ def _get_package_name(package_info, project_root: Path | None = None) -> str:
         str: Package name used as hook source marker and script namespace
     """
     if _is_root_local_package(package_info, project_root):
-        return _get_root_local_package_name(package_info, Path(project_root))
+        identity_root = _root_local_identity_root(package_info, project_root)
+        return _get_root_local_package_name(package_info, Path(identity_root))
     return package_info.install_path.name
 
 
@@ -433,7 +438,9 @@ def _merge_hook_file_entries(
 
         # Transform flat Copilot entries to the target's nested / native
         # hook shape.
-        if target_key == "gemini":
+        if target_key == "claude":
+            entries = _to_claude_hook_entries(entries)
+        elif target_key == "gemini":
             entries = _to_gemini_hook_entries(entries)
         elif target_key == "antigravity":
             entries = _to_antigravity_hook_entries(entries, event_name)
@@ -742,24 +749,33 @@ def _sync_claude_hooks_settings(json_path: Path, stats: dict[str, int]) -> None:
 
 
 def _clean_apm_entries_from_json(
-    json_path: Path, stats: dict[str, int], container: str = "hooks"
+    json_path: Path,
+    stats: dict[str, int],
+    container: str = "hooks",
+    sidecar_path: Path | None = None,
 ) -> None:
-    """Remove APM-tagged entries from a hooks JSON file.
+    """Remove APM-tagged entries from a native hooks JSON file.
 
-    Filters out entries with ``_apm_source`` markers and cleans up
-    empty event arrays and the *container* key itself.  *container*
-    defaults to ``"hooks"``; Antigravity passes ``"apm"`` (its reserved
-    hook-name container) so sibling user hook-names are left intact.
+    Reinjects *sidecar_path* ownership before filtering (when provided),
+    then unlinks it.  Antigravity passes ``container="apm"``.
     """
     if not json_path.exists():
         return
     try:
         with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
-
         if container not in data:
+            if sidecar_path is not None and sidecar_path.exists():
+                sidecar_path.unlink()
             return
-
+        if sidecar_path is not None and sidecar_path.exists():
+            try:
+                with open(sidecar_path, encoding="utf-8") as sf:
+                    sd = json.load(sf)
+                if isinstance(sd, dict):
+                    _reinject_apm_source_from_sidecar(data[container], sd)
+            except (json.JSONDecodeError, OSError):
+                pass
         modified = False
         for event_name in list(data[container].keys()):
             entries = data[container][event_name]
@@ -770,14 +786,14 @@ def _clean_apm_entries_from_json(
                 data[container][event_name] = filtered
                 if not filtered:
                     del data[container][event_name]
-
         if not data[container]:
             del data[container]
-
         if modified:
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
                 f.write("\n")
             stats["files_removed"] += 1
+        if sidecar_path is not None and sidecar_path.exists():
+            sidecar_path.unlink()
     except (json.JSONDecodeError, OSError):
         stats["errors"] += 1

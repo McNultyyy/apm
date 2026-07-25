@@ -11,6 +11,7 @@ are correctly intercepted.
 """
 
 from apm_cli.core.command_logger import CommandLogger, _strip_source_prefix, _ValidationOutcome
+from apm_cli.models.results import InstallDisposition
 
 
 class InstallLogger(CommandLogger):
@@ -535,6 +536,7 @@ class InstallLogger(CommandLogger):
         errors: int = 0,
         stale_cleaned: int = 0,
         elapsed_seconds: float | None = None,
+        disposition: InstallDisposition = InstallDisposition.SUCCESS,
     ):
         """Log final install summary.
 
@@ -550,6 +552,7 @@ class InstallLogger(CommandLogger):
                 When provided, appended as `` in {x:.1f}s`` before the
                 terminating period so the user can see how long the
                 whole command took (F5, microsoft/apm#1116).
+            disposition: Overall install outcome classification.
         """
         parts = []
         if apm_count > 0:
@@ -571,11 +574,29 @@ class InstallLogger(CommandLogger):
         if elapsed_seconds is not None:
             timing_suffix = f" in {elapsed_seconds:.1f}s"
 
-        if parts:
+        if disposition is InstallDisposition.DRY_RUN:
+            summary = " and ".join(parts) if parts else "no changes"
+            self.info(
+                f"Dry run completed: would install {summary}{timing_suffix}.",
+                symbol="info",
+            )
+        elif disposition is InstallDisposition.FAILED:
+            error_suffix = f" with {errors} error(s)" if errors > 0 else ""
+            self.error(
+                "Installation failed"
+                f"{error_suffix}{timing_suffix}. "
+                "No install transaction changes were committed.",
+            )
+        elif parts:
             summary = " and ".join(parts)
             if errors > 0:
                 self.warning(
                     f"Installed {summary}{cleanup_suffix}{timing_suffix} with {errors} error(s)."
+                )
+            elif disposition is InstallDisposition.PARTIAL_SUCCESS:
+                self.warning(
+                    f"Installed {summary}{cleanup_suffix}{timing_suffix}; "
+                    "some requested packages were skipped."
                 )
             else:
                 self.success(
@@ -597,3 +618,7 @@ class InstallLogger(CommandLogger):
         exception so a render failure cannot mask the original error.
         """
         self.warning(f"Install interrupted after {elapsed_seconds:.1f}s.")
+
+    def install_failed(self, elapsed_seconds: float) -> None:
+        """Render a handled terminal failure when no full summary ran."""
+        self.error(f"Install failed after {elapsed_seconds:.1f}s.")

@@ -5,13 +5,15 @@ import contextlib
 import os
 import sys
 import time
-from pathlib import Path
+from pathlib import Path  # noqa: F401 -- RULE B: apm_packages.py uses _m.Path
 
 import click
 
 from apm_cli.install.errors import (
     AuthenticationError,
     DirectDependencyError,
+    FrozenInstallError,
+    InstallFailureAlreadyRendered,
 )
 from apm_cli.install.gitlab_resolver import _try_resolve_gitlab_direct_shorthand  # noqa: F401
 
@@ -51,13 +53,12 @@ from apm_cli.install.services import (
     _integrate_package_primitives,  # noqa: F401
 )
 from apm_cli.install.validation import (
-    _local_path_failure_reason,  # noqa: F401 -- RULE B: pkg_resolution.py uses _m._local_path_failure_reason... wait, no it doesn't. Keep for @patch compat.
+    _local_path_failure_reason,  # noqa: F401 -- RULE B: imported by name in test_install_command.py
     _local_path_no_markers_hint,  # noqa: F401
     _validate_package_exists,  # noqa: F401 -- RULE B: pkg_resolution.py uses _m._validate_package_exists
 )
 from apm_cli.utils.diagnostics import DiagnosticCollector  # noqa: F401
 
-# Re-export manifest rollback helpers so @patch targets keep working.
 from apm_cli.install.manifest_rollback import (  # noqa: F401
     _maybe_rollback_manifest,
     _restore_manifest_from_snapshot,
@@ -88,22 +89,26 @@ from apm_cli.install.install_cmd_phases import (
     _setup_auth_and_check_manifest,
     _try_local_bundle_install,
 )
+from apm_cli.install.install_cmd_phases import _BundleSecurityCtx
 from apm_cli.install.mcp_handler import _McpConnectionParams, _handle_mcp_install
 
 from ..constants import InstallMode
 from ..core.auth import AuthResolver  # noqa: F401 -- RULE B: install_cmd_phases.py uses _m.AuthResolver
 from ..core.command_logger import InstallLogger, _ValidationOutcome  # noqa: F401
-from ..core.target_detection import TargetParamType
+from ..core.target_catalog import target_help_fragment as _target_help_fragment
+from ..core.target_detection import TargetParamType, manifest_targets_from_target_option  # noqa: F401
+from ..install.transaction import InstallTransaction  # noqa: F401 -- RULE B re-export
+from ..models.results import InstallDisposition
 
 # MCP helpers and console utilities.
 from ..install.mcp.command import run_mcp_install as _run_mcp_install  # noqa: F401
 from ..install.mcp.conflicts import validate_mcp_conflicts as _validate_mcp_conflicts
+from ..install.mcp.spec import MCPRequestSpec as _MCPRequestSpec
 from ..install.mcp.registry import (
     resolve_registry_url as _resolve_registry_url,  # noqa: F401
     validate_mcp_dry_run_entry as _validate_mcp_dry_run_entry,  # noqa: F401
     validate_registry_url as _validate_registry_url,
 )
-from ..install.mcp.spec import MCPRequestSpec as _MCPRequestSpec
 from ..utils.console import (  # noqa: F401
     _rich_echo,
     _rich_error,
@@ -111,6 +116,12 @@ from ..utils.console import (  # noqa: F401
     _rich_success,
 )
 from ._helpers import _get_invocation_argv, _split_argv_at_double_dash  # noqa: F401 -- patched by tests
+from ._install_ops import (
+    _create_transaction,
+    _make_fail_result,
+    _normalize_skill_subset,
+    _resolve_audit_override,
+)
 
 
 # CRITICAL: Shadow Python builtins that share names with Click commands
@@ -162,7 +173,8 @@ except ImportError as e:
 @click.option(
     "--runtime",
     help=(
-        "Target specific runtime only (copilot, claude, codex, cursor, gemini, antigravity, intellij, kiro, opencode, vscode, windsurf)"
+        f"Target a specific runtime only. {_target_help_fragment('install')} "
+        "(legacy alias for --target, single value only; prefer --target)"
     ),
 )
 @click.option("--exclude", help="Exclude specific runtime from installation")
@@ -194,11 +206,6 @@ except ImportError as e:
     help="Trust self-defined MCP servers from transitive packages (skip re-declaration requirement)",
 )
 @click.option(
-    "--trust-canvas-extensions",
-    is_flag=True,
-    help="[experimental] Deploy canvas extensions provided by dependencies. Canvas extensions are executable Node code and are blocked by default; this flag opts in. With --global the canvas deploys to ~/.copilot/extensions and the flag is always required. Requires the 'canvas' experimental feature.",
-)
-@click.option(
     "--parallel-downloads",
     type=int,
     default=4,
@@ -217,7 +224,14 @@ except ImportError as e:
     "target",
     type=TargetParamType(),
     default=None,
-    help="Target harness(es) to deploy to. Comma-separated for multiple: --target claude,cursor. Repeating the flag (e.g. '-t a -t b') is NOT supported -- only the last value wins; use commas. Highest-priority entry in the resolution chain (--target > apm.yml targets: > auto-detect). Values: copilot, claude, cursor, opencode, codex, gemini, antigravity, windsurf, kiro, agent-skills, all. 'agent-skills' deploys to .agents/skills/ (cross-client). 'antigravity' (alias 'agy') deploys to .agents/ (AGENTS.md + rules + skills + hooks.json + mcp_config.json) and is explicit-only -- not part of 'all' or auto-detection. 'all' = copilot+claude+cursor+opencode+codex+gemini+windsurf+kiro (excludes agent-skills and antigravity); combine with 'agent-skills' or 'antigravity' to add them. 'copilot-cowork' is also accepted when the copilot-cowork experimental flag is enabled (run 'apm experimental enable copilot-cowork'). 'copilot-app' is also accepted when the copilot-app experimental flag is enabled (run 'apm experimental enable copilot-app'). Note: '--target all' on 'apm compile' is deprecated; use 'apm compile --all' instead.",
+    help=(
+        f"Target harness(es) to deploy to. Use commas for multiple targets; repeating the flag "
+        f"keeps only the last value (use commas instead). {_target_help_fragment('install')} "
+        "IntelliJ-specific integration is MCP-only; file primitives use the Copilot profile. "
+        "'all' excludes agent-skills, antigravity, experimental targets, and intellij; combine "
+        "explicit-only targets when needed. Experimental targets require their feature flags. "
+        "Resolution order: --target > apm.yml targets: > apm config target > auto-detect."
+    ),
 )
 @click.option(
     "--allow-insecure",
@@ -407,7 +421,6 @@ def install(  # noqa: PLR0913
     frozen,
     verbose,
     trust_transitive_mcp,
-    trust_canvas_extensions,
     parallel_downloads,
     dev,
     target,
@@ -470,7 +483,9 @@ def install(  # noqa: PLR0913
     # even if logger init itself raised.
     install_started_at = time.perf_counter()
     summary_rendered = False
+    _command_result = None
     logger = None
+    transaction = None
     if frozen and update:
         raise click.UsageError(
             "--frozen and --update are mutually exclusive. "
@@ -479,14 +494,9 @@ def install(  # noqa: PLR0913
     # --root: entered manually so the existing try/finally handles __exit__.
     if root and global_:
         raise click.UsageError("--root is not valid with --global (user scope)")
-    from ..core.install_audit import resolve_audit_override_from_cli
     from ..install.root_redirect import install_root_redirect
 
-    try:
-        audit_override = resolve_audit_override_from_cli(no_audit, audit_mode)
-    except ValueError as exc:
-        raise click.UsageError(str(exc)) from exc
-
+    audit_override = _resolve_audit_override(no_audit, audit_mode)
     _root_redirect = install_root_redirect(root, dry_run=dry_run)
     _root_redirect.__enter__()
     try:
@@ -496,26 +506,14 @@ def install(  # noqa: PLR0913
         is_partial = bool(packages)
         logger = InstallLogger(verbose=verbose, dry_run=dry_run, partial=is_partial)
 
-        # W2-pkg-rollback (#827): init snapshot vars before any branch that might
-        # raise, so except handlers can always reference them (no UnboundLocalError).
-        _manifest_snapshot: bytes | None = None
-        _snapshot_manifest_path: Path | None = None
-
         # Resolve --legacy-skill-paths: CLI flag wins, then env var fallback.
         if not legacy_skill_paths:
             from ..integration.targets import should_use_legacy_skill_paths
 
             legacy_skill_paths = should_use_legacy_skill_paths()
 
-        # ----------------------------------------------------------------
-        # Local-bundle early-exit (issue #1098).  When the sole positional
-        # argument is a filesystem path that detect_local_bundle() recognises
-        # as an APM-pack bundle, we skip the dependency-resolution pipeline
-        # entirely and deploy the bundle's files directly.  Local bundles
-        # are imperative deploys -- they do NOT mutate apm.yml.  The detection
-        # + dispatch lives in _try_local_bundle_install(); it returns True when
-        # it fully handled the install (caller must return).
-        # ----------------------------------------------------------------
+        # Local-bundle early-exit (#1098): sole positional arg is a bundle path;
+        # skip dependency-resolution and return after direct deploy.
         if _try_local_bundle_install(
             packages,
             mcp_name,
@@ -527,7 +525,10 @@ def install(  # noqa: PLR0913
             alias,
             logger,
             legacy_skill_paths,
-            trust_canvas_extensions,
+            security_ctx=_BundleSecurityCtx(
+                no_policy=no_policy,
+                allow_executables=None,  # determined inside via read_bundle_allow_executables
+            ),
             rejected_flags={
                 "--update": update,
                 "--only": only,
@@ -543,7 +544,6 @@ def install(  # noqa: PLR0913
                 "--parallel-downloads": parallel_downloads != 4,
                 "--allow-insecure": allow_insecure,
                 "--allow-insecure-host": bool(allow_insecure_hosts),
-                "--no-policy": no_policy,
             },
         ):
             # Local bundle install renders its own summary; mark
@@ -566,15 +566,9 @@ def install(  # noqa: PLR0913
         if verbose:
             os.environ["APM_VERBOSE"] = "1"
 
-        # W2-pkg-rollback (#827): snapshot bytes captured BEFORE
-        # _validate_and_add_packages_to_apm_yml mutates apm.yml.
-        # NOTE: variables are initialised at the top of the try block
-        # (above the local-bundle early-exit) so exception handlers can
-        # always reference them without UnboundLocalError.
+        # W2-pkg-rollback: snapshot captured BEFORE _validate_and_add_packages_to_apm_yml mutates apm.yml.
 
-        # ----------------------------------------------------------------
         # --mcp branch (W3): compute argv split; route to MCP path if set.
-        # ----------------------------------------------------------------
         command_argv, pre_dash_packages = _compute_argv_pre_dash(packages)
 
         # Validate --registry (raises UsageError on a bad URL).
@@ -600,12 +594,7 @@ def install(  # noqa: PLR0913
         )
 
         # Normalize --skill: '*' means all (same as absent). Reject with --mcp.
-        _skill_subset = None
-        if skill_names:
-            if mcp_name is not None:
-                raise click.UsageError("--skill cannot be combined with --mcp.")
-            if not any(s == "*" for s in skill_names):
-                _skill_subset = builtins.tuple(skill_names)
+        _skill_subset = _normalize_skill_subset(skill_names, mcp_name)
 
         if mcp_name is not None:
             _handle_mcp_install(
@@ -626,6 +615,7 @@ def install(  # noqa: PLR0913
                 logger=logger,
                 no_policy=no_policy,
                 validated_registry_url=validated_registry_url,
+                target=target,
             )
             return
 
@@ -641,22 +631,17 @@ def install(  # noqa: PLR0913
             global_, logger
         )
 
+        # Snapshot the manifest BEFORE any mutation (bootstrap in _setup_auth_and_check_manifest
+        # may auto-create apm.yml; transaction must capture its pre-existence state first).
+        transaction = _create_transaction(manifest_path, scope, logger)
+
         auth_resolver = _setup_auth_and_check_manifest(
-            scope, packages, manifest_path, manifest_display, logger
+            scope, packages, manifest_path, manifest_display, logger, target=target
         )
 
         # If packages are specified, validate and add them to apm.yml first
         outcome = None
         if packages:
-            # -- W2-pkg-rollback (#827): snapshot raw bytes BEFORE mutation --
-            # _validate_and_add_packages_to_apm_yml does a YAML round-trip
-            # (load + dump) which may alter whitespace, key ordering, or
-            # trailing newlines.  We snapshot the raw bytes so rollback is
-            # byte-exact -- no YAML drift.
-            if manifest_path.exists():
-                _manifest_snapshot = manifest_path.read_bytes()
-                _snapshot_manifest_path = manifest_path
-
             _validated_packages, outcome = _validate_and_add_packages_to_apm_yml(
                 packages,
                 dry_run,
@@ -667,9 +652,14 @@ def install(  # noqa: PLR0913
                 scope=scope,
                 allow_insecure=allow_insecure,
                 skill_subset=_skill_subset,
+                skill_subset_from_cli=bool(skill_names),
             )
             # Short-circuit: all packages failed validation -- nothing to install
             if outcome.all_failed:
+                transaction.record_validation(outcome)
+                terminal = transaction.validation_result()
+                summary_rendered = True  # suppress "Install interrupted" line
+                ctx.exit(terminal.exit_code if terminal is not None else 1)
                 return
             # Note: Empty validated_packages is OK if packages are already in apm.yml;
             # only_packages is derived from validation outcomes below.
@@ -697,15 +687,13 @@ def install(  # noqa: PLR0913
             protocol_pref=protocol_pref,
             allow_protocol_fallback=allow_protocol_fallback,
             trust_transitive_mcp=trust_transitive_mcp,
-            trust_canvas=trust_canvas_extensions,
             no_policy=no_policy,
             audit_override=audit_override,
             install_mode=InstallMode(only) if only else InstallMode.ALL,
             packages=packages,
+            transaction=transaction,
             refresh=refresh,
             only_packages=only_packages_from_validation(packages, outcome),
-            manifest_snapshot=_manifest_snapshot,
-            snapshot_manifest_path=_snapshot_manifest_path,
             legacy_skill_paths=legacy_skill_paths,
             frozen=frozen,
             plan_callback=None,
@@ -713,50 +701,66 @@ def install(  # noqa: PLR0913
             skill_subset_from_cli=bool(skill_names),
         )
 
-        _execute_install_and_summary(install_ctx, outcome, frozen, install_started_at)
+        _command_result = _execute_install_and_summary(
+            install_ctx, outcome, frozen, install_started_at
+        )
         summary_rendered = True
 
-    except InsecureDependencyPolicyError:
-        _maybe_rollback_manifest(_snapshot_manifest_path, _manifest_snapshot, logger)
-        sys.exit(1)
+    except InsecureDependencyPolicyError as e:
+        _command_result = _make_fail_result(e, transaction)
+    except InstallFailureAlreadyRendered as e:
+        # Error was already rendered by the inner layer; rollback and record.
+        _command_result = _make_fail_result(e, transaction)
     except AuthenticationError as e:
-        _maybe_rollback_manifest(_snapshot_manifest_path, _manifest_snapshot, logger)
-        _rich_error(str(e))
-        if e.diagnostic_context:
-            _rich_echo(e.diagnostic_context)
-        _rich_info("Tip: run 'apm doctor' to diagnose auth and connectivity.", symbol="info")
-        sys.exit(1)
-    except DirectDependencyError as e:
-        _maybe_rollback_manifest(_snapshot_manifest_path, _manifest_snapshot, logger)
         logger.error(str(e))
-        sys.exit(1)
+        if e.diagnostic_context:
+            logger.error_detail(e.diagnostic_context)
+        logger.info("Tip: run 'apm doctor' to diagnose auth and connectivity.")
+        _command_result = _make_fail_result(e, transaction)
+    except FrozenInstallError as e:
+        logger.error(str(e))
+        for reason in e.reasons:
+            logger.error_detail(reason)
+        logger.info("Tip: run 'apm outdated' to see what changed, then 'apm update'.")
+        _command_result = _make_fail_result(e, transaction)
+    except DirectDependencyError as e:
+        logger.error(str(e))
+        _command_result = _make_fail_result(e, transaction)
     except click.UsageError:
         # Conflict matrix / argv parser raises UsageError -- let Click
         # render with exit code 2 and the standard "Usage: ..." prefix.
         raise
     except Exception as e:
-        _maybe_rollback_manifest(_snapshot_manifest_path, _manifest_snapshot, logger)
-        if logger:
-            logger.error(f"Error installing dependencies: {e}")
-            if not verbose:
-                logger.progress("Run with --verbose for detailed diagnostics")
-        else:
-            _rich_error(f"Error installing dependencies: {e}")
-        sys.exit(1)
+        (logger or InstallLogger(verbose=verbose, dry_run=dry_run)).exception(
+            f"Error installing dependencies: {e}"
+        )
+        _command_result = _make_fail_result(e, transaction)
     finally:
         # --root: restore cwd + clear the source-root override regardless
         # of how the handler exits (return, sys.exit -> SystemExit,
         # exception). Done first so cwd is back to $PWD before any
         # best-effort summary rendering below.
         _root_redirect.__exit__(None, None, None)
+        if transaction is not None:
+            transaction.__exit__(*sys.exc_info())
         # F5 (#1116): render minimal elapsed-time line on exit paths that
         # did not already render the full install summary. Best-effort:
         # never let a render failure mask the original exception/exit.
         if not summary_rendered and logger is not None:
             with contextlib.suppress(Exception):
-                logger.install_interrupted(elapsed_seconds=time.perf_counter() - install_started_at)
+                _elapsed = time.perf_counter() - install_started_at
+                if (
+                    _command_result is not None
+                    and _command_result.disposition is InstallDisposition.FAILED
+                ):
+                    logger.install_failed(elapsed_seconds=_elapsed)
+                else:
+                    logger.install_interrupted(elapsed_seconds=_elapsed)
         # HACK(#852) cleanup: restore APM_VERBOSE so it stays scoped to this call.
         if _apm_verbose_prev is None:
             os.environ.pop("APM_VERBOSE", None)
         else:
             os.environ["APM_VERBOSE"] = _apm_verbose_prev
+
+    if _command_result is not None:
+        ctx.exit(_command_result.exit_code)

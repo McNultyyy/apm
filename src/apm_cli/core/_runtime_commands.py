@@ -39,7 +39,9 @@ class _RuntimeCommandsMixin:
         """
         # Handle environment variables prefix (e.g., "ENV1=val1 ENV2=val2 codex [args] file.prompt.md")
         # More robust approach: split by runtime commands to separate env vars from command
-        runtime_commands = ["codex", "copilot", "llm", "gemini"]
+        import apm_cli.core.script_runner as _sr
+
+        runtime_commands = _sr.runtime_names()
 
         # Try matching with env-var prefix (e.g. "ENV=val codex args file.prompt.md")
         for runtime_cmd in runtime_commands:
@@ -110,13 +112,14 @@ class _RuntimeCommandsMixin:
         if env_prefix is not None and runtime_cmd != "codex":
             args_before = args_before.replace("-p", "").strip()
 
-        builders = {
-            "codex": self._build_codex_command,
-            "copilot": self._build_copilot_command,
-            "llm": self._build_llm_command,
-            "gemini": self._build_gemini_command,
-        }
-        builder = builders.get(runtime_cmd)
+        import apm_cli.core.script_runner as _sr
+
+        descriptor = _sr.get_runtime_descriptor(runtime_cmd)
+        builder = (
+            getattr(self, descriptor.script_builder)
+            if descriptor.script_builder is not None
+            else None
+        )
         if builder:
             return builder(args_before, args_after, env_prefix)
         return None
@@ -235,16 +238,12 @@ class _RuntimeCommandsMixin:
             Name of the detected runtime (copilot, codex, llm, gemini, or unknown)
         """
         command_lower = command.lower().strip()
-        if re.search(r"(?:^|\s)copilot(?:\s|$)", command_lower):
-            return "copilot"
-        elif re.search(r"(?:^|\s)codex(?:\s|$)", command_lower):
-            return "codex"
-        elif re.search(r"(?:^|\s)llm(?:\s|$)", command_lower):
-            return "llm"
-        elif re.search(r"(?:^|\s)gemini(?:\s|$)", command_lower):
-            return "gemini"
-        else:
-            return "unknown"
+        import apm_cli.core.script_runner as _sr
+
+        for runtime_name in _sr.runtime_names():
+            if re.search(rf"(?:^|\s){re.escape(runtime_name)}(?:\s|$)", command_lower):
+                return runtime_name
+        return "unknown"
 
     def _generate_runtime_command(self, runtime: str, prompt_file: Path) -> str:
         """Generate appropriate runtime command with proper defaults.
@@ -256,16 +255,15 @@ class _RuntimeCommandsMixin:
         Returns:
             Full command string with runtime-specific defaults
         """
-        if runtime == "copilot":
-            return (
-                f"copilot --log-level all --log-dir copilot-logs --allow-all-tools -p {prompt_file}"
-            )
-        elif runtime == "codex":
-            return f"codex -s workspace-write --skip-git-repo-check {prompt_file}"
-        elif runtime == "gemini":
-            return f"gemini -p {prompt_file}"
-        else:
+        import apm_cli.core.script_runner as _sr
+
+        try:
+            descriptor = _sr.get_runtime_descriptor(runtime)
+        except ValueError:
+            raise ValueError(f"Unsupported runtime: {runtime}") from None
+        if descriptor.default_command is None:
             raise ValueError(f"Unsupported runtime: {runtime}")
+        return descriptor.default_command.format(prompt_file=prompt_file)
 
     def _detect_installed_runtime(self) -> str:
         """Detect installed runtime with priority order.
@@ -284,19 +282,17 @@ class _RuntimeCommandsMixin:
         """
         import apm_cli.core.script_runner as _sr
 
-        if _sr.find_runtime_binary("copilot"):
-            return "copilot"
-        elif _sr.find_runtime_binary("codex"):
-            return "codex"
-        elif _sr.find_runtime_binary("gemini"):
-            return "gemini"
-        else:
-            raise RuntimeError(
-                "No compatible runtime found.\n"
-                "Install GitHub Copilot CLI with:\n"
-                "  apm runtime setup copilot\n"
-                "Or install Codex CLI with:\n"
-                "  apm runtime setup codex\n"
-                "Or install Gemini CLI with:\n"
-                "  apm runtime setup gemini"
-            )
+        executable_descriptors = [
+            descriptor
+            for descriptor in _sr.runtime_descriptors()
+            if descriptor.default_command is not None
+        ]
+        for descriptor in executable_descriptors:
+            if _sr.find_runtime_binary(descriptor.binary):
+                return descriptor.name
+        setup_lines = "\n".join(
+            f"  apm runtime setup {descriptor.name}" for descriptor in executable_descriptors
+        )
+        raise RuntimeError(
+            f"No compatible runtime found.\nInstall a supported runtime with one of:\n{setup_lines}"
+        )

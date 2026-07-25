@@ -16,6 +16,11 @@ from pathlib import Path
 
 import click
 
+from ..core.deployment_ledger import (
+    DEPLOYMENT_OWNER_REMEDIATION,
+    DeploymentLedgerCodec,
+    DeploymentOwnerViolation,
+)
 from ..deps.lockfile import LockFile
 from ..utils.console import STATUS_SYMBOLS
 
@@ -44,13 +49,13 @@ def _audit_ci_gate(
 
     ci_result = run_baseline_checks(cfg.project_root, fail_fast=fail_fast, ci_mode=True)
 
-    from ..policy.discovery import discover_policy, discover_policy_with_chain
+    from ..policy.discovery import discover_policy_with_chain
     from ..policy.project_config import read_project_fetch_failure_default
 
     fetch_result = None
     auto_discovered = False
     if policy_source and (not fail_fast or ci_result.passed):
-        fetch_result = discover_policy(
+        fetch_result = discover_policy_with_chain(
             cfg.project_root,
             policy_override=policy_source,
             no_cache=no_cache,
@@ -64,6 +69,7 @@ def _audit_ci_gate(
             "malformed",
             "cache_miss_fetch_fail",
             "garbage_response",
+            "incomplete_chain",
         )
         no_policy_outcomes = ("absent", "no_git_remote", "empty")
 
@@ -83,7 +89,7 @@ def _audit_ci_gate(
             source = fetch_result.source
             err_text = fetch_result.error or fetch_result.fetch_error or fetch_result.outcome
             cause = _a._audit_outcome_cause(fetch_result.outcome, source, err_text)
-            if project_default == "block":
+            if fetch_result.outcome == "incomplete_chain" or project_default == "block":
                 click.echo(
                     f"[x] {cause} (policy.fetch_failure_default=block)",
                     err=True,
@@ -104,12 +110,16 @@ def _audit_ci_gate(
             pass  # Policy checks disabled
         else:
             from ..policy.models import CheckResult
+            from ..policy.policy_checks import FAIL_CLOSED_POLICY_CHECKS
 
             policy_result = run_policy_checks(cfg.project_root, policy_obj, fail_fast=fail_fast)
             if policy_obj.enforcement == "block":
                 ci_result.checks.extend(policy_result.checks)
             else:
                 for check in policy_result.checks:
+                    if check.name in FAIL_CLOSED_POLICY_CHECKS and not check.passed:
+                        ci_result.checks.append(check)
+                        continue
                     ci_result.checks.append(
                         CheckResult(
                             name=check.name,
@@ -181,6 +191,25 @@ def _audit_ci_gate(
 # ---------------------------------------------------------------------------
 # _audit_content_scan
 # ---------------------------------------------------------------------------
+
+
+def _render_owner_violations(
+    violations: tuple[DeploymentOwnerViolation, ...],
+    logger,
+) -> None:
+    """Render invalid canonical owner references with one remediation."""
+    if not violations:
+        return
+    logger.error(f"{len(violations)} invalid deployment ownership record(s) in apm.lock.yaml")
+    for violation in violations:
+        invalid = ", ".join(violation.invalid_owners)
+        active = (
+            f"; active owner={violation.invalid_active_owner}"
+            if violation.invalid_active_owner is not None
+            else ""
+        )
+        logger.error_detail(f"  {violation.locator.key}: invalid owner(s)={invalid}{active}")
+    logger.error_detail(DEPLOYMENT_OWNER_REMEDIATION)
 
 
 def _resolve_fail_on_drift(project_root: Path) -> bool:
@@ -268,6 +297,64 @@ def _run_drift_detection(
     return drift_findings, drift_failed
 
 
+def _scan_lockfile_packages_or_exit(
+    _a,
+    lockfile_path,
+    project_root,
+    package,
+    effective_format,
+    external,
+    logger,
+):
+    """Load the lockfile and scan its deployed files.
+
+    Returns ``(findings_by_file, files_scanned, owner_violations)``.
+    Calls ``sys.exit`` on fatal conditions (missing lockfile with no external
+    scanners, invalid lockfile format, no deployed files).
+    """
+    if not lockfile_path.exists():
+        if not external:
+            logger.progress(
+                "No apm.lock.yaml found -- nothing to scan. Use --file to scan a specific file."
+            )
+            sys.exit(0)
+        return {}, 0, ()
+
+    if effective_format == "text":
+        if package:
+            logger.progress(f"Scanning package: {package}")
+        else:
+            logger.start("Scanning all installed packages...")
+
+    from ..deps.lockfile import LockfileFormatError
+
+    try:
+        lockfile = LockFile.read(lockfile_path)
+        owner_violations = (
+            DeploymentLedgerCodec.owner_reference_violations(lockfile)
+            if lockfile is not None
+            else ()
+        )
+        findings_by_file, files_scanned = _a.scan_lockfile_packages(
+            project_root,
+            package_filter=package,
+            lockfile=lockfile,
+        )
+    except LockfileFormatError as exc:
+        logger.error(f"Cannot audit invalid apm.lock.yaml: {exc}")
+        sys.exit(1)
+
+    if files_scanned == 0 and not external and not owner_violations:
+        if package:
+            logger.warning(
+                f"Package '{package}' not found in apm.lock.yaml or has no deployed files"
+            )
+        else:
+            logger.progress("No deployed files found in apm.lock.yaml")
+        sys.exit(0)
+    return findings_by_file, files_scanned, owner_violations
+
+
 def _audit_content_scan(
     cfg,
     package,
@@ -300,35 +387,19 @@ def _audit_content_scan(
     if file_path:
         findings_by_file, files_scanned = _a._scan_single_file(Path(file_path), logger)
         scan_paths = [Path(file_path)]
+        owner_violations: tuple[DeploymentOwnerViolation, ...] = ()
     else:
         scan_paths = [project_root]
         lockfile_path = _a.get_lockfile_path(project_root)
-        if not lockfile_path.exists():
-            if not external:
-                logger.progress(
-                    "No apm.lock.yaml found -- nothing to scan. Use --file to scan a specific file."
-                )
-                sys.exit(0)
-            findings_by_file, files_scanned = {}, 0
-        else:
-            if package:
-                logger.progress(f"Scanning package: {package}")
-            else:
-                logger.start("Scanning all installed packages...")
-
-            findings_by_file, files_scanned = _a.scan_lockfile_packages(
-                project_root,
-                package_filter=package,
-            )
-
-            if files_scanned == 0 and not external:
-                if package:
-                    logger.warning(
-                        f"Package '{package}' not found in apm.lock.yaml or has no deployed files"
-                    )
-                else:
-                    logger.progress("No deployed files found in apm.lock.yaml")
-                sys.exit(0)
+        findings_by_file, files_scanned, owner_violations = _scan_lockfile_packages_or_exit(
+            _a,
+            lockfile_path,
+            project_root,
+            package,
+            effective_format,
+            external,
+            logger,
+        )
 
     if external:
         options_by_name = _a._resolve_external_options(external, external_llm, external_args)
@@ -343,6 +414,10 @@ def _audit_content_scan(
         logger.progress("--dry-run only works with --strip (e.g. apm audit --strip --dry-run)")
 
     if strip:
+        if owner_violations:
+            _render_owner_violations(owner_violations, logger)
+            logger.error_detail("Content was not modified while lockfile ownership is invalid.")
+            sys.exit(1)
         if not findings_by_file:
             logger.progress("Nothing to clean -- no hidden characters found")
             sys.exit(0)
@@ -365,6 +440,8 @@ def _audit_content_scan(
     else:
         all_findings = [f for ff in findings_by_file.values() for f in ff]
         exit_code = 1 if _a.ContentScanner.has_critical(all_findings) else 2
+    if owner_violations:
+        exit_code = 1
 
     # Bare `apm audit` is advisory for drift by default: drift findings are
     # rendered (text/json/sarif) but DO NOT escalate the exit code. When
@@ -387,7 +464,10 @@ def _audit_content_scan(
             sys.exit(1)
         if findings_by_file:
             _a._render_findings_table(findings_by_file, verbose=cfg.verbose)
-        _a._render_summary(findings_by_file, files_scanned, logger)
+            _a._render_summary(findings_by_file, files_scanned, logger)
+        elif not owner_violations:
+            _a._render_summary(findings_by_file, files_scanned, logger)
+        _render_owner_violations(owner_violations, logger)
         if not file_path:
             _a._render_canvas_note(cfg.project_root, package, logger)
         if drift_findings:
@@ -398,7 +478,11 @@ def _audit_content_scan(
     elif effective_format == "markdown":
         from ..security.audit_report import findings_to_markdown
 
-        md_report = findings_to_markdown(findings_by_file, files_scanned=files_scanned)
+        md_report = findings_to_markdown(
+            findings_by_file,
+            files_scanned=files_scanned,
+            owner_violations=owner_violations,
+        )
         if cfg.output_path:
             Path(cfg.output_path).parent.mkdir(parents=True, exist_ok=True)
             Path(cfg.output_path).write_text(md_report, encoding="utf-8")
@@ -414,12 +498,17 @@ def _audit_content_scan(
         )
 
         if effective_format == "sarif":
-            report = findings_to_sarif(findings_by_file, files_scanned=files_scanned)
+            report = findings_to_sarif(
+                findings_by_file,
+                files_scanned=files_scanned,
+                owner_violations=owner_violations,
+            )
         else:
             report = findings_to_json(
                 findings_by_file,
                 files_scanned=files_scanned,
                 exit_code=exit_code,
+                owner_violations=owner_violations,
             )
 
         if cfg.output_path:

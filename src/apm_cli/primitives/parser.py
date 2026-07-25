@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-import frontmatter
+from apm_cli.utils.yaml_io import load_frontmatter
 
 from .models import Chatmode, Context, Instruction, Primitive, Skill
 
@@ -27,7 +27,7 @@ def parse_skill_file(file_path: str | Path, source: str = None) -> Skill:  # noq
 
     try:
         with open(file_path, encoding="utf-8") as f:
-            post = frontmatter.load(f)
+            post = load_frontmatter(f)
 
         metadata = post.metadata
         content = post.content
@@ -67,7 +67,7 @@ def parse_primitive_file(file_path: str | Path, source: str = None) -> Primitive
 
     try:
         with open(file_path, encoding="utf-8") as f:
-            post = frontmatter.load(f)
+            post = load_frontmatter(f)
 
         # Extract name based on file structure
         name = _extract_primitive_name(file_path)
@@ -75,7 +75,7 @@ def parse_primitive_file(file_path: str | Path, source: str = None) -> Primitive
         content = post.content
 
         # Determine primitive type based on file extension
-        if file_path.name.endswith(".chatmode.md") or file_path.name.endswith(".agent.md"):
+        if file_path.name.endswith(".agent.md"):
             return _parse_chatmode(name, file_path, metadata, content, source)
         elif file_path.name.endswith(".instructions.md"):
             return _parse_instruction(name, file_path, metadata, content, source)
@@ -222,7 +222,6 @@ def _parse_context(
 
 
 _PRIMITIVE_SUFFIXES = (
-    ".chatmode.md",
     ".instructions.md",
     ".context.md",
     ".memory.md",
@@ -230,7 +229,7 @@ _PRIMITIVE_SUFFIXES = (
     ".md",
 )
 
-_STRUCTURED_SUBDIRS = frozenset({"chatmodes", "instructions", "context", "memory", "agents"})
+_STRUCTURED_SUBDIRS = frozenset({"instructions", "context", "memory", "agents"})
 
 
 def _strip_file_ext(basename: str) -> str:

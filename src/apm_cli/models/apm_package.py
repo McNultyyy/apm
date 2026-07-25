@@ -6,14 +6,23 @@ Dependency and validation types have been extracted to sibling modules
 compatibility.
 """
 
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from ..core.apm_yml import parse_targets_field
+from ..core.target_catalog import normalize_target_name
 from ..core.target_detection import parse_target_field
+from ._apm_package_registries import (
+    _parse_registries_block,
+)
+from ._apm_package_registries import (
+    _parse_v01_registries_block as _parse_v01_registries_block,
+)
 from .dependency import (
     DependencyReference,
     GitReferenceType,
@@ -31,6 +40,11 @@ from .validation import (
     ValidationResult,
     validate_apm_package,
 )
+
+if TYPE_CHECKING:
+    from apm_cli.deps.lockfile import LockFile
+
+_log = logging.getLogger(__name__)
 
 # Re-export all moved symbols so `from apm_cli.models.apm_package import X` keeps working
 __all__ = [  # noqa: RUF022
@@ -52,7 +66,9 @@ __all__ = [  # noqa: RUF022
     # Defined in this module
     "APMPackage",
     "PackageInfo",
+    "build_installed_package_info",
     "clear_apm_yml_cache",
+    "surviving_dependency_refs_for_reintegration",
 ]
 
 # Module-level parse cache: (resolved apm.yml path, resolved source dir) ->
@@ -67,94 +83,6 @@ _apm_yml_cache: dict[tuple[Path, Path | None], "APMPackage"] = {}
 def clear_apm_yml_cache() -> None:
     """Clear the from_apm_yml parse cache. Call in tests for isolation."""
     _apm_yml_cache.clear()
-
-
-def _parse_registries_block(data: dict, apm_yml_path: Path):
-    """Parse the top-level ``registries:`` block per design §3.1.
-
-    Schema::
-
-        registries:
-          corp-main:
-            url: https://registry.corp.example.com/apm
-          corp-other:
-            url: https://other.example.com/apm
-          default: corp-main           # optional; routes unscoped deps here
-
-    Returns ``(registries_map, default_name)`` where *registries_map* is
-    ``{name: url}`` and *default_name* is the value of ``default:`` (or
-    ``None``). Absent block returns ``(None, None)``.
-    """
-    raw = data.get("registries")
-    if raw is None:
-        return None, None
-    if raw != {}:
-        from ..deps.registry.feature_gate import require_package_registry_enabled
-
-        require_package_registry_enabled("Top-level 'registries:' blocks")
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"Top-level 'registries:' block in {apm_yml_path} must be a "
-            f"mapping (name -> {{url: ...}})"
-        )
-
-    default_value = raw.get("default")
-    registries_map: dict[str, str] = {}
-    for name, body in raw.items():
-        if name == "default":
-            continue
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(
-                f"Registry name in 'registries:' block must be a non-empty string (got {name!r})"
-            )
-        if not isinstance(body, dict):
-            raise ValueError(
-                f"Registry {name!r} must be a mapping with at least 'url:' "
-                f"(got {type(body).__name__})"
-            )
-        # Token trap: tokens must never appear in repo-tracked YAML files.
-        if "token" in body:
-            from ..deps.registry.auth import registry_token_env_var
-
-            raise ValueError(
-                f"Registry {name!r}: 'token' must not appear in apm.yml. "
-                f"Use the {registry_token_env_var(name)} "
-                f"environment variable or 'apm config set registry.{name}.token <value>'."
-            )
-        url = body.get("url")
-        if not isinstance(url, str) or not url.strip():
-            raise ValueError(f"Registry {name!r} is missing required field 'url:'")
-        url = url.strip()
-        if not url.startswith(("https://", "http://")):
-            raise ValueError(
-                f"Registry {name!r} URL must start with https:// or http:// (got {url!r})"
-            )
-        # Reject any unknown keys to catch typos early.
-        unknown = set(body.keys()) - {"url"}
-        if unknown:
-            raise ValueError(
-                f"Registry {name!r} has unknown fields: {sorted(unknown)} (known fields: ['url'])"
-            )
-        registries_map[name] = url
-
-    default_name: str | None = None
-    if default_value is not None:
-        if not isinstance(default_value, str) or not default_value.strip():
-            raise ValueError(
-                f"'registries.default' in {apm_yml_path} must be a non-empty "
-                f"string naming one of the configured registries"
-            )
-        default_name = default_value.strip()
-        if default_name not in registries_map:
-            raise ValueError(
-                f"'registries.default: {default_name}' refers to an "
-                f"unconfigured registry. Configured: {sorted(registries_map.keys())}"
-            )
-
-    if not registries_map and default_name is None:
-        return None, None
-
-    return registries_map, default_name
 
 
 def routes_unscoped_to_registry(dep: Any) -> bool:
@@ -257,6 +185,12 @@ class APMPackage:
         # re-validate via parse_targets_field with the same dict shape it sees from
         # raw apm.yml. None means the user did not declare 'targets:' at all.
     )
+    canonical_targets: tuple[str, ...] = ()
+    """Validated target names consumed by compile, install, and pack.
+
+    ``target`` and ``targets`` remain compatibility projections of the
+    author-facing spellings. Runtime consumers must use this tuple.
+    """
     type: PackageContentType | None = (
         None  # Package content type: instructions, skill, hybrid, or prompts
     )
@@ -267,6 +201,7 @@ class APMPackage:
     registries: dict[str, str] | None = None
     # Value of ``registries.default:`` -- routes unscoped deps to this registry.
     default_registry: str | None = None
+    manifest_contract: str = "working-draft"
 
     # Top-level ``allowExecutables:`` block -- per-package approval for
     # executable primitives (hooks, MCP servers, bin/ executables).
@@ -274,6 +209,21 @@ class APMPackage:
     # Keys are package handles with pinned version; values map exec type
     # to boolean (e.g. ``{"owner/repo#v1.0": {"hooks": true}}``).
     allow_executables: dict[str, dict[str, bool]] | None = None
+
+    def __post_init__(self) -> None:
+        """Derive the canonical target projection for compatibility callers."""
+        if self.canonical_targets:
+            return
+        raw_targets: list[str] = []
+        if self.targets is not None:
+            raw_targets.extend(self.targets)
+        elif isinstance(self.target, list):
+            raw_targets.extend(self.target)
+        elif isinstance(self.target, str):
+            raw_targets.append(self.target)
+        self.canonical_targets = tuple(
+            name if name == "all" else normalize_target_name(name) for name in raw_targets
+        )
 
     @classmethod
     def _parse_dependency_dict(cls, raw_deps: dict, label: str = "") -> dict:
@@ -383,14 +333,26 @@ class APMPackage:
         if not isinstance(data, dict):
             raise ValueError(f"apm.yml must contain a YAML object, got {type(data)}")
 
+        from .manifest_contract import negotiate_manifest_contract
+
+        manifest_contract = negotiate_manifest_contract(data)
+
         # Required fields
         if "name" not in data:
             raise ValueError("Missing required field 'name' in apm.yml")
         if "version" not in data:
             raise ValueError("Missing required field 'version' in apm.yml")
+        if not isinstance(data["name"], str) or not data["name"].strip():
+            raise ValueError("Invalid apm.yml identity: 'name' must be a non-empty string")
+        if not isinstance(data["version"], str) or not data["version"].strip():
+            raise ValueError("Invalid apm.yml identity: 'version' must be a non-empty string")
 
         # Top-level ``registries:`` block per design §3.1.
-        registries, default_registry = _parse_registries_block(data, apm_yml_path)
+        registries, default_registry = _parse_registries_block(
+            data,
+            apm_yml_path,
+            manifest_contract,
+        )
 
         # Parse dependencies
         dependencies = None
@@ -473,25 +435,40 @@ class APMPackage:
         # string like ``target: "claude,copilot"`` resolves identically to
         # ``--target claude,copilot`` and unknown tokens fail at parse time
         # (see apm_cli.core.target_detection.parse_target_field).
-        target_value = parse_target_field(
-            data.get("target"),
-            source_path=apm_yml_path,
-        )
-
-        # Plural 'targets:' field is stored raw (no canonical validation here)
-        # so the MCP install gate at mcp_integrator._gate_project_scoped_runtimes
-        # can re-run parse_targets_field on a dict that mirrors apm.yml shape
-        # and surface the same conflict / empty-list errors uniformly. Without
-        # this passthrough, the call site at commands/install.py would silently
-        # bypass the targets whitelist for any user on the modern plural form
-        # (#1335 regression caught in PR #1336 audit).
+        target_value = None
         targets_value: list[str] | None = None
-        if "targets" in data and data["targets"] is not None:
-            raw_targets = data["targets"]
-            if isinstance(raw_targets, list):
-                targets_value = [str(t).strip() for t in raw_targets if str(t).strip()]
-            else:
-                targets_value = [str(raw_targets).strip()]
+        if "targets" in data and "target" in data:
+            target_value = parse_target_field(
+                data.get("target"),
+                source_path=apm_yml_path,
+            )
+            raw_targets = data.get("targets")
+            targets_value = (
+                [str(item).strip() for item in raw_targets if str(item).strip()]
+                if isinstance(raw_targets, list)
+                else [str(raw_targets).strip()]
+            )
+            canonical_targets = ()
+        elif "targets" in data:
+            parsed_targets = parse_targets_field(data)
+            targets_value = parsed_targets or None
+            canonical_targets = tuple(parsed_targets)
+        else:
+            target_value = parse_target_field(
+                data.get("target"),
+                source_path=apm_yml_path,
+            )
+            parsed_target_values = (
+                target_value
+                if isinstance(target_value, list)
+                else [target_value]
+                if isinstance(target_value, str)
+                else []
+            )
+            canonical_targets = tuple(
+                name if name == "all" else normalize_target_name(name)
+                for name in parsed_target_values
+            )
 
         result = cls(
             name=data["name"],
@@ -506,10 +483,12 @@ class APMPackage:
             source_path=resolved_source,
             target=target_value,
             targets=targets_value,
+            canonical_targets=canonical_targets,
             type=pkg_type,
             includes=includes,
             registries=registries,
             default_registry=default_registry,
+            manifest_contract=manifest_contract.value,
             allow_executables=allow_executables,
         )
         _apm_yml_cache[cache_key] = result
@@ -550,6 +529,14 @@ class APMPackage:
             if isinstance(dep, MCPDependency)
         ]
 
+    def get_all_apm_dependencies(self) -> list[DependencyReference]:
+        """Get production and dev APM dependencies in manifest order."""
+        return self.get_apm_dependencies() + self.get_dev_apm_dependencies()
+
+    def has_any_apm_dependencies(self) -> bool:
+        """Check if this package has any APM dependencies (prod or dev)."""
+        return bool(self.get_apm_dependencies() or self.get_dev_apm_dependencies())
+
     def get_all_mcp_dependencies(self) -> list["MCPDependency"]:
         """Get production and dev MCP dependencies in manifest order."""
         return self.get_mcp_dependencies() + self.get_dev_mcp_dependencies()
@@ -573,6 +560,48 @@ class APMPackage:
         ]
 
 
+def canonical_package_targets(package: object) -> tuple[str, ...]:
+    """Return canonical targets for packages and compatibility stand-ins."""
+    canonical = getattr(package, "canonical_targets", ())
+    if isinstance(canonical, (tuple, list)) and canonical:
+        return tuple(canonical)
+    plural = getattr(package, "targets", None)
+    if isinstance(plural, list) and plural:
+        return tuple(name if name == "all" else normalize_target_name(name) for name in plural)
+    singular = getattr(package, "target", None)
+    values = singular if isinstance(singular, list) else [singular]
+    return tuple(
+        name if name == "all" else normalize_target_name(name)
+        for name in values
+        if isinstance(name, str) and name
+    )
+
+
+def canonical_package_target_config(package: object) -> dict[str, object]:
+    """Project canonical targets into the compatibility config shape."""
+    canonical = canonical_package_targets(package)
+    if not canonical:
+        return {}
+    if isinstance(package, APMPackage):
+        return {"targets": list(canonical)}
+    plural = getattr(package, "targets", None)
+    if isinstance(plural, list):
+        return {"targets": list(canonical)}
+    singular = getattr(package, "target", None)
+    if isinstance(singular, str) and len(canonical) == 1:
+        return {"target": singular}
+    return {"targets": list(canonical)}
+
+
+def package_target_selection(package: APMPackage) -> str | list[str] | None:
+    """Return pack-compatible selection from the canonical package owner."""
+    if package.targets is not None:
+        return list(package.canonical_targets)
+    if package.target is not None:
+        return package.target
+    return list(package.canonical_targets) or None
+
+
 @dataclass
 class PackageInfo:
     """Information about a downloaded/installed package."""
@@ -585,6 +614,8 @@ class PackageInfo:
         None  # Original dependency reference for canonical string
     )
     package_type: PackageType | None = None  # APM_PACKAGE, CLAUDE_SKILL, or HYBRID
+    root_local_project_root: Path | None = None
+    deployment_package_root: Path | None = None  # Source root in the deployment output frame
 
     def get_canonical_dependency_string(self) -> str:
         """Get the canonical dependency string for this package.
@@ -612,7 +643,7 @@ class PackageInfo:
             # Check for any primitive files in .apm/ subdirectories
             for primitive_type in [
                 "instructions",
-                "chatmodes",
+                "agents",
                 "contexts",
                 "prompts",
                 "hooks",
@@ -627,3 +658,77 @@ class PackageInfo:
             return True
 
         return False
+
+
+def build_installed_package_info(
+    dep_ref: DependencyReference, apm_modules_dir: Path
+) -> PackageInfo | None:
+    """Build a ``PackageInfo`` for a dependency that is still installed on disk.
+
+    Shared by callers that re-integrate primitives from remaining
+    dependencies after some other package is removed -- e.g. ``apm
+    uninstall``'s post-removal re-sync and ``apm prune``'s hook
+    reconciliation (see ``HookIntegrator.reconcile_after_removal``).
+    Returns ``None`` when the dependency's install directory is missing
+    or fails manifest validation, so callers can skip it rather than
+    fail the broader re-integration pass.
+    """
+    install_path = dep_ref.get_install_path(apm_modules_dir)
+    if not install_path.exists():
+        return None
+
+    result = validate_apm_package(install_path)
+    package = result.package if result and result.package else None
+    if not package:
+        return None
+
+    return PackageInfo(
+        package=package,
+        install_path=install_path,
+        dependency_ref=dep_ref,
+        package_type=result.package_type if result else None,
+    )
+
+
+def surviving_dependency_refs_for_reintegration(
+    apm_package: "APMPackage",
+    project_root: Path,
+    *,
+    lockfile: "LockFile | None" = None,
+) -> list[DependencyReference]:
+    """Return packages still present after removal, for clear+rebuild.
+
+    Prefer lockfile package dependencies (direct *and* transitive,
+    excluding the virtual ``"."`` self-entry). Callers that already hold
+    a post-removal in-memory lockfile (``apm uninstall``) must pass it
+    explicitly -- the on-disk lockfile is still stale until uninstall
+    writes it. When *lockfile* is omitted, the on-disk lockfile under
+    *project_root* is loaded (safe for ``apm prune``, which writes the
+    lockfile before hook reconciliation).
+
+    Falls back to ``apm_package.get_all_apm_dependencies()`` (manifest
+    directs only) when no lockfile is available.
+    """
+    # Deferred: LockFile imports DependencyReference from this module.
+    from apm_cli.deps.lockfile import LockFile, get_lockfile_path
+
+    resolved = lockfile
+    lockfile_source = "caller-provided"
+    if resolved is None:
+        lockfile_source = "on-disk"
+        resolved = LockFile.read(get_lockfile_path(project_root))
+    if resolved is not None:
+        deps = [dep.to_dependency_ref() for dep in resolved.get_package_dependencies()]
+        _log.debug(
+            "Survivor set for re-integration: %d package(s) from %s lockfile",
+            len(deps),
+            lockfile_source,
+        )
+        return deps
+    deps = list(apm_package.get_all_apm_dependencies())
+    _log.debug(
+        "Survivor set for re-integration: %d package(s) from manifest fallback "
+        "(lockfile unavailable)",
+        len(deps),
+    )
+    return deps

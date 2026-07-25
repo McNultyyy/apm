@@ -24,6 +24,7 @@ def _handle_mcp_install(
     dev,
     force,
     runtime,
+    target,
     exclude,
     verbose,
     logger,
@@ -90,12 +91,19 @@ def _handle_mcp_install(
     )
 
     try:
+        try:
+            from apm_cli.core.target_detection import normalize_policy_targets
+
+            policy_targets = normalize_policy_targets(target or runtime)
+        except (ImportError, AttributeError):
+            policy_targets = target or runtime
         _pf_result, _pf_active = run_policy_preflight(
             project_root=Path.cwd(),
             mcp_deps=[_preflight_dep],
             no_policy=no_policy,
             logger=logger,
             dry_run=logger.dry_run,
+            effective_target=policy_targets,
         )
     except PolicyBlockError:
         # Diagnostics already emitted by the helper + logger.
@@ -134,4 +142,5 @@ def _handle_mcp_install(
         logger=logger,
         apm_dir=mcp_apm_dir,
         scope=mcp_scope,
+        target=target,
     )

@@ -46,6 +46,9 @@ class LinkResolutionContext:
     # stay inside this subtree already resolve after copy and should remain
     # portable bundle-local links.
     preserved_source_root: Path | None = None
+    # Source package projected into the deployment output frame. Audit replay
+    # points this at scratch while package_root remains the real source tree.
+    deployment_package_root: Path | None = None
 
 
 class UnifiedLinkResolver:
@@ -76,6 +79,7 @@ class UnifiedLinkResolver:
         # rewriting (#1147). None for compile / legacy callers disables
         # the generalization safely.
         self.package_root: Path | None = None
+        self.deployment_package_root: Path | None = None
 
     def register_contexts(self, primitives) -> None:
         """Build registry of all available context files.
@@ -138,6 +142,7 @@ class UnifiedLinkResolver:
             package_root=self.package_root,
             enable_asset_rewrite=self.package_root is not None,
             preserved_source_root=preserved_source_root,
+            deployment_package_root=self.deployment_package_root,
         )
 
         return self._rewrite_markdown_links(content, ctx)
@@ -458,6 +463,28 @@ class UnifiedLinkResolver:
         idx = min(positions)
         return link_path[:idx], link_path[idx:]
 
+    def _compute_deployment_candidate(
+        self,
+        candidate: "Path",
+        source_package_root: "Path",
+        ctx: "LinkResolutionContext",
+    ) -> "Path | None":
+        """Project *candidate* into the deployment frame, or return None on error."""
+        candidate_in_deployment = candidate
+        if ctx.deployment_package_root is not None:
+            try:
+                package_relative = candidate.relative_to(source_package_root)
+                candidate_in_deployment = ctx.deployment_package_root / package_relative
+            except (OSError, ValueError):
+                return None
+        elif not candidate.is_relative_to(ctx.base_dir):
+            try:
+                package_relative = candidate.relative_to(source_package_root)
+                candidate_in_deployment = ctx.base_dir / package_relative
+            except (OSError, ValueError):
+                return None
+        return candidate_in_deployment
+
     def _resolve_in_package_asset_link(
         self, link_path: str, ctx: LinkResolutionContext
     ) -> str | None:
@@ -479,11 +506,8 @@ class UnifiedLinkResolver:
           ``..`` chains, etc.).
         * Path computation raises (broken filesystem, encoding, ...).
         """
-        if ctx.package_root is None or not ctx.package_root.is_dir():
-            return None
-
         path_part, suffix = self._split_link_target(link_path)
-        if not path_part:
+        if ctx.package_root is None or not ctx.package_root.is_dir() or not path_part:
             return None
 
         try:
@@ -505,33 +529,19 @@ class UnifiedLinkResolver:
                 pass
 
         try:
-            ensure_path_within(candidate, ctx.package_root)
-        except PathTraversalError:
+            source_package_root = ctx.package_root.resolve()
+            ensure_path_within(candidate, source_package_root)
+        except (OSError, ValueError, PathTraversalError):
             return None
 
-        # Replay-frame translation (#1182): during audit-replay of a
-        # self-package, ``ctx.base_dir`` is the scratch tmpdir but
-        # ``ctx.package_root`` (and therefore ``candidate``) still points
-        # at the real project tree. Computing ``relpath`` directly would
-        # produce a tmpdir-traversal link (e.g. ``../../../../Users/...``)
-        # that diverges from what real install writes to disk, causing
-        # spurious drift. Detect the cross-frame case (candidate outside
-        # base_dir) and re-anchor the target onto package_root so the
-        # rewrite mirrors the install-time output.
-        relpath_anchor = ctx.target_location
-        try:
-            candidate_in_base = candidate.is_relative_to(ctx.base_dir)
-        except (OSError, ValueError):
-            candidate_in_base = True
-        if not candidate_in_base:
-            try:
-                target_rel = ctx.target_location.relative_to(ctx.base_dir)
-                relpath_anchor = ctx.package_root / target_rel
-            except (OSError, ValueError):
-                relpath_anchor = ctx.target_location
+        candidate_in_deployment = self._compute_deployment_candidate(
+            candidate, source_package_root, ctx
+        )
+        if candidate_in_deployment is None:
+            return None
 
         try:
-            relative_path = os.path.relpath(candidate, relpath_anchor)
+            relative_path = os.path.relpath(candidate_in_deployment, ctx.target_location)
         except (OSError, ValueError):
             return None
 

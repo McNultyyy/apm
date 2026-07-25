@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from apm_cli.install.errors import DirectDependencyError
 from apm_cli.install.registry_wiring import (
     registry_resolution_for_cached_registry_dep,
 )
@@ -228,6 +229,8 @@ class LocalDependencySource(DependencySource):
                 resolved_by=resolved_by,
                 is_dev=_is_dev,
                 registry_config=None,
+                package_name=local_info.package.name if local_info.package else None,
+                package_version=local_info.package.version if local_info.package else None,
             )
         )
         if install_path.is_dir() and not dep_ref.is_local:
@@ -317,7 +320,12 @@ class CachedDependencySource(DependencySource):
             if locked_dep and locked_dep.resolved_commit and locked_dep.resolved_commit != "cached":
                 cached_commit = locked_dep.resolved_commit
         if not cached_commit:
-            cached_commit = dep_ref.reference
+            # Registry deps identify by resolved_hash+version, not a commit SHA.
+            # dep_ref.reference is a semver range (e.g. "^1.0.0") for registry
+            # deps -- storing it as resolved_commit would corrupt the lockfile
+            # and cause the update plan to show a spurious "^1.0.0 -> -" diff.
+            if dep_ref.source != "registry":
+                cached_commit = dep_ref.reference
         return cached_commit
 
     def acquire(self) -> Materialization | None:
@@ -327,9 +335,10 @@ class CachedDependencySource(DependencySource):
             APMPackage,
             GitReferenceType,
             PackageInfo,
+            PackageType,
             ResolvedReference,
         )
-        from apm_cli.models.validation import detect_package_type
+        from apm_cli.models.validation import detect_package_type, validate_apm_package
         from apm_cli.utils.content_hash import compute_package_hash as _compute_hash
 
         ctx = self.ctx
@@ -374,12 +383,20 @@ class CachedDependencySource(DependencySource):
         # so transitive ``local_path`` deps inside this remote package resolve
         # from there (#857).
         apm_yml_path = install_path / APM_YML_FILENAME
+        pkg_type, _ = detect_package_type(install_path)
         if apm_yml_path.exists():
             cached_package = APMPackage.from_apm_yml(apm_yml_path, source_path=install_path)
             # TODO(#940): see note in _materialize_local for the same caveat
             # about post-construction mutation of .source.
             if not cached_package.source:
                 cached_package.source = dep_ref.repo_url
+        elif pkg_type == PackageType.CLAUDE_SKILL:
+            validation_result = validate_apm_package(install_path)
+            if not validation_result.is_valid or validation_result.package is None:
+                details = "; ".join(validation_result.errors) or "validator returned no package"
+                raise DirectDependencyError(f"Cached Claude Skill is invalid: {details}")
+            cached_package = validation_result.package
+            cached_package.source = dep_ref.repo_url
         else:
             cached_package = APMPackage(
                 name=dep_ref.repo_url.split("/")[-1],
@@ -407,7 +424,6 @@ class CachedDependencySource(DependencySource):
             dependency_ref=dep_ref,
         )
 
-        pkg_type, _ = detect_package_type(install_path)
         cached_package_info.package_type = pkg_type
 
         # Collect for lockfile
@@ -457,6 +473,12 @@ class CachedDependencySource(DependencySource):
                 registry_config=_cached_registry,
                 registry_resolution=_cached_resolution,
                 git_semver_resolution=_cached_semver,
+                package_name=cached_package_info.package.name
+                if cached_package_info.package
+                else None,
+                package_version=cached_package_info.package.version
+                if cached_package_info.package
+                else None,
             )
         )
         if install_path.is_dir():

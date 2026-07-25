@@ -23,8 +23,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
 
-import yaml
-
+from ..utils.yaml_io import load_yaml_str
+from . import builder as _b  # noqa: F401 -- _b.urllib.request is the patchable seam
 from ._builder_reports import BuildOptions, ResolvedPackage, ResolveResult
 from ._shared import iter_semver_tags
 from .errors import (
@@ -46,6 +46,21 @@ logger = logging.getLogger(__name__)
 # 40-char hex SHA pattern (also used in builder.py -- defined here because
 # _resolve_explicit_ref lives here).
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# Cap for remote metadata reads via urllib (in bytes).
+_REMOTE_METADATA_MAX_BYTES = 512 * 1024  # 512 KiB
+
+
+def _read_capped_text(resp) -> str:
+    """Read a urllib HTTP response up to _REMOTE_METADATA_MAX_BYTES.
+
+    Returns the decoded text. Reads are capped so a malicious or corrupt
+    remote does not OOM the process; callers pass context-sized limits.
+    """
+    raw = resp.read(_REMOTE_METADATA_MAX_BYTES + 1)
+    if len(raw) > _REMOTE_METADATA_MAX_BYTES:
+        raise ValueError(f"Remote metadata response exceeds {_REMOTE_METADATA_MAX_BYTES} bytes")
+    return raw.decode("utf-8")
 
 
 def _strip_ref_prefix(refname: str) -> str:
@@ -156,64 +171,72 @@ class _BuilderResolveMixin:
 
         refs = resolver.list_remote_refs(owner_repo)
 
-        # Try as tag first
+        # Build O(1) lookup dicts in a single pass over refs.
+        tags_by_name: dict[str, object] = {}
+        refs_by_name: dict[str, object] = {}
+        branches_by_name: dict[str, object] = {}
         for remote_ref in refs:
-            if not remote_ref.name.startswith("refs/tags/"):
-                continue
-            tag_name = _strip_ref_prefix(remote_ref.name)
-            if tag_name == ref_text:
-                sv = parse_semver(tag_name.lstrip("vV"))
-                return ResolvedPackage(
-                    name=entry.name,
-                    source_repo=owner_repo,
-                    subdir=entry.subdir,
-                    ref=tag_name,
-                    sha=remote_ref.sha,
-                    requested_version=entry.version,
-                    tags=entry.tags,
-                    is_prerelease=sv.is_prerelease if sv else False,
-                    host=out_host,
-                    source_url=source_url,
-                )
+            if remote_ref.name.startswith("refs/tags/"):
+                tags_by_name[_strip_ref_prefix(remote_ref.name)] = remote_ref
+            refs_by_name[remote_ref.name] = remote_ref
+            if remote_ref.name.startswith("refs/heads/"):
+                branches_by_name[_strip_ref_prefix(remote_ref.name)] = remote_ref
+
+        # Try as tag first
+        tag_hit = tags_by_name.get(ref_text)
+        if tag_hit is not None:
+            sv = parse_semver(ref_text.lstrip("vV"))
+            return ResolvedPackage(
+                name=entry.name,
+                source_repo=owner_repo,
+                subdir=entry.subdir,
+                ref=ref_text,
+                sha=tag_hit.sha,
+                requested_version=entry.version,
+                tags=entry.tags,
+                is_prerelease=sv.is_prerelease if sv else False,
+                host=out_host,
+                source_url=source_url,
+            )
 
         # Try as full refname
-        for remote_ref in refs:
-            if remote_ref.name == ref_text:
-                short = _strip_ref_prefix(remote_ref.name)
-                is_branch = remote_ref.name.startswith("refs/heads/")
-                if is_branch and not self._options.allow_head:  # type: ignore[attr-defined]
-                    raise HeadNotAllowedError(entry.name, short)
-                sv = parse_semver(short.lstrip("vV"))
-                return ResolvedPackage(
-                    name=entry.name,
-                    source_repo=owner_repo,
-                    subdir=entry.subdir,
-                    ref=short,
-                    sha=remote_ref.sha,
-                    requested_version=entry.version,
-                    tags=entry.tags,
-                    is_prerelease=sv.is_prerelease if sv else False,
-                    host=out_host,
-                    source_url=source_url,
-                )
+        ref_hit = refs_by_name.get(ref_text)
+        if ref_hit is not None:
+            short = _strip_ref_prefix(ref_hit.name)
+            is_branch = ref_hit.name.startswith("refs/heads/")
+            if is_branch and not self._options.allow_head:  # type: ignore[attr-defined]
+                raise HeadNotAllowedError(entry.name, short)
+            sv = parse_semver(short.lstrip("vV"))
+            return ResolvedPackage(
+                name=entry.name,
+                source_repo=owner_repo,
+                subdir=entry.subdir,
+                ref=short,
+                sha=ref_hit.sha,
+                requested_version=entry.version,
+                tags=entry.tags,
+                is_prerelease=sv.is_prerelease if sv else False,
+                host=out_host,
+                source_url=source_url,
+            )
 
         # Try as branch name
-        for remote_ref in refs:
-            if remote_ref.name == f"refs/heads/{ref_text}":
-                if not self._options.allow_head:  # type: ignore[attr-defined]
-                    raise HeadNotAllowedError(entry.name, ref_text)
-                return ResolvedPackage(
-                    name=entry.name,
-                    source_repo=owner_repo,
-                    subdir=entry.subdir,
-                    ref=ref_text,
-                    sha=remote_ref.sha,
-                    requested_version=entry.version,
-                    tags=entry.tags,
-                    is_prerelease=False,
-                    host=out_host,
-                    source_url=source_url,
-                )
+        branch_hit = branches_by_name.get(ref_text)
+        if branch_hit is not None:
+            if not self._options.allow_head:  # type: ignore[attr-defined]
+                raise HeadNotAllowedError(entry.name, ref_text)
+            return ResolvedPackage(
+                name=entry.name,
+                source_repo=owner_repo,
+                subdir=entry.subdir,
+                ref=ref_text,
+                sha=branch_hit.sha,
+                requested_version=entry.version,
+                tags=entry.tags,
+                is_prerelease=False,
+                host=out_host,
+                source_url=source_url,
+            )
 
         if ref_text.upper() == "HEAD":
             if not self._options.allow_head:  # type: ignore[attr-defined]
@@ -383,7 +406,7 @@ class _BuilderResolveMixin:
                     _limit,
                 )
                 return None
-            data = yaml.safe_load(raw.decode("utf-8"))
+            data = load_yaml_str(raw.decode("utf-8"))
             if not isinstance(data, dict):
                 return None
             result: dict[str, str] = {}
@@ -472,7 +495,7 @@ class _BuilderResolveMixin:
                     req.add_header("Authorization", f"token {token}")
                 try:
                     with _b.urllib.request.urlopen(req, timeout=5) as resp:
-                        raw = resp.read().decode("utf-8")
+                        raw = _read_capped_text(resp)
                 except _b.urllib.error.HTTPError as exc:
                     if exc.code != 404:
                         raise
@@ -487,7 +510,7 @@ class _BuilderResolveMixin:
                     if token:
                         req.add_header("Authorization", f"token {token}")
                     with _b.urllib.request.urlopen(req, timeout=5) as resp:
-                        raw = resp.read().decode("utf-8")
+                        raw = _read_capped_text(resp)
             else:
                 api_base = (
                     host_info.api_base if host_info else None
@@ -499,8 +522,8 @@ class _BuilderResolveMixin:
                     req.add_header("Authorization", f"token {token}")
 
                 with _b.urllib.request.urlopen(req, timeout=5) as resp:
-                    raw = resp.read().decode("utf-8")
-            data = yaml.safe_load(raw)
+                    raw = _read_capped_text(resp)
+            data = load_yaml_str(raw)
             if not isinstance(data, dict):
                 return None
             result: dict[str, str] = {}

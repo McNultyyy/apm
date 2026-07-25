@@ -12,6 +12,29 @@ import logging
 from pathlib import Path
 from typing import Any
 
+# Untrusted plugin JSON files are capped at this size before parsing
+# to prevent hanging from deeply nested structures or huge integer literals.
+_MAX_PLUGIN_JSON_BYTES = 5 * 1024 * 1024
+
+
+def _bounded_read_json(path: Path) -> Any:
+    """Read and JSON-parse a plugin-package file fail-closed under a size cap.
+
+    Raises ``ValueError`` on any parse failure (oversize, malformed, deep-nest
+    ``RecursionError``, huge-int / ``MemoryError``). ``OSError`` (missing or
+    unreadable file) propagates unchanged so callers can distinguish it.
+    """
+    size = path.stat().st_size
+    if size > _MAX_PLUGIN_JSON_BYTES:
+        raise ValueError(
+            f"JSON file {path} exceeds {_MAX_PLUGIN_JSON_BYTES}-byte cap ({size} bytes)"
+        )
+    text = path.read_text(encoding="utf-8")
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError, MemoryError) as exc:
+        raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+
 
 def _read_mcp_file(plugin_path: Path, rel_path: str, logger: logging.Logger) -> dict[str, Any]:
     """Read a JSON file relative to *plugin_path* and return its ``mcpServers`` dict."""
@@ -35,8 +58,8 @@ def _read_mcp_file(plugin_path: Path, rel_path: str, logger: logging.Logger) -> 
 def _read_mcp_json(path: Path, logger: logging.Logger) -> dict[str, Any]:
     """Parse a JSON file and return the ``mcpServers`` mapping."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        data = _bounded_read_json(path)
+    except (ValueError, OSError) as exc:
         logger.warning("Failed to read MCP config %s: %s", path, exc)
         return {}
     if not isinstance(data, dict):
@@ -243,8 +266,8 @@ def _read_lsp_json(path: Path, logger: logging.Logger) -> dict[str, Any]:
     Claude ``~/.claude.json``.  Plugins may ship either variant.
     """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        data = _bounded_read_json(path)
+    except (ValueError, OSError) as exc:
         logger.warning("Failed to read LSP config %s: %s", path, exc)
         return {}
     if not isinstance(data, dict):

@@ -67,6 +67,11 @@ parser. The supported forms:
 | Registry shorthand | `owner/repo#^2.0.0` with a default registry configured | Routes dep through the default registry instead of git. Default may come from `apm.yml` or `~/.apm/config.json`. Requires `registries` experimental flag. |
 | Registry object form | `{ id: owner/repo, version: ^2.0.0 }` | Explicit registry dep. `registry:` optional when a default registry is configured. Requires `registries` experimental flag. |
 
+GitHub and package-registry owner/repository identifiers are normalized to
+lowercase before APM derives lock keys, cache identity, canonical strings, or
+`apm_modules/` paths. For example, `Owner/Repo` and `owner/repo` install as one
+package at `apm_modules/owner/repo`. Repository path casing is preserved for
+unknown git hosts because a self-hosted backend may be case-sensitive.
 
 Object form in YAML — three mutually exclusive keys select the variant
 (`git`, `path`, or `marketplace`):
@@ -110,6 +115,13 @@ dependencies:
       version: 1.4.0
 
 ```
+
+Remote Git objects accept only `git`, `path`, `ref`, `alias`, `type`,
+`allow_insecure`, `skills`, and `targets`. Unknown keys fail closed. In
+particular, `version` reports `use 'ref' for a branch, tag, or commit`;
+`version` belongs to registry and marketplace objects. The special
+`git: parent` form accepts only `git`, `path`, `ref`, and `alias`. See the
+[full field table](../../reference/manifest-schema/#412-object-form).
 
 A `path:` declared inside a remote package is allowed only when the resolved
 path stays inside that same cloned repo. APM expands it to the parent's remote
@@ -295,11 +307,15 @@ apm prune             # delete orphaned packages from apm_modules/
 ```
 
 `apm prune` removes any directory in `apm_modules/` that no longer
-corresponds to a declared dependency. It does not touch your manifest,
-your lockfile entries are rewritten on the next `apm install`, and
-deployed files in `.github/`, `.claude/`, etc. are reconciled then too.
+corresponds to a declared dependency or a transitive dependency still
+required by another package. It does not touch your manifest.
+Lockfile entries, deployed harness files (`.github/`, `.claude/`, etc.),
+and merged hook configuration owned by the pruned package are all
+reconciled immediately by `apm prune` itself -- remaining direct and
+transitive packages keep their hooks; no follow-up `apm install` is
+required.
 
-If you also want to refresh remaining deps to their latest refs, see
+If you also want to refresh remaining deps to their latest versions or refs, see
 [Update and refresh](../update-and-refresh/).
 
 ## The lockfile
@@ -328,7 +344,7 @@ For the full lockfile schema, see
 
 :::note[Coming from npm?]
 The split mirrors `package.json` + `package-lock.json`. The verbs match
-too: `apm update` refreshes dependencies to the latest matching refs
+too: `apm update` refreshes dependencies to the latest matching versions or refs
 (like `npm update`); `apm install --frozen` is the lockfile-only,
 fail-on-drift install for CI (like `npm ci`). To upgrade the `apm` CLI
 binary itself, use `apm self-update`.

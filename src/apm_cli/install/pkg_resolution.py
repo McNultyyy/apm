@@ -10,10 +10,15 @@ from apm_cli.install.insecure_policy import (
     _get_insecure_dependency_url,
 )
 from apm_cli.install.package_resolution import (
+    apply_cli_skill_pin,
     dependency_reference_to_yaml_entry,
-    normalize_and_merge_skill_subset,
 )
-from apm_cli.install.validation import _local_path_failure_reason
+from apm_cli.install.validation import (
+    _generic_host_ambiguous_subpath_hint as _ambiguous_subpath_hint,
+)
+from apm_cli.install.validation import (
+    _local_path_failure_reason,
+)
 
 
 def _check_package_conflicts(current_deps):
@@ -176,6 +181,7 @@ def _resolve_package_references(
     scope=None,
     allow_insecure=False,
     skill_subset=None,
+    skill_subset_from_cli=False,
     default_registry=None,
 ):
     """Validate, canonicalize, and resolve package references.
@@ -245,13 +251,15 @@ def _resolve_package_references(
             # Attach --skill filter so to_apm_yml_entry() emits the dict form.
             # Merges with existing skills: list so repeated --skill
             # invocations are additive (issue #1771).
-            if skill_subset:
-                dep_ref.skill_subset = normalize_and_merge_skill_subset(
-                    skill_subset,
-                    current_deps,
-                    identity,
-                    dependency_reference_cls=DependencyReference,
-                )
+            apply_cli_skill_pin(
+                dep_ref,
+                skill_subset,
+                skill_subset_from_cli,
+                current_deps,
+                _apm_yml_entries,
+                dependency_reference_cls=DependencyReference,
+                logger=logger,
+            )
             if marketplace_dep_ref is not None or direct_virtual_resolved:
                 _apm_yml_entries[canonical] = dependency_reference_to_yaml_entry(dep_ref)
         except ValueError as e:
@@ -331,7 +339,7 @@ def _resolve_package_references(
             if marketplace_provenance:
                 _marketplace_provenance[identity] = marketplace_provenance
         else:
-            reason = _local_path_failure_reason(dep_ref)
+            reason = _local_path_failure_reason(dep_ref) or _ambiguous_subpath_hint(dep_ref)
             if not reason:
                 # Round-4 panel fix (devx-ux): name the four-step probe
                 # chain explicitly when the validator exhausted it
@@ -400,18 +408,15 @@ def _merge_packages_into_yml(
 
     # Write back to apm.yml
     try:
-        from apm_cli.utils.yaml_io import dump_yaml
+        from apm_cli.utils.yaml_io import dump_yaml_roundtrip
 
-        dump_yaml(data, apm_yml_path)
+        dump_yaml_roundtrip(data, apm_yml_path)
         if logger:
             logger.success(
                 f"Updated {APM_YML_FILENAME} with {len(validated_packages)} new package(s)"
             )
     except Exception as e:
-        if logger:
-            logger.error(f"Failed to write {APM_YML_FILENAME}: {e}")
-        else:
-            _m._rich_error(f"Failed to write {APM_YML_FILENAME}: {e}")
+        (logger or _m.InstallLogger()).error(f"Failed to write {APM_YML_FILENAME}: {e}")
         sys.exit(1)
 
 
@@ -425,6 +430,7 @@ def _validate_and_add_packages_to_apm_yml(
     scope=None,
     allow_insecure=False,
     skill_subset=None,
+    skill_subset_from_cli=False,
 ):
     """Validate packages exist and can be accessed, then add to apm.yml dependencies section.
 
@@ -454,14 +460,11 @@ def _validate_and_add_packages_to_apm_yml(
 
     # Read current apm.yml
     try:
-        from apm_cli.utils.yaml_io import load_yaml
+        from apm_cli.utils.yaml_io import load_yaml_roundtrip
 
-        data = load_yaml(apm_yml_path) or {}
+        data = load_yaml_roundtrip(apm_yml_path) or {}
     except Exception as e:
-        if logger:
-            logger.error(f"Failed to read {APM_YML_FILENAME}: {e}")
-        else:
-            _m._rich_error(f"Failed to read {APM_YML_FILENAME}: {e}")
+        (logger or _m.InstallLogger()).error(f"Failed to read {APM_YML_FILENAME}: {e}")
         sys.exit(1)
 
     # Ensure dependencies structure exists
@@ -497,6 +500,7 @@ def _validate_and_add_packages_to_apm_yml(
         scope=scope,
         allow_insecure=allow_insecure,
         skill_subset=skill_subset,
+        skill_subset_from_cli=skill_subset_from_cli,
         default_registry=_default_registry_for_cli,
     )
 

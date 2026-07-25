@@ -13,9 +13,9 @@ working.
 
 from __future__ import annotations
 
-import sys
 from typing import TYPE_CHECKING, Any
 
+from apm_cli.install.errors import DirectDependencyError
 from apm_cli.install.registry_wiring import (
     get_registry_resolver,
     resolver_last_registry_resolution,
@@ -25,7 +25,7 @@ from apm_cli.install.sources_base import (
     Materialization,
     _record_declared_license,
 )
-from apm_cli.utils.console import _rich_error, _rich_success
+from apm_cli.utils.console import _rich_success
 from apm_cli.utils.short_sha import format_short_sha
 
 if TYPE_CHECKING:
@@ -58,10 +58,8 @@ def _format_package_type_label(pkg_type) -> str | None:
 class FreshDependencySource(DependencySource):
     """Fresh dependency: needs a network download.
 
-    Performs supply-chain hash verification (#763) and, on mismatch,
-    aborts the entire process via ``sys.exit(1)`` -- this matches the
-    legacy behaviour because content drift from the lockfile is treated
-    as a possible tampering event.
+    Performs supply-chain hash verification (#763) and raises on mismatch
+    because content drift from the lockfile is treated as possible tampering.
     """
 
     # Inherits the default "Failed to integrate primitives" prefix.
@@ -127,6 +125,10 @@ class FreshDependencySource(DependencySource):
             if dep_key in ctx.pre_download_results:
                 package_info = ctx.pre_download_results[dep_key]
             elif dep_ref.source == "registry":
+                if dep_key in ctx.callback_failures:
+                    # Resolve already surfaced the registry failure; do not
+                    # retry through the git fallback path.
+                    return None
                 from apm_cli.deps.registry.feature_gate import (
                     require_package_registry_enabled,
                 )
@@ -264,6 +266,12 @@ class FreshDependencySource(DependencySource):
                     registry_config=(ctx.registry_config if not dep_ref.is_local else None),
                     registry_resolution=_registry_resolution,
                     git_semver_resolution=_git_semver_resolution,
+                    package_name=package_info.package.name
+                    if package_info and package_info.package
+                    else None,
+                    package_version=package_info.package.version
+                    if package_info and package_info.package
+                    else None,
                 )
             )
             if install_path.is_dir():
@@ -290,18 +298,13 @@ class FreshDependencySource(DependencySource):
                 _fresh_hash = ctx.package_hashes[dep_key]
                 if _fresh_hash != dep_locked_chk.content_hash:
                     safe_rmtree(install_path, ctx.apm_modules_dir)
-                    _rich_error(
-                        f"Content hash mismatch for "
-                        f"{dep_key}: "
-                        f"expected {dep_locked_chk.content_hash}, "
-                        f"got {_fresh_hash}. "
-                        "The downloaded content differs from the "
-                        "lockfile record. This may indicate a "
-                        "supply-chain attack. Use 'apm install "
-                        "--update' to accept new content and "
-                        "update the lockfile."
+                    raise DirectDependencyError(
+                        f"Content hash mismatch for {dep_key}: "
+                        f"expected {dep_locked_chk.content_hash}, got {_fresh_hash}. "
+                        "The downloaded content differs from the lockfile record. "
+                        "This may indicate a supply-chain attack. Use "
+                        "'apm install --update' to accept new content and update the lockfile."
                     )
-                    sys.exit(1)
 
             if hasattr(package_info, "package_type") and package_info.package_type:
                 ctx.package_types[dep_key] = package_info.package_type.value
@@ -324,6 +327,8 @@ class FreshDependencySource(DependencySource):
                 deltas=deltas,
             )
 
+        except DirectDependencyError:
+            raise
         except Exception as e:
             display_name = str(dep_ref) if dep_ref.is_virtual else dep_ref.repo_url
             # task_id may not exist if progress.add_task failed; guard it.

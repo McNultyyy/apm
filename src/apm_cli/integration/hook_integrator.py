@@ -1,83 +1,58 @@
-"""Hook integration functionality for APM packages.
-
-Integrates hook JSON files and their referenced scripts during package
-installation. Supports VSCode Copilot (.github/hooks/), Claude Code
-(.claude/settings.json), and Cursor (.cursor/hooks.json) targets.
-
-Hook JSON format (Claude Code  -- nested matcher groups):
-    {
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "hooks": [
-                        {"type": "command", "command": "./scripts/validate.sh", "timeout": 10}
-                    ]
-                }
-            ]
-        }
-    }
-
-Hook JSON format (GitHub Copilot  -- flat arrays with bash/powershell keys):
-    {
-        "version": 1,
-        "hooks": {
-            "preToolUse": [
-                {"type": "command", "bash": "./scripts/validate.sh", "timeoutSec": 10}
-            ]
-        }
-    }
-
-Hook JSON format (Cursor  -- flat arrays with command key):
-    {
-        "hooks": {
-            "afterFileEdit": [
-                {"command": "./hooks/format.sh"}
-            ]
-        }
-    }
-
-Script path handling:
-    - ${CLAUDE_PLUGIN_ROOT}/path, ${CURSOR_PLUGIN_ROOT}/path, ${PLUGIN_ROOT}/path
-      -> resolved relative to package root, rewritten for target
-    - ./path -> relative path, resolved from hook file's parent directory, rewritten for target
-    - System commands (no path separators) -> passed through unchanged
-"""
+"""Hook integration facade for APM packages."""
 
 import json
 import logging
-import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from apm_cli.core.deployment_ledger import DeploymentLedgerCodec
+from apm_cli.core.deployment_state import (
+    MaterializationResult,
+    MaterializationStatus,
+    NativePayloadValidation,
+)
+from apm_cli.core.scope import InstallScope
 from apm_cli.integration.base_integrator import BaseIntegrator, IntegrationResult
-from apm_cli.utils.console import _rich_warning
-from apm_cli.utils.path_security import ensure_path_within
+from apm_cli.integration.hook_bundle import copy_deployed_hook_bundle
+from apm_cli.integration.hook_file_routing import filter_hook_files_for_target
+from apm_cli.utils.atomic_io import atomic_write_text
+from apm_cli.utils.console import (
+    _rich_warning,  # noqa: F401  (testability seam -- tests monkeypatch this)
+)
 from apm_cli.utils.paths import portable_relpath
+
+if TYPE_CHECKING:
+    from apm_cli.deps.lockfile import LockFile
 
 from .hook_merge import (
     _clean_apm_entries_from_json,
     _dependency_hook_sources,
     _get_hook_source_marker,
-    _get_package_name,
     _is_root_local_package,
     _load_merged_config_and_sidecar,
     _merge_hook_file_entries,
-    _sync_claude_hooks_settings,
     _warn_empty_hook_file,
     _write_merged_config,
 )
 from .hook_merge import (
+    _get_package_name as _get_package_name_impl,
+)
+from .hook_merge import (
     _parse_hook_json as _parse_hook_json_impl,
+)
+from .hook_native_formats import (  # noqa: F401
+    _to_antigravity_hook_entries,
+    _to_claude_hook_entries,
+    _to_gemini_hook_entries,
 )
 from .hook_transforms import (
     _APM_HOOKS_SIDECAR,
     _HOOK_EVENT_MAP,
     _MERGE_HOOK_TARGETS,
     _emit_hook_event_diagnostics,
-    _filter_hook_files_for_target,
     _MergeHookConfig,
-    _rewrite_command_for_target,
     _rewrite_hooks_data,
+    _validate_copilot_payload,
 )
 
 # ---------------------------------------------------------------------------
@@ -95,9 +70,15 @@ from .hook_transforms import (
 )
 from .hook_transforms import _reinject_apm_source_from_sidecar as _reinject_apm_source_from_sidecar
 from .hook_transforms import (
+    _rewrite_command_for_target as _rewrite_command_for_target_impl,
+)
+from .hook_transforms import (
     _summarize_command as _summarize_command_impl,
 )
-from .hook_transforms import _to_gemini_hook_entries as _to_gemini_hook_entries
+
+# Testability seam: tests can patch deprecated filename routing without
+# replacing the imported helper for every call site.
+_filter_hook_files_for_target = filter_hook_files_for_target
 
 _log = logging.getLogger(__name__)
 
@@ -106,8 +87,6 @@ _log = logging.getLogger(__name__)
 # Backward-compatible shim: accepts hooks_integrated= kwarg and
 # exposes a hooks_integrated property for consumers of the old API.
 class HookIntegrationResult(IntegrationResult):
-    """Backward-compatible wrapper around IntegrationResult."""
-
     def __init__(self, *args, hooks_integrated=None, **kwargs):
         if hooks_integrated is not None:
             kwargs.setdefault("files_integrated", hooks_integrated)
@@ -118,74 +97,56 @@ class HookIntegrationResult(IntegrationResult):
 
     @property
     def hooks_integrated(self):
-        """Alias for files_integrated (backward compat)."""
         return self.files_integrated
 
 
 class HookIntegrator(BaseIntegrator):
-    """Handles integration of APM package hooks into target locations.
+    """Handles integration of APM package hooks into target locations."""
 
-    Discovers hook JSON files and their referenced scripts from packages,
-    then installs them to the appropriate target location:
-    - VSCode: .github/hooks/<pkg>-<name>.json + .github/hooks/scripts/<pkg>/
-    - Claude: Merged into .claude/settings.json hooks key + .claude/hooks/<pkg>/
-    - Cursor: Merged into .cursor/hooks.json hooks key + .cursor/hooks/<pkg>/
-    """
-
-    # ---------------------------------------------------------------------------
-    # Static wrappers -- keep callable via HookIntegrator.xxx() for back-compat
-    # ---------------------------------------------------------------------------
+    def __init__(self) -> None:
+        super().__init__()
+        self._deprecated_hook_routing_warnings: set[str] = set()
 
     @staticmethod
-    def _is_root_local_package(package_info, project_root: Path | None) -> bool:
-        """Return True when package_info represents the project's own .apm content."""
-        return _is_root_local_package(package_info, project_root)
+    def _get_package_name(package_info, project_root: Path | None = None) -> str:
+        return _get_package_name_impl(package_info, project_root)
 
     @staticmethod
-    def _dependency_hook_sources(project_root: Path) -> set[str]:
-        """Return source markers that correspond to installed dependency dirs."""
-        return _dependency_hook_sources(project_root)
-
-    @staticmethod
-    def _clean_apm_entries_from_json(
-        json_path: Path, stats: dict[str, int], container: str = "hooks"
-    ) -> None:
-        """Remove APM-tagged entries from a hooks JSON file."""
-        _clean_apm_entries_from_json(json_path, stats, container=container)
-
     def _rewrite_command_for_target(
-        self,
         command: str,
-        package_path: Path,
+        package_path,
         package_name: str,
         target: str,
-        hook_file_dir: Path | None = None,
+        deploy_root=None,
+        hook_file_dir=None,
         root_dir: str | None = None,
-        deploy_root: Path | None = None,
-    ) -> tuple[str, list[tuple[Path, str]]]:
-        """Rewrite a hook command to use installed script paths."""
-        return _rewrite_command_for_target(
+        _warn=None,
+    ):
+        if _warn is None:
+            import apm_cli.integration.hook_integrator as _hi
+
+            _warn = _hi._rich_warning
+        return _rewrite_command_for_target_impl(
             command,
             package_path,
             package_name,
             target,
+            deploy_root=deploy_root,
             hook_file_dir=hook_file_dir,
             root_dir=root_dir,
-            deploy_root=deploy_root,
-            _warn=_rich_warning,
+            _warn=_warn,
         )
 
+    @staticmethod
     def _rewrite_hooks_data(
-        self,
         data: dict,
-        package_path: Path,
+        package_path,
         package_name: str,
         target: str,
-        hook_file_dir: Path | None = None,
+        hook_file_dir=None,
         root_dir: str | None = None,
-        deploy_root: Path | None = None,
-    ) -> tuple[dict, list[tuple[Path, str]]]:
-        """Rewrite all command paths in a hooks JSON structure."""
+        deploy_root=None,
+    ):
         return _rewrite_hooks_data(
             data,
             package_path,
@@ -196,18 +157,43 @@ class HookIntegrator(BaseIntegrator):
             deploy_root=deploy_root,
         )
 
-    # ---------------------------------------------------------------------------
-    # Hook file discovery
-    # ---------------------------------------------------------------------------
+    @staticmethod
+    def _root_local_identity_root(package_info, project_root: Path | None) -> Path | None:
+        return getattr(package_info, "root_local_project_root", None) or project_root
+
+    @staticmethod
+    def _deploy_root_for_hook_rewrite(project_root: Path, user_scope: bool) -> Path | None:
+        return project_root if user_scope else None
+
+    @staticmethod
+    def _is_root_local_package(package_info, project_root: Path | None) -> bool:
+        return _is_root_local_package(package_info, project_root)
+
+    @staticmethod
+    def _get_hook_source_marker(package_info, project_root: Path, package_name: str) -> str:
+        return _get_hook_source_marker(package_info, project_root, package_name)
+
+    @staticmethod
+    def _dependency_hook_sources(project_root: Path) -> set[str]:
+        return _dependency_hook_sources(project_root)
+
+    @staticmethod
+    def _clean_apm_entries_from_json(
+        json_path: Path,
+        stats: dict[str, int],
+        container: str = "hooks",
+        sidecar_path: Path | None = None,
+    ) -> None:
+        _clean_apm_entries_from_json(
+            json_path, stats, container=container, sidecar_path=sidecar_path
+        )
 
     @staticmethod
     def _iter_hook_entries(payload: dict) -> list[tuple[str, dict]]:
-        """Flatten hook payloads into (event_name, entry_dict) pairs."""
         return _iter_hook_entries_impl(payload)
 
     @staticmethod
     def _summarize_command(entry: dict) -> str:
-        """Return a human-readable summary for a single hook command entry."""
         return _summarize_command_impl(entry)
 
     def _build_display_payload(
@@ -217,24 +203,11 @@ class HookIntegrator(BaseIntegrator):
         source_hook_file: Any,
         rewritten: dict,
     ) -> dict:
-        """Build CLI display metadata for an integrated hook file."""
         return _build_display_payload_impl(target_label, output_path, source_hook_file, rewritten)
 
     def find_hook_files(self, package_path: Path) -> list[Path]:
-        """Find all hook JSON files in a package.
-
-        Searches in:
-        - .apm/hooks/ subdirectory (APM convention)
-        - hooks/ subdirectory (Claude-native convention)
-
-        Args:
-            package_path: Path to the package directory
-
-        Returns:
-            List[Path]: List of absolute paths to hook JSON files
-        """
-        hook_files = []
-        seen = set()
+        hook_files: list[Path] = []
+        seen_stems: set[str] = set()
 
         # Search in .apm/hooks/ (APM convention)
         apm_hooks = package_path / ".apm" / "hooks"
@@ -242,9 +215,9 @@ class HookIntegrator(BaseIntegrator):
             for f in sorted(apm_hooks.glob("*.json")):
                 if f.is_symlink():
                     continue
-                resolved = f.resolve()
-                if resolved not in seen:
-                    seen.add(resolved)
+                stem_key = f.stem.lower()
+                if stem_key not in seen_stems:
+                    seen_stems.add(stem_key)
                     hook_files.append(f)
 
         # Search in hooks/ (Claude-native convention)
@@ -253,60 +226,17 @@ class HookIntegrator(BaseIntegrator):
             for f in sorted(hooks_dir.glob("*.json")):
                 if f.is_symlink():
                     continue
-                resolved = f.resolve()
-                if resolved not in seen:
-                    seen.add(resolved)
+                stem_key = f.stem.lower()
+                if stem_key not in seen_stems:
+                    seen_stems.add(stem_key)
                     hook_files.append(f)
 
         return hook_files
 
     def _parse_hook_json(self, hook_file: Path) -> dict | None:
-        """Parse a hook JSON file and return the data dict.
-
-        Accepts both the wrapped format and the naked Claude-settings
-        hooks-slice format.  See ``hook_merge._parse_hook_json`` for details.
-        """
         return _parse_hook_json_impl(hook_file)
 
-    # ---------------------------------------------------------------------------
-    # Script copy helper
-    # ---------------------------------------------------------------------------
-
-    def _copy_hook_scripts(
-        self,
-        scripts: list[tuple[Path, str]],
-        project_root: Path,
-        target_paths: list[Path],
-        managed_files: set | None,
-        force: bool,
-        diagnostics,
-    ) -> tuple[int, int]:
-        """Copy referenced hook scripts to their target locations.
-
-        Returns:
-            (scripts_copied, scripts_adopted) counts.
-        """
-        scripts_copied = 0
-        scripts_adopted = 0
-        for source_file, target_rel in scripts:
-            target_script = project_root / target_rel
-            ensure_path_within(target_script, project_root)
-            if self.try_adopt_identical(target_script, source_file, target_paths):
-                scripts_adopted += 1
-                continue
-            if self.check_collision(
-                target_script, target_rel, managed_files, force, diagnostics=diagnostics
-            ):
-                continue
-            target_script.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_file, target_script)
-            scripts_copied += 1
-            target_paths.append(target_script)
-        return scripts_copied, scripts_adopted
-
-    # ---------------------------------------------------------------------------
-    # Copilot (individual-file) integration
-    # ---------------------------------------------------------------------------
+    # -- Copilot (individual-file) integration --
 
     def integrate_package_hooks(
         self,
@@ -316,50 +246,45 @@ class HookIntegrator(BaseIntegrator):
         managed_files: set = None,  # noqa: RUF013
         diagnostics=None,
         target=None,
+        *,
+        user_scope: bool = False,
     ) -> HookIntegrationResult:
-        """Integrate hooks from a package into hooks dir (Copilot target).
-
-        Deploys hook JSON files with clean filenames and copies referenced
-        script files. Skips user-authored files unless force=True.
-
-        Args:
-            package_info: PackageInfo with package metadata and install path
-            project_root: Root directory of the project
-            force: If True, overwrite user-authored files on collision
-            managed_files: Set of relative paths known to be APM-managed
-            target: Optional TargetProfile for scope-resolved root_dir
-
-        Returns:
-            HookIntegrationResult: Results of the integration operation
-        """
         hook_files = self.find_hook_files(package_info.install_path)
-        hook_files = _filter_hook_files_for_target(hook_files, "copilot")
+        package_name = self._get_package_name(package_info, project_root)
+        hook_files = _filter_hook_files_for_target(
+            hook_files,
+            "copilot",
+            package_name=package_name,
+            warned_packages=self._deprecated_hook_routing_warnings,
+            package_identity=package_info.get_canonical_dependency_string(),
+        )
 
         if not hook_files:
             return HookIntegrationResult(
-                files_integrated=0,
-                files_updated=0,
-                files_skipped=0,
-                target_paths=[],
+                files_integrated=0, files_updated=0, files_skipped=0, target_paths=[]
             )
 
         root_dir = target.root_dir if target else ".github"
         hooks_dir = project_root / root_dir / "hooks"
         hooks_dir.mkdir(parents=True, exist_ok=True)
+        deploy_root_for_rewrite = self._deploy_root_for_hook_rewrite(project_root, user_scope)
 
-        package_name = _get_package_name(package_info, project_root)
         hooks_integrated = 0
         scripts_copied = 0
         scripts_adopted = 0
         target_paths: list[Path] = []
         display_payloads: list = []
+        materializations: list[MaterializationResult] = []
+        from apm_cli.integration.targets import KNOWN_TARGETS
+        from apm_cli.utils.content_hash import compute_file_hash
+
+        _copilot_target = KNOWN_TARGETS["copilot"]
 
         for hook_file in hook_files:
             data = self._parse_hook_json(hook_file)
             if data is None:
                 continue
 
-            # Rewrite script paths for VSCode target
             rewritten, scripts = _rewrite_hooks_data(
                 data,
                 package_info.install_path,
@@ -367,42 +292,100 @@ class HookIntegrator(BaseIntegrator):
                 "vscode",
                 hook_file_dir=hook_file.parent,
                 root_dir=root_dir,
+                deploy_root=deploy_root_for_rewrite,
             )
 
-            # Generate target filename (clean, no -apm suffix)
+            # Apply Copilot event name normalisation
+            hooks = rewritten.get("hooks", {})
+            event_map = _HOOK_EVENT_MAP.get("copilot", {})
+            if isinstance(hooks, dict):
+                renamed_hooks: dict = {}
+                for raw_event_name, entries in hooks.items():
+                    event_name = event_map.get(raw_event_name, raw_event_name)
+                    if event_name in renamed_hooks and isinstance(renamed_hooks[event_name], list):
+                        if isinstance(entries, list):
+                            renamed_hooks[event_name].extend(entries)
+                            continue
+                    renamed_hooks[event_name] = entries
+                rewritten["hooks"] = renamed_hooks
+
+            rewritten.setdefault("version", 1)
+            errors = _validate_copilot_payload(rewritten)
+            validation = NativePayloadValidation(
+                valid=not errors, contract="copilot-hooks-v1", errors=tuple(errors)
+            )
+
+            # Generate target filename
             stem = hook_file.stem
             target_filename = f"{package_name}-{stem}.json"
             target_path = hooks_dir / target_filename
             rel_path = portable_relpath(target_path, project_root)
+
+            if not validation.valid:
+                if diagnostics is not None:
+                    diagnostics.error(
+                        f"Invalid Copilot hook payload for {rel_path}",
+                        package=package_name,
+                        detail="; ".join(validation.errors),
+                    )
+                materializations.append(
+                    MaterializationResult(
+                        locator=DeploymentLedgerCodec.locator_for_path(
+                            target_path,
+                            project_root=project_root,
+                            target=_copilot_target,
+                            scope=InstallScope.PROJECT,
+                        ),
+                        owners=frozenset({package_info.get_canonical_dependency_string()}),
+                        status=MaterializationStatus.FAILED,
+                        content_hash=None,
+                        validation=validation,
+                    )
+                )
+                continue
 
             if self.check_collision(
                 target_path, rel_path, managed_files, force, diagnostics=diagnostics
             ):
                 continue
 
-            _emit_hook_event_diagnostics(list(rewritten.get("hooks", {}).keys()), "copilot", {})
-
-            # Write rewritten JSON
-            with open(target_path, "w", encoding="utf-8") as f:
-                json.dump(rewritten, f, indent=2)
-                f.write("\n")
-
+            _emit_hook_event_diagnostics(list(hooks.keys()), "copilot", event_map)
+            atomic_write_text(target_path, json.dumps(rewritten, indent=2) + "\n")
             hooks_integrated += 1
             target_paths.append(target_path)
-            display_payloads.append(
-                self._build_display_payload(
-                    f"{root_dir}/hooks/",
-                    target_filename,
-                    hook_file,
-                    rewritten,
+            materializations.append(
+                MaterializationResult(
+                    locator=DeploymentLedgerCodec.locator_for_path(
+                        target_path,
+                        project_root=project_root,
+                        target=_copilot_target,
+                        scope=InstallScope.PROJECT,
+                    ),
+                    owners=frozenset({package_info.get_canonical_dependency_string()}),
+                    status=MaterializationStatus.WRITTEN,
+                    content_hash=compute_file_hash(target_path),
+                    validation=validation,
                 )
             )
-
-            sc, sa = self._copy_hook_scripts(
-                scripts, project_root, target_paths, managed_files, force, diagnostics
+            display_payloads.append(
+                self._build_display_payload(
+                    f"{root_dir}/hooks/", target_filename, hook_file, rewritten
+                )
             )
-            scripts_copied += sc
-            scripts_adopted += sa
+            copy_result = copy_deployed_hook_bundle(
+                self,
+                package_path=package_info.install_path,
+                hook_file_dir=hook_file.parent,
+                project_root=project_root,
+                scripts=scripts,
+                managed_files=managed_files,
+                force=force,
+                diagnostics=diagnostics,
+                target_paths=target_paths,
+                hook_descriptor_files=set(hook_files),
+            )
+            scripts_copied += copy_result.scripts_copied
+            scripts_adopted += copy_result.files_adopted
 
         return HookIntegrationResult(
             files_integrated=hooks_integrated,
@@ -412,11 +395,10 @@ class HookIntegrator(BaseIntegrator):
             scripts_copied=scripts_copied,
             files_adopted=scripts_adopted,
             display_payloads=display_payloads,
+            materializations=tuple(materializations),
         )
 
-    # ------------------------------------------------------------------
-    # Shared JSON-merge implementation for Claude / Cursor / Codex
-    # ------------------------------------------------------------------
+    # -- Shared JSON-merge implementation (Claude / Cursor / Codex) --
 
     def _integrate_merged_hooks(
         self,
@@ -430,12 +412,6 @@ class HookIntegrator(BaseIntegrator):
         target=None,
         user_scope: bool = False,
     ) -> HookIntegrationResult:
-        """Integrate hooks by merging into a target-specific JSON config.
-
-        This is the shared implementation for Claude, Cursor, and Codex
-        targets that merge hook entries into a single JSON file (as
-        opposed to Copilot which uses individual JSON files).
-        """
         _empty = HookIntegrationResult(
             files_integrated=0,
             files_updated=0,
@@ -451,14 +427,20 @@ class HookIntegrator(BaseIntegrator):
             return _empty
 
         # Absolutize hook commands only for user-scope deploys.
-        _deploy_root_for_rewrite = project_root if user_scope else None
+        _deploy_root_for_rewrite = self._deploy_root_for_hook_rewrite(project_root, user_scope)
 
         hook_files = self.find_hook_files(package_info.install_path)
-        hook_files = _filter_hook_files_for_target(hook_files, config.target_key)
+        package_name = self._get_package_name(package_info, project_root)
+        hook_files = _filter_hook_files_for_target(
+            hook_files,
+            config.target_key,
+            package_name=package_name,
+            warned_packages=self._deprecated_hook_routing_warnings,
+            package_identity=package_info.get_canonical_dependency_string(),
+        )
         if not hook_files:
             return _empty
 
-        package_name = _get_package_name(package_info, project_root)
         source_marker = _get_hook_source_marker(package_info, project_root, package_name)
         heal_stale = _is_root_local_package(package_info, project_root)
         dep_sources = _dependency_hook_sources(project_root) if heal_stale else set()
@@ -468,10 +450,6 @@ class HookIntegrator(BaseIntegrator):
         scripts_adopted = 0
         target_paths: list[Path] = []
         display_payloads: list = []
-        # Per-file display metadata is captured during the merge loop but
-        # the payloads are BUILT after the JSON config is finalized (Gemini
-        # transform applied, schema-strict _apm_source stripped) so that
-        # rendered_json reflects the actual on-disk/executed content.
         pending_display: list = []
         cleared_events: set = set()
 
@@ -481,9 +459,6 @@ class HookIntegrator(BaseIntegrator):
             json_path, sidecar_path, config.schema_strict, container=config.event_container_key
         )
 
-        # Inject any target-specific top-level defaults (e.g. "version": 1 for
-        # Cursor) that are absent from the existing file.  Existing values are
-        # never overwritten so a user-set "version" is preserved across reinstalls.
         injected_keys: list[str] = []
         for key, value in config.top_level_defaults.items():
             if key not in json_config:
@@ -491,9 +466,7 @@ class HookIntegrator(BaseIntegrator):
                 injected_keys.append(key)
         if injected_keys:
             _log.debug(
-                "Injected top_level_defaults into %s: %s",
-                config.config_filename,
-                injected_keys,
+                "Injected top_level_defaults into %s: %s", config.config_filename, injected_keys
             )
 
         for hook_file in hook_files:
@@ -511,7 +484,8 @@ class HookIntegrator(BaseIntegrator):
                 deploy_root=_deploy_root_for_rewrite,
             )
 
-            hooks = rewritten.get("hooks", {})
+            container = config.event_container_key
+            hooks = rewritten.get("hooks", {})  # source files always use "hooks" key
             event_map = _HOOK_EVENT_MAP.get(config.target_key, {})
             _emit_hook_event_diagnostics(list(hooks.keys()), config.target_key, event_map)
 
@@ -526,7 +500,7 @@ class HookIntegrator(BaseIntegrator):
                 heal_stale_root_source=heal_stale,
                 dependency_sources=dep_sources,
                 capture_entries=file_event_entries,
-                container=config.event_container_key,
+                container=container,
             )
 
             if appended:
@@ -542,26 +516,31 @@ class HookIntegrator(BaseIntegrator):
             else:
                 _warn_empty_hook_file(hook_file, config.target_key)
 
-            copied, adopted = self._copy_hook_scripts(
-                scripts, project_root, target_paths, managed_files, force, diagnostics
+            copy_result = copy_deployed_hook_bundle(
+                self,
+                package_path=package_info.install_path,
+                hook_file_dir=hook_file.parent,
+                project_root=project_root,
+                scripts=scripts,
+                managed_files=managed_files,
+                force=force,
+                diagnostics=diagnostics,
+                target_paths=target_paths,
+                hook_descriptor_files=set(hook_files),
             )
-            scripts_copied += copied
-            scripts_adopted += adopted
+            scripts_copied += copy_result.scripts_copied
+            scripts_adopted += copy_result.files_adopted
 
         json_path.parent.mkdir(parents=True, exist_ok=True)
         _write_merged_config(json_path, sidecar_path, json_config, config.schema_strict)
 
-        # Build display payloads from the finalized entry objects (post
-        # Gemini transform and post schema-strict _apm_source strip) so the
-        # CLI summary and rendered_json faithfully reflect what is written
-        # to disk and executed -- not the pre-transform per-file data.
         for _label, _path, _hook_file, _file_event_entries in pending_display:
             display_payloads.append(
                 self._build_display_payload(
                     _label,
                     _path,
                     _hook_file,
-                    {"hooks": _file_event_entries},
+                    {config.event_container_key: _file_event_entries},
                 )
             )
 
@@ -585,10 +564,6 @@ class HookIntegrator(BaseIntegrator):
         *,
         user_scope: bool = False,
     ) -> HookIntegrationResult:
-        """Integrate hooks into .claude/settings.json.
-
-        .. deprecated:: Use :meth:`integrate_hooks_for_target` instead.
-        """
         return self._integrate_merged_hooks(
             _MERGE_HOOK_TARGETS["claude"],
             package_info,
@@ -609,10 +584,6 @@ class HookIntegrator(BaseIntegrator):
         *,
         user_scope: bool = False,
     ) -> HookIntegrationResult:
-        """Integrate hooks into .cursor/hooks.json.
-
-        .. deprecated:: Use :meth:`integrate_hooks_for_target` instead.
-        """
         return self._integrate_merged_hooks(
             _MERGE_HOOK_TARGETS["cursor"],
             package_info,
@@ -633,10 +604,6 @@ class HookIntegrator(BaseIntegrator):
         *,
         user_scope: bool = False,
     ) -> HookIntegrationResult:
-        """Integrate hooks into .codex/hooks.json.
-
-        .. deprecated:: Use :meth:`integrate_hooks_for_target` instead.
-        """
         return self._integrate_merged_hooks(
             _MERGE_HOOK_TARGETS["codex"],
             package_info,
@@ -647,9 +614,7 @@ class HookIntegrator(BaseIntegrator):
             user_scope=user_scope,
         )
 
-    # ------------------------------------------------------------------
-    # Target-driven API
-    # ------------------------------------------------------------------
+    # -- Target-driven API --
 
     def integrate_hooks_for_target(
         self,
@@ -662,19 +627,12 @@ class HookIntegrator(BaseIntegrator):
         diagnostics=None,
         scope=None,
         user_scope: bool = False,
+        dep_targets_active: bool = False,
+        allowed_targets: "set[str] | None" = None,
     ) -> "HookIntegrationResult":
-        """Integrate hooks for a single *target*.
+        if dep_targets_active and (not allowed_targets or target.name not in allowed_targets):
+            raise AssertionError(f"BUG: target {target.name} bypassed chokepoint filter")
 
-        Copilot uses individual JSON files (genuinely different pattern).
-        All other merge-based targets are dispatched via the
-        ``_MERGE_HOOK_TARGETS`` registry.
-
-        ``user_scope`` controls whether merged-hook ``command`` paths are
-        rewritten to absolute paths (required when deploying to
-        ``~/.claude/settings.json`` -- see #1310 / #1354) or left
-        repo-relative so checked-in project-scope configs stay portable
-        across clones, contributors, and CI runners (#1394).
-        """
         if target.name == "copilot":
             return self.integrate_package_hooks(
                 package_info,
@@ -683,6 +641,7 @@ class HookIntegrator(BaseIntegrator):
                 managed_files=managed_files,
                 diagnostics=diagnostics,
                 target=target,
+                user_scope=user_scope,
             )
 
         if target.name == "kiro":
@@ -726,17 +685,6 @@ class HookIntegrator(BaseIntegrator):
         managed_files: set = None,  # noqa: RUF013
         targets=None,
     ) -> dict:
-        """Remove APM-managed hook files.
-
-        Uses *managed_files* (relative paths) to surgically remove only
-        APM-tracked files.  Falls back to legacy ``*-apm.json`` glob when
-        *managed_files* is ``None``.
-
-        **Never** calls ``shutil.rmtree``.
-
-        Also cleans APM entries from merged-hook JSON files via the
-        ``_apm_source`` marker.
-        """
         from .targets import KNOWN_TARGETS
 
         stats: dict[str, int] = {"files_removed": 0, "errors": 0}
@@ -752,13 +700,10 @@ class HookIntegrator(BaseIntegrator):
         hook_prefix_tuple = tuple(hook_prefixes)
 
         if managed_files is not None:
-            # Manifest-based removal -- only remove tracked files
             deleted: list = []
             for rel_path in managed_files:
                 normalized = rel_path.replace("\\", "/")
-                if not normalized.startswith(hook_prefix_tuple):
-                    continue
-                if ".." in rel_path:
+                if not normalized.startswith(hook_prefix_tuple) or ".." in rel_path:
                     continue
                 target_file = project_root / rel_path
                 if target_file.exists() and target_file.is_file():
@@ -768,10 +713,8 @@ class HookIntegrator(BaseIntegrator):
                         deleted.append(target_file)
                     except Exception:
                         stats["errors"] += 1
-            # Batch parent cleanup -- single bottom-up pass
             self.cleanup_empty_parents(deleted, stop_at=project_root)
         else:
-            # Legacy fallback  -- glob for old -apm suffix files
             hooks_dir = project_root / ".github" / "hooks"
             if hooks_dir.exists():
                 for hook_file in hooks_dir.glob("*-apm.json"):
@@ -785,12 +728,70 @@ class HookIntegrator(BaseIntegrator):
         for t in source:
             config = _MERGE_HOOK_TARGETS.get(t.name)
             if config is not None:
-                json_path = project_root / t.root_dir / config.config_filename
-                if t.name == "claude":
-                    _sync_claude_hooks_settings(json_path, stats)
-                else:
-                    _clean_apm_entries_from_json(
-                        json_path, stats, container=config.event_container_key
-                    )
+                root = t.root_dir if hasattr(t, "root_dir") else f".{t.name}"
+                json_path = project_root / root / config.config_filename
+                sidecar_path = json_path.parent / _APM_HOOKS_SIDECAR
+                self._clean_apm_entries_from_json(
+                    json_path,
+                    stats,
+                    container=config.event_container_key,
+                    sidecar_path=sidecar_path,
+                )
 
         return stats
+
+    def reconcile_after_removal(
+        self,
+        apm_package,
+        project_root: Path,
+        *,
+        user_scope: bool = False,
+        lockfile: "LockFile | None" = None,
+    ) -> dict:
+        """Reconcile merged-hook ownership after packages leave apm.yml (#2254)."""
+        from apm_cli.constants import APM_MODULES_DIR
+        from apm_cli.models.apm_package import (
+            build_installed_package_info,
+            surviving_dependency_refs_for_reintegration,
+        )
+
+        from .targets import resolve_targets
+
+        config_target = list(apm_package.canonical_targets)
+        targets = resolve_targets(
+            project_root, user_scope=user_scope, explicit_target=config_target or None
+        )
+        surviving_deps = surviving_dependency_refs_for_reintegration(
+            apm_package, project_root, lockfile=lockfile
+        )
+        stats = self.sync_integration(
+            apm_package, project_root, managed_files=set(), targets=targets
+        )
+        for dep_ref in surviving_deps:
+            pkg_info = build_installed_package_info(dep_ref, project_root / APM_MODULES_DIR)
+            if pkg_info is None:
+                continue
+            try:
+                for target in targets:
+                    self.integrate_hooks_for_target(
+                        target, pkg_info, project_root, user_scope=user_scope
+                    )
+            except Exception as e:
+                stats["errors"] = stats.get("errors", 0) + 1
+                pkg_id = (
+                    dep_ref.get_identity() if hasattr(dep_ref, "get_identity") else str(dep_ref)
+                )
+                _log.warning("Best-effort hook re-integration skipped for %s: %s", pkg_id, e)
+        return stats
+
+    def reconcile_dropped_targets(
+        self,
+        project_root: Path,
+        dropped_target_names: "list[str] | set[str]",
+        *,
+        user_scope: bool = False,
+    ) -> "dict[str, int]":
+        """Clean merge-hook state for targets no longer declared (#2253)."""
+        from ._hook_dropped_targets import reconcile_dropped_targets as _impl
+
+        return _impl(project_root, dropped_target_names, user_scope=user_scope)

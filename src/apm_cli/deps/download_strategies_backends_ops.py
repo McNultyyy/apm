@@ -11,12 +11,78 @@ original module at module scope (avoids an import cycle).
 import base64
 import io
 import os
+import tempfile
 import zipfile
 from pathlib import Path
 
 import requests
 
 from ..models.apm_package import DependencyReference
+from ..utils.archive import ArchiveError, safe_extract_zip
+
+_ARTIFACTORY_DOWNLOAD_CHUNK_BYTES = 256 * 1024
+
+
+def _stream_artifactory_archive_impl(
+    response: requests.Response,
+    output_path: Path,
+    url: str,
+    max_archive_bytes: int,
+) -> None:
+    """Stream an Artifactory archive response to disk with a byte cap."""
+    content_length = response.headers.get("Content-Length", "")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except (TypeError, ValueError):
+            declared_size = None
+        else:
+            if declared_size > max_archive_bytes:
+                raise ArchiveError(f"Archive too large ({declared_size} bytes) from {url}")
+
+    total_bytes = 0
+    with open(output_path, "wb") as archive_file:
+        for chunk in response.iter_content(chunk_size=_ARTIFACTORY_DOWNLOAD_CHUNK_BYTES):
+            if not chunk:
+                continue
+            total_bytes += len(chunk)
+            if total_bytes > max_archive_bytes:
+                raise ArchiveError(f"Archive too large ({total_bytes} bytes) from {url}")
+            archive_file.write(chunk)
+
+
+def _extract_artifactory_zip_impl(
+    zf: zipfile.ZipFile,
+    target_path: Path,
+    url: str,
+) -> None:
+    """Extract an Artifactory VCS archive with shared ZIP safety guards."""
+    names = zf.namelist()
+    if not names:
+        raise RuntimeError(f"Empty archive from {url}")
+
+    root_prefix = names[0]
+    if root_prefix.endswith("/"):
+
+        def _strip_root(member_name: str) -> str | None:
+            if member_name == root_prefix:
+                return None
+            if not member_name.startswith(root_prefix):
+                raise ArchiveError(
+                    f"Archive member is outside root prefix {root_prefix!r}: {member_name!r}"
+                )
+            rel_path = member_name[len(root_prefix) :]
+            return rel_path or None
+
+        safe_extract_zip(
+            zf,
+            target_path,
+            error_type=ArchiveError,
+            member_name_transform=_strip_root,
+        )
+        return
+
+    safe_extract_zip(zf, target_path, error_type=ArchiveError)
 
 
 def download_artifactory_archive(
@@ -31,35 +97,37 @@ def download_artifactory_archive(
 ) -> None:
     """Download and extract a zip archive from Artifactory VCS proxy.
 
-    Tries multiple URL patterns (GitHub-style and GitLab-style).
-    GitHub archives contain a single root directory named {repo}-{ref}/;
-    this method strips that prefix on extraction so files land directly
-    in *target_path*.
-
+    Streams to a temp file to avoid buffering large archives in memory.
     Raises RuntimeError on failure.
     """
+    from apm_cli.config import get_apm_temp_dir
     from apm_cli.deps import download_strategies as _ds
 
     archive_urls = _ds.build_artifactory_archive_url(host, prefix, owner, repo, ref, scheme=scheme)
     headers = delegate.get_artifactory_headers()
 
-    # Guard: reject unreasonably large archives (default 500 MB)
     max_archive_bytes = int(os.environ.get("ARTIFACTORY_MAX_ARCHIVE_MB", "500")) * 1024 * 1024
 
     last_error = None
     for url in archive_urls:
         _ds._debug(f"Trying Artifactory archive: {url}")
+        resp = None
         try:
-            resp = delegate._host._resilient_get(url, headers=headers, timeout=60)
+            resp = delegate._host._resilient_get(url, headers=headers, timeout=60, stream=True)
             if resp.status_code == 200:
-                if len(resp.content) > max_archive_bytes:
-                    last_error = f"Archive too large ({len(resp.content)} bytes) from {url}"
-                    _ds._debug(last_error)
-                    continue
-                _extract_stripped_archive(resp.content, target_path, url)
+                target_path.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(dir=get_apm_temp_dir()) as temp_dir:
+                    archive_path = Path(temp_dir) / "artifactory-download.zip"
+                    _stream_artifactory_archive_impl(resp, archive_path, url, max_archive_bytes)
+                    with zipfile.ZipFile(archive_path) as zf:
+                        _extract_artifactory_zip_impl(zf, target_path, url)
                 _ds._debug(f"Extracted Artifactory archive to {target_path}")
                 return
-            last_error = f"HTTP {resp.status_code} from {url}"
+            else:
+                last_error = f"HTTP {resp.status_code} from {url}"
+                _ds._debug(last_error)
+        except ArchiveError as e:
+            last_error = f"Unsafe zip archive from {url}: {e}"
             _ds._debug(last_error)
         except zipfile.BadZipFile:
             last_error = f"Invalid zip archive from {url}"
@@ -67,47 +135,14 @@ def download_artifactory_archive(
         except requests.RequestException as e:
             last_error = str(e)
             _ds._debug(f"Request failed: {last_error}")
+        finally:
+            if resp is not None:
+                _ds._close_response(resp, "artifactory archive")
 
     raise RuntimeError(
         f"Failed to download package {owner}/{repo}#{ref} from Artifactory "
         f"({host}/{prefix}). Last error: {last_error}"
     )
-
-
-def _extract_stripped_archive(content: bytes, target_path: Path, url: str) -> None:
-    """Extract a zip archive into *target_path*, stripping the root prefix."""
-    from apm_cli.deps import download_strategies as _ds
-
-    target_path.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        names = zf.namelist()
-        if not names:
-            raise RuntimeError(f"Empty archive from {url}")
-        root_prefix = names[0]
-        if not root_prefix.endswith("/"):
-            # Single file archive; extract as-is
-            zf.extractall(target_path)
-            return
-        for member in zf.infolist():
-            if member.filename == root_prefix:
-                continue
-            rel = member.filename[len(root_prefix) :]
-            if not rel:
-                continue
-            # Guard: prevent zip path traversal (CWE-22)
-            dest = target_path / rel
-            if not dest.resolve().is_relative_to(target_path.resolve()):
-                _ds._debug(f"Skipping zip entry escaping target: {member.filename}")
-                continue
-            unix_mode = (member.external_attr >> 16) & 0xFFFF
-            if member.is_dir():
-                dest.mkdir(parents=True, exist_ok=True)
-            else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(member) as src, open(dest, "wb") as dst:
-                    dst.write(src.read())
-                if unix_mode:
-                    os.chmod(dest, unix_mode & 0o755)
 
 
 def download_file_from_artifactory(

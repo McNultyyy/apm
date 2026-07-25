@@ -35,11 +35,17 @@ and [`apm marketplace init`](../marketplace/) instead.
 | `-y`, `--yes` | off | Skip interactive prompts; use auto-detected defaults. Overwrites an existing `apm.yml` without confirmation. |
 | `--plugin` | off | **Deprecated.** Use [`apm plugin init`](../plugin/) instead. Scaffold a plugin authoring project: also writes `plugin.json` and adds a `devDependencies` block to `apm.yml`. Plugin name must be kebab-case, max 64 chars. |
 | `--marketplace` | off | **Deprecated.** Use [`apm marketplace init`](../marketplace/) instead. Append a `marketplace:` authoring block to `apm.yml`. See [Publish to a marketplace](../../../producer/publish-to-a-marketplace/). |
-| `--target` | (prompt) | Comma-separated target list. Skips the interactive target prompt and writes targets directly. Valid values: `copilot`, `claude`, `cursor`, `opencode`, `codex`, `gemini`, `windsurf`, `kiro`. |
+| `--target` | (prompt) | Comma-separated target list. Skips the interactive target prompt and writes targets directly. Valid values include `copilot`, `claude`, `cursor`, `opencode`, `codex`, `gemini`, `antigravity`, `windsurf`, `kiro`, `agent-skills`, and `all`. |
 | `-v`, `--verbose` | off | Show detailed output. |
 
 Target precedence: `--target` flag > interactive prompt > auto-detect at
 compile time (used with `--yes` or in non-TTY shells).
+
+`init` resolves CLI aliases before writing `targets:`. For example,
+`--target agents` and `--target vscode` both persist the canonical
+`copilot` identifier, while `--target all` expands to canonical manifest
+targets. The generated manifest is therefore accepted unchanged by
+`apm install`.
 
 ## Examples
 
@@ -104,6 +110,10 @@ $ apm init --yes --target copilot,claude,cursor
   pre-checks targets read from its existing `target:` field.
 - **Codex hint:** if `.codex/` is present, suggests
   `--target agent-skills` to also deploy skills to `.agents/skills/`.
+- **Existing plugin sources:** when plugin-native directories such as
+  `skills/`, `agents/`, or `commands/` exist at the project root and `.apm/`
+  does not, warns that they remain packable. `apm init` does not create
+  `.apm/` automatically.
 - **agentrc suggestion:** when no agent instruction files are found
   (`.github/copilot-instructions.md`, `AGENTS.md`, `.github/instructions/`),
   the Next Steps panel suggests generating agent instructions:

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from apm_cli.drift import build_download_ref, detect_ref_change
+from apm_cli.install.helpers.ref_reuse import maybe_resolve_git_semver as _maybe_resolve_git_semver
 
 if TYPE_CHECKING:
     from apm_cli.install.context import InstallContext
@@ -48,6 +49,7 @@ class _TransitiveDownloader:
         registries_map,
         direct_dep_keys,
         update_refs: bool,
+        staging_session=None,
     ):
         self.ctx = ctx
         self.registry_resolver = registry_resolver
@@ -55,6 +57,7 @@ class _TransitiveDownloader:
         self.registries_map = registries_map
         self.direct_dep_keys = direct_dep_keys
         self.update_refs = update_refs
+        self.staging_session = staging_session
         # Snapshot the same ctx fields the former closure captured as locals.
         self.scope = ctx.scope
         self.project_root = ctx.project_root
@@ -121,13 +124,21 @@ class _TransitiveDownloader:
                 package's directory rather than the root consumer (#857).
         """
         install_path = dep_ref.get_install_path(modules_dir)
-        # Cache short-circuit: skip the rest when the install path already
-        # exists, unless this is a git-source semver dep under --update /
-        # --refresh (then fall through so ``_maybe_resolve_git_semver``
-        # re-runs ``git ls-remote`` and the lockfile gets rewritten with the
-        # latest matching tag -- Bug 1 fix on #1496).
-        if install_path.exists() and not self._force_semver_resolve(dep_ref):
-            return install_path
+        # Cache reuse stays behind the canonical ref-drift owner.
+        if install_path.exists():
+            _locked_for_recheck = (
+                self.existing_lockfile.get_dependency(dep_ref.get_unique_key())
+                if self.existing_lockfile
+                else None
+            )
+            from apm_cli.drift import should_force_ref_recheck
+
+            if not should_force_ref_recheck(
+                dep_ref, _locked_for_recheck, update_refs=self.update_refs
+            ):
+                return install_path
+        if self.staging_session is not None:
+            self.staging_session.prepare_path(install_path)
         self._emit_heartbeat(dep_ref)
         try:
             # Registry-sourced dep (design 8): routed before local/git so the
@@ -193,6 +204,9 @@ class _TransitiveDownloader:
                 self.downloaded[dep_ref.get_unique_key()] = None
                 return install_path
         self.registry_resolver.download_package(dep_ref, install_path)
+        from apm_cli.install.phases.resolve import _annotate_registry_dep_ref
+
+        _annotate_registry_dep_ref(dep_ref, self.registry_resolver)
         # Mark as already-downloaded so the parallel pre-download phase skips
         # this dep. No SHA for registry deps.
         self.downloaded[dep_ref.get_unique_key()] = None
@@ -237,17 +251,15 @@ class _TransitiveDownloader:
 
     def _download_git(self, dep_ref, install_path):
         """Resolve any git-source semver range, detect spec drift, and clone."""
-        from apm_cli.install.phases.resolve import _maybe_resolve_git_semver
-
-        # Git-source semver range resolution (#1488): resolve a semver range
-        # ``ref:`` to a concrete tag BEFORE any git operation. The result is
-        # stashed on ctx so sources.py can plumb it into the lockfile; the
-        # dep_ref's ``reference`` is rewritten in place to the concrete tag.
         _semver_resolution = _maybe_resolve_git_semver(
             dep_ref=dep_ref,
             existing_lockfile=self.existing_lockfile,
             update_refs=self.update_refs,
             auth_resolver=self.ctx.auth_resolver,
+            ref_resolver_cache=self.ctx.ref_resolver_cache,
+            ref_resolver_cache_lock=self.lock,
+            transport_selector=self.downloader._transport_selector,
+            protocol_pref=self.downloader._protocol_pref,
         )
         if _semver_resolution is not None:
             with self.lock:
@@ -292,6 +304,8 @@ class _TransitiveDownloader:
         # Capture resolved commit SHA for lockfile.
         resolved_sha = None
         if result and hasattr(result, "resolved_reference") and result.resolved_reference:
+            # Download wins over cached pre-plan state; tiered re-resolution is cheap.
+            dep_ref.resolved_reference = result.resolved_reference
             resolved_sha = result.resolved_reference.resolved_commit
         with self.lock:
             self.downloaded[dep_ref.get_unique_key()] = resolved_sha

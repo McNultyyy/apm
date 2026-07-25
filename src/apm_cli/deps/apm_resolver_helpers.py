@@ -17,10 +17,12 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path, PureWindowsPath
 
 from ..models.apm_package import APMPackage, DependencyReference
+from ..utils.paths import portable_relpath
 from .dependency_graph import (
     CircularRef,
     DependencyGraph,
@@ -152,6 +154,45 @@ def _expand_parent_repo_decl(
 # ---------------------------------------------------------------------------
 
 
+def _select_dependency_winners(
+    nodes: Iterable[DependencyNode],
+) -> tuple[tuple[DependencyNode, ...], dict[str, str]]:
+    """Return canonical dependency order and first-wins node IDs."""
+    ordered = tuple(sorted(nodes, key=lambda node: (node.depth, node.get_id())))
+    winner_ids: dict[str, str] = {}
+    for node in ordered:
+        winner_ids.setdefault(
+            node.dependency_ref.get_unique_key(),
+            node.get_id(),
+        )
+    return ordered, winner_ids
+
+
+def _portable_anchor_identity(anchored: Path, base: Path | None) -> str:
+    """Return a machine-independent identity string for a resolved local dep.
+
+    ``anchored`` is the absolute, resolved on-disk location of a local
+    package. The returned value is the package's stable identity only --
+    it feeds the ``local:`` cycle key, the lockfile
+    ``dependencies[].anchored_local_path`` field, and (via that same owner
+    identity) the deployment-ledger owner rows. It is never re-opened as a
+    filesystem path.
+
+    A lockfile is a committed, cross-machine artifact, so this identity
+    MUST NOT carry a developer's home directory or any absolute prefix.
+    Packages inside ``base`` (the project root) are recorded relative to
+    it in forward-slash POSIX form -- matching how directly-declared local
+    owners already serialize -- which keeps a regenerated lockfile
+    deterministic across machines and CI. Packages outside ``base`` (or
+    when ``base`` is unknown) fall back to the resolved absolute POSIX
+    path: such out-of-project local deps are inherently non-committable,
+    and the fallback preserves a unique identity without inventing one.
+    """
+    if base is None:
+        return anchored.resolve().as_posix()
+    return portable_relpath(anchored, base)
+
+
 def _detect_circular_deps(tree: DependencyTree) -> list[CircularRef]:
     """Detect and report circular dependency chains.
 
@@ -173,9 +214,9 @@ def _detect_circular_deps(tree: DependencyTree) -> list[CircularRef]:
     def dfs_detect_cycles(node: DependencyNode) -> None:
         """Recursive DFS function to detect cycles."""
         node_id = node.get_id()
-        # Use unique key (includes subdirectory path) to distinguish monorepo packages
-        # e.g., vineethsoma/agent-packages/agents/X vs vineethsoma/agent-packages/skills/Y
-        unique_key = node.dependency_ref.get_unique_key()
+        # Use cycle key (includes anchored local path) to distinguish local deps
+        # e.g., two different local packages at different paths
+        unique_key = node.dependency_ref.get_cycle_key()
 
         # Check if this unique key is already in our current path (cycle detected)
         if unique_key in current_path_set:
@@ -197,7 +238,7 @@ def _detect_circular_deps(tree: DependencyTree) -> list[CircularRef]:
             child_id = child.get_id()
 
             # Only recurse if we haven't processed this subtree completely
-            if child_id not in visited or child.dependency_ref.get_unique_key() in current_path_set:
+            if child_id not in visited or child.dependency_ref.get_cycle_key() in current_path_set:
                 dfs_detect_cycles(child)
 
         # Remove from path when backtracking (but keep in visited)
@@ -227,27 +268,15 @@ def _flatten_dependencies(tree: DependencyTree) -> FlatDependencyMap:
         FlatDependencyMap: Flattened dependencies ready for installation.
     """
     flat_map = FlatDependencyMap()
-    seen_keys: set[str] = set()
-
-    # Process dependencies level by level (breadth-first)
-    # This ensures that dependencies declared earlier in the tree get priority
-    for depth in range(1, tree.max_depth + 1):
-        nodes_at_depth = tree.get_nodes_at_depth(depth)
-
-        # Sort nodes by their position in the tree to ensure deterministic ordering
-        nodes_at_depth.sort(key=lambda node: node.get_id())
-
-        for node in nodes_at_depth:
-            unique_key = node.dependency_ref.get_unique_key()
-
-            if unique_key not in seen_keys:
-                # First occurrence - add without conflict
-                flat_map.add_dependency(node.dependency_ref, is_conflict=False)
-                seen_keys.add(unique_key)
-            else:
-                # Conflict - record it but keep the first one
-                flat_map.add_dependency(node.dependency_ref, is_conflict=True)
-
+    ordered, winner_ids = _select_dependency_winners(
+        node for node in tree.nodes.values() if node.depth >= 1
+    )
+    for node in ordered:
+        unique_key = node.dependency_ref.get_unique_key()
+        flat_map.add_dependency(
+            node.dependency_ref,
+            is_conflict=winner_ids[unique_key] != node.get_id(),
+        )
     return flat_map
 
 
@@ -592,3 +621,38 @@ def _resolve_marketplace_or_record_error(
             f"{f' ({context})' if context else ''}: {exc}"
         )
         return None
+
+
+def _anchor_local_sub_dep(
+    sub_dep: DependencyReference,
+    node: DependencyNode,
+    root_package: APMPackage,
+) -> DependencyReference | None:
+    """Anchor a local sub-dep to its declaring package's source directory.
+
+    Returns the updated ``sub_dep`` with ``declaring_parent`` and
+    ``anchored_local_path`` set, or ``None`` if the dep resolves to an
+    ancestor (cycle already linked). Returns ``sub_dep`` unmodified when
+    anchoring does not apply.
+    """
+    if not (sub_dep.is_local and sub_dep.local_path and node.package.source_path is not None):
+        return sub_dep
+    local_path = Path(sub_dep.local_path).expanduser()
+    anchored = (
+        local_path.resolve()
+        if local_path.is_absolute()
+        else (node.package.source_path / local_path).resolve()
+    )
+    sub_dep = replace(
+        sub_dep,
+        declaring_parent=node.get_id(),
+        anchored_local_path=_portable_anchor_identity(anchored, root_package.source_path),
+    )
+    ancestor: DependencyNode | None = node
+    while ancestor is not None:
+        if ancestor.dependency_ref.get_cycle_key() == sub_dep.get_cycle_key():
+            if all(child is not ancestor for child in node.children):
+                node.children.append(ancestor)
+            return None
+        ancestor = ancestor.parent
+    return sub_dep

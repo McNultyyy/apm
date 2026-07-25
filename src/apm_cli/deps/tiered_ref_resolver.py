@@ -66,6 +66,13 @@ _log = logging.getLogger(__name__)
 _SHA_RE = re.compile(r"^[a-f0-9]{40}$", re.IGNORECASE)
 
 
+def _repository_cache_identity(dep_ref: DependencyReference) -> str:
+    """Return the full normalized repository identity shared by all cache tiers."""
+    from ..cache.url_normalize import normalize_repo_url
+
+    return normalize_repo_url(dep_ref.to_github_url())
+
+
 def is_tiered_resolver_enabled() -> bool:
     """Read the ``APM_TIERED_RESOLVER`` env flag. Default ON.
 
@@ -133,7 +140,7 @@ class L0PerRunCache:
     name: str = "per_run_cache"
 
     def try_resolve(self, dep_ref: DependencyReference, ref: str) -> str | None:
-        return self.cache.get(dep_ref.repo_url, ref)
+        return self.cache.get(_repository_cache_identity(dep_ref), ref)
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +154,10 @@ class L1CommitsAPI:
     Delegates to :meth:`GitReferenceResolver.resolve_commit_sha_for_ref` --
     the cheap-path helper that already dispatches through
     ``host_backends.build_commits_api_url`` and ``host._resilient_get``,
-    inheriting that helper's auth + retry behavior. Returns ``None`` for
-    hosts whose backend has no cheap commits endpoint (e.g. ADO today);
-    the caller then falls through to L2/L3.
+    inheriting that helper's auth behavior. The optional metadata lookup
+    makes one HTTP attempt so rate limiting cannot delay L2/L3 fallback.
+    Returns ``None`` for hosts whose backend has no cheap commits endpoint
+    (e.g. ADO today); the caller then falls through to L2/L3.
 
     Future: an explicit :class:`HttpCache` ETag pass could be added here
     for unauthenticated requests (the underlying helper does not yet
@@ -220,7 +228,7 @@ class L2BareRevParse:
             return None
 
         try:
-            shard_key = cache_shard_key(dep_ref.repo_url)
+            shard_key = cache_shard_key(dep_ref.to_github_url())
         except Exception:
             return None
 
@@ -338,6 +346,31 @@ class TieredRefResolver:
         # Diagnostics: counts per tier across the run. Read by tests.
         self.stats: dict[str, int] = {tier.name: 0 for tier in tiers}
         self.stats["coalesced"] = 0
+        # Zero-I/O resolves of an already-concrete SHA. Tracked separately
+        # so verbose tier stats do not inflate the commits-API count.
+        self.stats["sha_passthrough"] = 0
+
+    def seed(self, repo_ref: str | DependencyReference, ref: str, sha: str) -> bool:
+        """Pre-populate the L0 per-run cache with a known ``ref -> sha``.
+
+        Used by the resolve phase to inject a lockfile-recorded commit
+        (``resolved_commit``) for a named ``resolved_ref`` -- a branch OR a
+        tag name, whichever the lockfile recorded -- BEFORE any download
+        runs, so the subsequent ``resolve()`` for that same ref gets an L0
+        hit and the commits-API tier (L1) never fires. ``ref`` must be the
+        exact ref string ``resolve()`` will look up. Idempotent; a no-op
+        unless ``sha`` is a full 40-char hex commit and ``ref`` is
+        non-empty. Returns ``True`` when a value was stored.
+
+        Safe because the seeded SHA is the lockfile's own trust anchor --
+        the same value ``resolve()`` would otherwise fetch from the network
+        and cache. No behavior change beyond eliminating the round-trip.
+        """
+        if not ref or not sha or not _SHA_RE.match(sha):
+            return False
+        dep_ref = self._normalize(repo_ref)
+        self._cache.put(_repository_cache_identity(dep_ref), ref, sha.lower())
+        return True
 
     def resolve(self, repo_ref: str | DependencyReference) -> ResolvedReference:
         """Resolve a git reference, dispatching through the tier waterfall.
@@ -354,7 +387,16 @@ class TieredRefResolver:
         if not ref or dep_ref.is_artifactory():
             return self._legacy.resolve_full(dep_ref)
 
-        key = (dep_ref.repo_url, ref)
+        # Ref is already a concrete commit SHA (e.g. the download ref was
+        # rewritten from the lockfile): resolution is a no-op with zero I/O.
+        # Count it distinctly so verbose tier stats reflect *real* network
+        # round-trips -- previously this fell into the commits-API tier and
+        # inflated ``commits_api`` even though no HTTP call was made.
+        if _SHA_RE.match(ref):
+            self.stats["sha_passthrough"] = self.stats.get("sha_passthrough", 0) + 1
+            return self._build_result(dep_ref, ref, ref.lower(), tier_name="sha_passthrough")
+
+        key = (_repository_cache_identity(dep_ref), ref)
 
         # Fast path: cache hit avoids both tier dispatch and the
         # coalesce lock entirely.

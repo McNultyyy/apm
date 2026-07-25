@@ -107,6 +107,10 @@ requirements:
     keyword: MUST
     section: "4.8"
     conformance_class: producer
+  - id: req-mf-022
+    keyword: MUST
+    section: "4.3.2"
+    conformance_class: consumer
   - id: req-ext-001
     keyword: MUST
     section: "4.1"
@@ -127,6 +131,7 @@ requirements:
     keyword: MUST
     section: "5.2"
     conformance_class: consumer
+    notes: "full-SHA manifest pins must match resolved_commit during conformance audit"
   - id: req-lk-004
     keyword: MUST
     section: "5.4"
@@ -187,6 +192,21 @@ requirements:
     keyword: SHOULD
     section: "5.5"
     conformance_class: consumer
+  - id: req-lk-019
+    keyword: MUST
+    section: "5.2"
+    conformance_class: consumer
+    notes: "name and dependency-apm.yml-derived version are self-asserted inventory metadata, never trust anchors"
+  - id: req-lk-020
+    keyword: MUST
+    section: "5.2"
+    conformance_class: consumer
+    notes: "target and identity reconciliation preserves legitimate, indeterminate, and freshly redeployed paths while dropping inactive-target ghosts"
+  - id: req-lk-021
+    keyword: MUST
+    section: "5.2"
+    conformance_class: consumer
+    notes: "extends req-lk-020's preserve/remove decision to merge-based hook configuration and its ownership record"
   - id: req-pl-001
     keyword: MUST
     section: "6.1"
@@ -247,6 +267,11 @@ requirements:
     keyword: MUST
     section: "6.3.5"
     conformance_class: governance
+  - id: req-pl-016
+    keyword: MUST
+    section: "6.8"
+    conformance_class: governance
+    notes: "a canonical deployment-ledger owner absent from apm.lock.yaml is a hard integrity failure independent of security.audit.fail_on_drift; audit exits non-zero in both default and CI modes and refuses to mutate deployed bytes while ownership is invalid"
   - id: req-rs-001
     keyword: MUST
     section: "7.2"
@@ -303,6 +328,15 @@ requirements:
     keyword: MUST
     section: "7.3.1"
     conformance_class: consumer
+  - id: req-rs-015
+    keyword: MUST
+    section: "7.5"
+    conformance_class: consumer
+  - id: req-rs-016
+    keyword: MUST
+    section: "7.2"
+    conformance_class: consumer
+    notes: "minimum repository identity binds every cache layer; distinct identities must not share source material"
   - id: req-pr-001
     keyword: MUST
     section: "8.2"
@@ -339,6 +373,18 @@ requirements:
     keyword: MUST
     section: "4.2.1"
     conformance_class: consumer
+  - id: req-tg-005
+    keyword: MUST
+    section: "8.5"
+    conformance_class: consumer
+  - id: req-tg-006
+    keyword: MUST
+    section: "8.5"
+    conformance_class: consumer
+  - id: req-tg-007
+    keyword: MUST
+    section: "8.5"
+    conformance_class: consumer
   - id: req-sc-001
     keyword: MUST
     section: "10.4"
@@ -370,6 +416,22 @@ requirements:
   - id: req-sc-008
     keyword: SHOULD
     section: "10.3"
+    conformance_class: consumer
+  - id: req-sc-009
+    keyword: MUST
+    section: "10.13"
+    conformance_class: consumer
+  - id: req-sc-010
+    keyword: MUST
+    section: "10.13"
+    conformance_class: consumer
+  - id: req-sc-011
+    keyword: MUST
+    section: "10.14"
+    conformance_class: consumer
+  - id: req-sc-012
+    keyword: MUST
+    section: "10.14"
     conformance_class: consumer
   - id: req-rg-001
     keyword: MUST

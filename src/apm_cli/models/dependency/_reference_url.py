@@ -29,6 +29,7 @@ from ._reference_util import (
     _NON_ADO_PATH_SEGMENT_RE,
     _path_segment_pattern,
 )
+from .identity import _split_shorthand_host_port
 
 
 class _ReferenceUrlMixin:
@@ -207,13 +208,15 @@ class _ReferenceUrlMixin:
         Validates path components before returning.
 
         Returns:
-            ``(parsed_url, host)``
+            ``(parsed_url, host, port)`` with any custom shorthand port.
         """
         parts = repo_url.split("/")
 
         if "_git" in parts:
             git_idx = parts.index("_git")
             parts = parts[:git_idx] + parts[git_idx + 1 :]
+
+        parts[0], port = _split_shorthand_host_port(parts[0])
 
         if len(parts) >= 3 and is_supported_git_host(parts[0]):
             host = parts[0]
@@ -281,7 +284,7 @@ class _ReferenceUrlMixin:
         github_url = urllib.parse.urljoin(f"https://{host}/", quoted_repo)
         parsed_url = urllib.parse.urlparse(github_url)
 
-        return parsed_url, host
+        return parsed_url, host, port
 
     @classmethod
     def _validate_url_repo_path(cls, parsed_url) -> tuple[str, str | None]:
@@ -478,7 +481,7 @@ class _ReferenceUrlMixin:
             if port == _DEFAULT_SCHEME_PORTS.get(scheme):
                 port = None
         else:
-            parsed_url, host = cls._resolve_shorthand_to_parsed_url(repo_url, host)
+            parsed_url, host, port = cls._resolve_shorthand_to_parsed_url(repo_url, host)
 
         repo_url, url_virtual_path = cls._validate_url_repo_path(parsed_url)
 
@@ -498,15 +501,7 @@ class _ReferenceUrlMixin:
 
     @classmethod
     def _validate_final_repo_fields(cls, host, repo_url):
-        """Validate the final repo_url and extract ADO organisation fields.
-
-        Performs character-set and segment-count validation appropriate for
-        the detected host type (Azure DevOps vs generic git host).
-
-        Returns:
-            ``(ado_organization, ado_project, ado_repo)`` -- all ``None``
-            for non-ADO hosts.
-        """
+        """Validate a repository path and return its ADO coordinates when applicable."""
         is_ado_final = host and is_azure_devops_hostname(host)
         if is_ado_final:
             if not re.match(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._\- ]+/[a-zA-Z0-9._\- ]+$", repo_url):

@@ -330,6 +330,7 @@ class CloneEngine:
             auth_resolver=host.auth_resolver,
             default_host_fn=default_host,
             last_error=last_error,
+            last_attempt_scheme=prev_scheme,
             sanitize_git_error=host._sanitize_git_error,
             clone_ctx=CloneFailureContext(
                 is_ado=bool(is_ado),

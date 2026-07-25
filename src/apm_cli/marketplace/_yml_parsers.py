@@ -578,7 +578,8 @@ def _parse_package_entry(raw: Any, index: int, source_base: str | None = None) -
             raise MarketplaceYmlError(f"'packages[{index}].repository' must be a non-empty string")
         repository = repository.strip()
 
-    # Marketplace category
+    # Optional marketplace category. Emitted by both the Claude and Codex
+    # outputs when set; the Codex output additionally requires it.
     category: str | None = None
     raw_category = raw.get("category")
     if raw_category is not None:

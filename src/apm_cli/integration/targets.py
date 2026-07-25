@@ -1,30 +1,22 @@
 """Target profiles for multi-tool integration.
 
 Each target tool (Copilot, Claude, Cursor, ...) describes where APM
-primitives should land.  Adding a new target means adding an entry to
+primitives land.  Adding a new target means adding an entry to
 ``KNOWN_TARGETS`` -- no new classes required.
-
-Resolver invariant (#820): both :func:`active_targets` and
-:func:`active_targets_user_scope` accept ``Union[str, List[str]]`` for
-``explicit_target`` but treat the two shapes identically -- string inputs
-are wrapped to a one-element list before the resolution loop.  Validity
-is enforced *upstream* by
-:func:`apm_cli.core.target_detection.parse_target_field`, which is the
-shared gatekeeper for both ``--target`` and ``apm.yml``'s ``target:``
-field.  Unknown tokens never reach these functions in normal flow; if
-one does, it falls through the loop without matching any profile and
-the result is an empty list (no silent ``[copilot]`` fallback).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
+
+from apm_cli.core.target_catalog import (
+    TARGET_CAPABILITIES,
+    expand_all,
+    normalize_target_name,
+)
 
 from .target_profile import RULE_FORMATS as RULE_FORMATS
 from .target_profile import PrimitiveMapping, TargetProfile
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # ------------------------------------------------------------------
 # Runtime -> canonical target alias map
@@ -39,9 +31,10 @@ if TYPE_CHECKING:
 # strip a runtime even when its canonical target is active (the same class
 # of bug as #1335).
 RUNTIME_TO_CANONICAL_TARGET: dict[str, str] = {
-    "vscode": "copilot",
-    "agents": "copilot",
-    "intellij": "copilot",
+    runtime: capability.primitive_profile
+    for capability in TARGET_CAPABILITIES.values()
+    if capability.primitive_profile is not None
+    for runtime in capability.runtimes
 }
 
 
@@ -56,7 +49,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # that single file at user scope (not individual *.instructions.md).
     # Ref: https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli
     "copilot": TargetProfile(
-        name="copilot",
+        capability=TARGET_CAPABILITIES["copilot"],
         root_dir=".github",
         primitives={
             "instructions": PrimitiveMapping(
@@ -81,7 +74,6 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
             "instructions": PrimitiveMapping("", ".md", "copilot_user_instructions"),
         },
         generated_files=("copilot-instructions.md",),
-        compile_family="vscode",
     ),
     # Claude Code -- the user-level config directory is whatever
     # ``CLAUDE_CONFIG_DIR`` points to (default ``~/.claude``).  The env
@@ -91,7 +83,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # Instructions deploy to <root>/rules/*.md with paths: frontmatter.
     # Ref: https://code.claude.com/docs/en/memory#organize-rules-with-claude%2Frules%2F
     "claude": TargetProfile(
-        name="claude",
+        capability=TARGET_CAPABILITIES["claude"],
         root_dir=".claude",
         primitives={
             "instructions": PrimitiveMapping(
@@ -108,7 +100,6 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         auto_create=False,
         detect_by_dir=True,
         user_supported=True,
-        compile_family="claude",
         hooks_config_display=".claude/settings.json",
     ),
     # Cursor -- at user scope, ~/.cursor/ supports skills, agents, hooks,
@@ -116,7 +107,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # (not file-based), so "instructions" is excluded from user scope.
     # Ref: https://cursor.com/docs/rules
     "cursor": TargetProfile(
-        name="cursor",
+        capability=TARGET_CAPABILITIES["cursor"],
         root_dir=".cursor",
         primitives={
             "instructions": PrimitiveMapping(
@@ -151,7 +142,6 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         user_supported="partial",
         user_root_dir=".cursor",
         unsupported_user_primitives=("instructions",),
-        compile_family="agents",
         hooks_config_display=".cursor/hooks.json",
     ),
     # Kiro IDE -- spec-driven development editor.
@@ -164,7 +154,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # Ref: https://kiro.dev/docs/skills/
     # Ref: https://kiro.dev/docs/hooks/
     "kiro": TargetProfile(
-        name="kiro",
+        capability=TARGET_CAPABILITIES["kiro"],
         root_dir=".kiro",
         primitives={
             "instructions": PrimitiveMapping(
@@ -180,12 +170,11 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         detect_by_dir=True,
         user_supported=True,
         user_root_dir=".kiro",
-        compile_family="agents",
     ),
     # OpenCode -- at user scope, ~/.config/opencode/ supports skills, agents,
     # and commands.  OpenCode has no hooks concept, so "hooks" is excluded.
     "opencode": TargetProfile(
-        name="opencode",
+        capability=TARGET_CAPABILITIES["opencode"],
         root_dir=".opencode",
         primitives={
             "agents": PrimitiveMapping("agents", ".md", "opencode_agent"),
@@ -202,7 +191,6 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         user_supported="partial",
         user_root_dir=".config/opencode",
         unsupported_user_primitives=("hooks",),
-        compile_family="agents",
     ),
     # Gemini CLI -- ~/.gemini/ is the documented user-level config directory.
     # Instructions are compile-only (GEMINI.md) -- Gemini CLI does not read
@@ -212,7 +200,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # Ref: https://geminicli.com/docs/cli/gemini-md/
     # Ref: https://geminicli.com/docs/reference/configuration/
     "gemini": TargetProfile(
-        name="gemini",
+        capability=TARGET_CAPABILITIES["gemini"],
         root_dir=".gemini",
         primitives={
             "commands": PrimitiveMapping("commands", ".toml", "gemini_command"),
@@ -228,7 +216,6 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         detect_by_dir=True,
         user_supported=True,
         user_root_dir=".gemini",
-        compile_family="gemini",
         hooks_config_display=".gemini/settings.json",
     ),
     # Antigravity CLI (agy) -- Google's Gemini-derived agentic CLI.
@@ -256,7 +243,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # Ref: https://antigravity.google/docs/hooks
     # Ref: https://antigravity.google/docs/mcp
     "antigravity": TargetProfile(
-        name="antigravity",
+        capability=TARGET_CAPABILITIES["antigravity"],
         root_dir=".agents",
         primitives={
             "instructions": PrimitiveMapping(
@@ -274,14 +261,13 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         user_supported="partial",
         user_root_dir=".gemini/antigravity-cli",
         unsupported_user_primitives=("instructions", "hooks"),
-        compile_family="agents",
         hooks_config_display=".agents/hooks.json",
     ),
     # Codex CLI: skills use the cross-tool .agents/ dir (agent skills standard),
     # agents are TOML under .codex/agents/, hooks merge into .codex/hooks.json.
     # Instructions are compile-only (AGENTS.md) -- not installed.
     "codex": TargetProfile(
-        name="codex",
+        capability=TARGET_CAPABILITIES["codex"],
         root_dir=".codex",
         primitives={
             "agents": PrimitiveMapping("agents", ".toml", "codex_agent"),
@@ -297,7 +283,6 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         detect_by_dir=True,
         user_supported="partial",
         pack_prefixes=(".codex/", ".agents/"),
-        compile_family="agents",
         hooks_config_display=".codex/hooks.json",
     ),
     # Windsurf/Cascade -- .windsurf/ is the workspace config directory.
@@ -317,7 +302,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # Ref: https://docs.windsurf.com/windsurf/cascade/memories
     # Ref: https://docs.windsurf.com/windsurf/cascade/mcp
     "windsurf": TargetProfile(
-        name="windsurf",
+        capability=TARGET_CAPABILITIES["windsurf"],
         root_dir=".windsurf",
         primitives={
             "instructions": PrimitiveMapping(
@@ -326,7 +311,9 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
                 "windsurf_rules",
                 output_compare=True,
             ),
-            "skills": PrimitiveMapping("skills", "/SKILL.md", "skill_standard"),
+            "skills": PrimitiveMapping(
+                "skills", "/SKILL.md", "skill_standard", deploy_root=".agents"
+            ),
             "commands": PrimitiveMapping("workflows", ".md", "windsurf_workflow"),
             "hooks": PrimitiveMapping("", "hooks.json", "windsurf_hooks"),
         },
@@ -335,15 +322,15 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         user_supported="partial",
         user_root_dir=".codeium/windsurf",
         unsupported_user_primitives=("instructions",),
-        compile_family="agents",
         hooks_config_display=".windsurf/hooks.json",
+        pack_prefixes=(".windsurf/", ".agents/"),
     ),
     # Agent-skills: cross-client shared skills directory (.agents/skills/).
     # Skills primitive only -- no agents, hooks, or commands.
     # Not auto-detected (detect_by_dir=False) because .agents/ is shared by
     # multiple tools (Codex, etc.). Explicit --target agent-skills only.
     "agent-skills": TargetProfile(
-        name="agent-skills",
+        capability=TARGET_CAPABILITIES["agent-skills"],
         root_dir=".agents",
         primitives={
             "skills": PrimitiveMapping(
@@ -368,7 +355,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # the --global user path is the distinguishing capability.
     # Ref: https://docs.openclaw.ai/tools/skills
     "openclaw": TargetProfile(
-        name="openclaw",
+        capability=TARGET_CAPABILITIES["openclaw"],
         root_dir=".agents",
         primitives={
             "skills": PrimitiveMapping(
@@ -381,7 +368,6 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         detect_by_dir=False,
         user_supported=True,
         user_root_dir=".openclaw",
-        requires_flag="openclaw",
     ),
     # Hermes agent (Nous Research) -- experimental.  Hermes natively reads
     # the agentskills.io SKILL.md format and the AGENTS.md context-file
@@ -392,7 +378,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # are written separately by HermesClientAdapter to ~/.hermes/config.yaml.
     # $HERMES_HOME overrides the user-scope root (handled in for_scope).
     "hermes": TargetProfile(
-        name="hermes",
+        capability=TARGET_CAPABILITIES["hermes"],
         root_dir=".agents",
         primitives={
             "skills": PrimitiveMapping(
@@ -405,8 +391,6 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         detect_by_dir=False,
         user_supported=True,
         user_root_dir=".hermes",
-        compile_family="agents",
-        requires_flag="hermes",
     ),
     # Microsoft 365 Copilot (Cowork) -- experimental, user-scope only.
     # Skills are deployed to <OneDrive>/Documents/Cowork/skills/.
@@ -414,7 +398,7 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
     # copilot_cowork_paths.resolve_copilot_cowork_skills_dir().
     # Non-skill primitives are not supported.
     "copilot-cowork": TargetProfile(
-        name="copilot-cowork",
+        capability=TARGET_CAPABILITIES["copilot-cowork"],
         root_dir="copilot-cowork",  # display grouping placeholder only
         primitives={
             "skills": PrimitiveMapping(
@@ -427,20 +411,15 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         detect_by_dir=False,
         user_supported=True,
         user_root_resolver=lambda: _resolve_copilot_cowork_root(),
-        requires_flag="copilot_cowork",
+        external_locator_encoder=lambda path, deploy_root: _encode_cowork_locator(
+            path, deploy_root
+        ),
+        lockfile_uri_schemes=("cowork://",),
+        warn_unsupported_primitives=True,
     ),
     # GitHub Copilot desktop App -- experimental, user-scope only.
-    # Prompts whose frontmatter carries workflow-shape keys (``interval``,
-    # ``schedule_hour``, ``schedule_day``) are installed as rows in the
-    # app's ``workflows`` table at ``~/.copilot/data.db``.  ``mode`` /
-    # ``model`` / ``reasoning_effort`` are optional fields on a workflow
-    # but do NOT mark a plain prompt as a workflow (they overload with
-    # plain VSCode / Copilot slash-command prompts).  No files are
-    # written under the deploy root; the synthetic root is only used so
-    # the existing target machinery can address rows via the
-    # ``copilot-app-db://workflows/<id>`` lockfile URI scheme.
     "copilot-app": TargetProfile(
-        name="copilot-app",
+        capability=TARGET_CAPABILITIES["copilot-app"],
         root_dir="copilot-app",  # display grouping placeholder only
         primitives={
             "prompts": PrimitiveMapping(
@@ -453,8 +432,9 @@ KNOWN_TARGETS: dict[str, TargetProfile] = {
         detect_by_dir=False,
         user_supported=True,
         user_root_resolver=lambda: _resolve_copilot_app_root(),
-        requires_flag="copilot_app",
         scope_invariant_resolver=True,
+        external_locator_encoder=lambda path, _deploy_root: _encode_copilot_app_locator(path),
+        lockfile_uri_schemes=("copilot-app-db://",),
     ),
 }
 
@@ -523,6 +503,20 @@ def _resolve_copilot_app_root() -> Path | None:
     return resolve_copilot_app_root()
 
 
+def _encode_cowork_locator(path: Path, deploy_root: Path) -> str:
+    """Translate a Cowork path through its native target adapter."""
+    from apm_cli.integration.copilot_cowork_paths import to_lockfile_path
+
+    return to_lockfile_path(path, deploy_root)
+
+
+def _encode_copilot_app_locator(path: Path) -> str:
+    """Translate an app workflow row through its native target adapter."""
+    from apm_cli.integration.copilot_app_db import to_lockfile_uri
+
+    return to_lockfile_uri(path.name)
+
+
 def _is_flag_enabled(flag_name: str) -> bool:
     """Check whether an experimental flag is enabled.
 
@@ -561,17 +555,11 @@ def _flag_gated(profile: TargetProfile) -> bool:
 
 
 def get_integration_prefixes(targets=None) -> tuple:
-    """Return all known target root prefixes as a tuple.
+    """Return all known target root prefixes.
 
-    Used by ``BaseIntegrator.validate_deploy_path`` so the allow-list
-    stays in sync with registered targets.
-
-    When *targets* is provided, prefixes are derived from those
-    (already scope-resolved) profiles.  Otherwise falls back to
-    ``KNOWN_TARGETS`` for backward compatibility.
-
-    Includes prefixes from ``deploy_root`` overrides (e.g. ``.agents/``
-    for Codex skills) so cross-root paths pass security validation.
+    When *targets* is provided, prefixes are derived from those profiles.
+    Otherwise falls back to ``KNOWN_TARGETS`` for backward compatibility.
+    Includes prefixes from ``deploy_root`` overrides (e.g. ``.agents/``).
     """
     source = targets if targets is not None else KNOWN_TARGETS.values()
     prefixes: list[str] = []
@@ -604,44 +592,90 @@ def get_integration_prefixes(targets=None) -> tuple:
     return tuple(prefixes)
 
 
+def encode_external_target_locator(target: object, path: Path) -> str | None:
+    """Encode an external path using profile metadata."""
+    if isinstance(target, TargetProfile):
+        return target.encode_external_locator(path)
+    name = getattr(target, "name", None)
+    profile = KNOWN_TARGETS.get(name) if isinstance(name, str) else None
+    deploy_root = getattr(target, "managed_deploy_root", None)
+    if (
+        profile is None
+        or profile.external_locator_encoder is None
+        or not isinstance(deploy_root, Path)
+    ):
+        return None
+    return profile.external_locator_encoder(path, deploy_root)
+
+
+def target_lockfile_uri_schemes(target: object) -> tuple[str, ...]:
+    """Return governed URI schemes from canonical target metadata."""
+    if isinstance(target, TargetProfile):
+        return target.lockfile_uri_schemes
+    name = getattr(target, "name", None)
+    profile = KNOWN_TARGETS.get(name) if isinstance(name, str) else None
+    return profile.lockfile_uri_schemes if profile is not None else ()
+
+
+def target_warns_unsupported_primitives(target: object) -> bool:
+    """Return the unsupported-primitive warning capability."""
+    if isinstance(target, TargetProfile):
+        return target.warn_unsupported_primitives
+    name = getattr(target, "name", None)
+    profile = KNOWN_TARGETS.get(name) if isinstance(name, str) else None
+    return bool(profile and profile.warn_unsupported_primitives)
+
+
+def target_supports_primitive(target: object, primitive: str) -> bool:
+    """Read primitive support from a concrete or lightweight profile."""
+    primitives = getattr(target, "primitives", None)
+    if isinstance(primitives, dict):
+        return primitive in primitives
+    name = getattr(target, "name", None)
+    profile = KNOWN_TARGETS.get(name) if isinstance(name, str) else None
+    return bool(profile and profile.supports(primitive))
+
+
+def target_name_for_locator(locator: str) -> str | None:
+    """Resolve a native target name from a registered locator URI."""
+    for profile in KNOWN_TARGETS.values():
+        if any(locator.startswith(scheme) for scheme in profile.lockfile_uri_schemes):
+            return profile.name
+    return None
+
+
 def active_targets_user_scope(
     explicit_target: str | list[str] | None = None,
 ) -> list:
-    """Return ``TargetProfile`` instances for user-scope deployment.
-
-    Mirrors ``active_targets()`` but operates against ``~/`` and filters
-    out targets that do not support user scope.
-
-    Resolution order:
-
-    1. **Explicit target** (``--target``): returns the matching profile(s)
-       that support user scope.  ``"all"`` returns every user-capable
-       target.  Validity is enforced upstream by
-       :func:`apm_cli.core.target_detection.parse_target_field`; this
-       function does not silently fall back when given unknown tokens.
-    2. **Directory detection**: profiles whose ``effective_root(user_scope=True)``
-       directory exists under ``~/``.
-    3. **Fallback**: ``[copilot]`` -- same default as project scope.
-    """
+    """Return ``TargetProfile`` instances for user-scope deployment."""
     from pathlib import Path
 
     home = Path.home()
 
     # --- explicit target ---
     if explicit_target:
-        # See module docstring on the parse_target_field gate-keeping contract.
         raw = [explicit_target] if isinstance(explicit_target, str) else list(explicit_target)
         profiles: list = []
         seen: set = set()
         for t in raw:
-            canonical = RUNTIME_TO_CANONICAL_TARGET.get(t, t)
+            try:
+                canonical = normalize_target_name(t)
+            except KeyError:
+                continue
             if canonical == "all":
-                from apm_cli.core.target_detection import EXPLICIT_ONLY_TARGETS
-
+                all_targets = {normalize_target_name(target) for target in expand_all("install")}
+                all_targets.update(
+                    capability.name
+                    for capability in TARGET_CAPABILITIES.values()
+                    if capability.experimental_flag is not None
+                )
                 return [
                     p
                     for p in KNOWN_TARGETS.values()
-                    if p.user_supported and _flag_gated(p) and p.name not in EXPLICIT_ONLY_TARGETS
+                    if p.name in all_targets
+                    and not p.capability.explicit_only
+                    and p.user_supported
+                    and _flag_gated(p)
                 ]
             profile = KNOWN_TARGETS.get(canonical)
             if (
@@ -675,58 +709,24 @@ def active_targets(
     project_root,
     explicit_target: str | list[str] | None = None,
 ) -> list:
-    """Return the list of ``TargetProfile`` instances that should be
-    deployed into *project_root*.
-
-    Resolution order:
-
-    1. **Explicit target** (``--target`` flag or ``apm.yml target:``):
-       returns the matching profile(s).  ``"all"`` returns every known
-       target.  Validity is enforced upstream by
-       :func:`apm_cli.core.target_detection.parse_target_field`; unknown
-       tokens never reach here, so this branch never silently falls back
-       to ``[copilot]``.
-    2. **Directory detection**: profiles whose ``root_dir`` already
-       exists under *project_root*.
-    3. **Fallback**: when nothing is detected, returns ``[copilot]``
-       so greenfield projects get a default skills root.
-
-    Args:
-        project_root: The workspace root ``Path``.
-        explicit_target: Canonical target name, list of canonical names,
-            or ``"all"``/``None``.  ``None`` means auto-detect.
-    """
+    """Return ``TargetProfile`` instances that should be deployed into *project_root*."""
     from pathlib import Path
 
     root = Path(project_root)
 
     # --- explicit target ---
     if explicit_target:
-        # See module docstring on the parse_target_field gate-keeping contract.
         raw = [explicit_target] if isinstance(explicit_target, str) else list(explicit_target)
         profiles: list = []
         seen: set = set()
         for t in raw:
-            canonical = RUNTIME_TO_CANONICAL_TARGET.get(t, t)
+            try:
+                canonical = normalize_target_name(t)
+            except KeyError:
+                continue
             if canonical == "all":
-                # Exclude explicit-only targets (agent-skills) -- they must
-                # be requested individually.
-                # Exclude experimental targets (copilot-cowork) -- they must
-                # be opted into explicitly via `--target copilot-cowork`,
-                # matching the documented contract on EXPERIMENTAL_TARGETS in
-                # core/target_detection.py. Including cowork in `all` for
-                # project scope hits the unconditional project-scope gate in
-                # phases/targets.py and aborts the entire install (#1185 b).
-                from apm_cli.core.target_detection import (
-                    EXPERIMENTAL_TARGETS,
-                    EXPLICIT_ONLY_TARGETS,
-                )
-
-                return [
-                    p
-                    for p in KNOWN_TARGETS.values()
-                    if p.name not in EXPLICIT_ONLY_TARGETS and p.name not in EXPERIMENTAL_TARGETS
-                ]
+                all_targets = {normalize_target_name(target) for target in expand_all("install")}
+                return [p for p in KNOWN_TARGETS.values() if p.name in all_targets]
             profile = KNOWN_TARGETS.get(canonical)
             if profile and _flag_gated(profile) and profile.name not in seen:
                 seen.add(profile.name)
@@ -752,21 +752,7 @@ def resolve_targets(
     user_scope: bool = False,
     explicit_target: str | list[str] | None = None,
 ) -> list:
-    """Return scope-resolved ``TargetProfile`` instances.
-
-    This is the **single entry point** for obtaining deployment targets.
-    It combines target detection (or explicit selection), scope resolution
-    (``for_scope``), and primitive filtering into one call.
-
-    Callers receive profiles where ``root_dir`` is already correct for
-    the requested scope -- no ``effective_root()`` calls needed.
-
-    Args:
-        project_root: Workspace root (``Path.cwd()`` or ``Path.home()``).
-        user_scope: When ``True``, resolve for user-level deployment.
-        explicit_target: Canonical target name, list of canonical names,
-            or ``"all"``.  ``None`` means auto-detect.
-    """
+    """Return scope-resolved ``TargetProfile`` instances (single entry point)."""
     if user_scope:
         raw = active_targets_user_scope(explicit_target)
     else:

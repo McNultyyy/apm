@@ -20,6 +20,12 @@ from ...utils.github_host import (
     unsupported_host_error,
 )
 from ...utils.path_security import validate_path_segments
+from .object_fields import (
+    apply_optional_dependency_fields,
+    parse_alias_override,
+    reject_unknown_fields,
+    reject_unknown_git_fields,
+)
 
 if TYPE_CHECKING:
     from .reference import DependencyReference
@@ -34,21 +40,19 @@ class _ReferenceParseMixin:
     def _parse_host_type(raw: object) -> str | None:
         """Parse the optional object-form ``type`` host-kind hint.
 
-        Currently only ``gitlab`` is accepted; any other value fails closed with
-        a ``ValueError``. This is a deliberate gate, not an oversight: future
-        host kinds (e.g. ``gitea``, ``bitbucket``) would extend the accepted set
-        here and thread a matching branch through ``AuthResolver.classify_host``
-        and ``host_backends.backend_for``. Until those backends exist, rejecting
-        unknown hints keeps classification explicit rather than silently
-        mis-routing a bespoke host to the GitHub path.
+        Values come from the canonical host-provider registry. Unknown hints
+        fail closed rather than silently selecting a generic transport.
         """
         if raw is None:
             return None
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError("'type' field must be a non-empty string")
         value = raw.strip().lower()
-        if value != "gitlab":
-            raise ValueError(f"'type' field only supports 'gitlab'; got {raw!r}")
+        from apm_cli.core.host_providers import accepted_host_types
+
+        supported = accepted_host_types()
+        if value not in supported:
+            raise ValueError(f"'type' field supports {', '.join(supported)}; got {raw!r}")
         return value
 
     @classmethod
@@ -274,6 +278,7 @@ class _ReferenceParseMixin:
     @classmethod
     def _parse_local_path_object_entry(cls, entry: dict) -> "DependencyReference":
         """Parse a ``{ path: ./local/dir }`` dict-form local path entry."""
+        reject_unknown_fields(entry, {"path", "alias", "skills", "targets"}, "path")
         local = entry["path"]
         if not isinstance(local, str) or not local.strip():
             raise ValueError("'path' field must be a non-empty string")
@@ -284,13 +289,14 @@ class _ReferenceParseMixin:
                 "or 'path' must be a local filesystem path "
                 "(starting with './', '../', '/', or '~')"
             )
-        return cls.parse(local)
+        dep = cls.parse(local)
+        apply_optional_dependency_fields(dep, entry)
+        return dep
 
     @classmethod
     def _parse_parent_inheritance_entry(cls, entry: dict) -> "DependencyReference":
         """Parse a ``git: parent`` monorepo-inheritance object entry."""
-        if entry.get("type") is not None:
-            raise ValueError("'type' is only supported for remote git dependencies")
+        reject_unknown_git_fields(entry, parent=True)
         path_raw = entry.get("path")
         if path_raw is None:
             raise ValueError("Object-style dependency with git: 'parent' requires a 'path' field")
@@ -303,16 +309,11 @@ class _ReferenceParseMixin:
         if ref_override is not None:
             reference = cls._validate_object_ref(ref_override)
 
-        alias_override = entry.get("alias")
-        alias_val: str | None = None
-        if alias_override is not None:
-            alias_val = cls._validate_object_alias(alias_override)
-
         return cls(
             repo_url="_parent",
             host=None,
             reference=reference,
-            alias=alias_val,
+            alias=parse_alias_override(entry.get("alias")),
             virtual_path=normalized_path,
             is_virtual=True,
             is_parent_repo_inheritance=True,
@@ -321,6 +322,7 @@ class _ReferenceParseMixin:
     @classmethod
     def _parse_git_object_entry(cls, entry: dict, git_url: str) -> "DependencyReference":
         """Parse a standard ``git:`` object entry and apply its overrides."""
+        reject_unknown_git_fields(entry, parent=False)
         sub_path = entry.get("path")
         allow_insecure = entry.get("allow_insecure", False)
         if not isinstance(allow_insecure, bool):
@@ -352,20 +354,12 @@ class _ReferenceParseMixin:
         if ref_override is not None:
             dep.reference = cls._validate_object_ref(ref_override)
 
-        alias_override = entry.get("alias")
-        if alias_override is not None:
-            dep.alias = cls._validate_object_alias(alias_override)
-
         # Apply sub-path as virtual package
         if sub_path:
             dep.virtual_path = sub_path
             dep.is_virtual = True
 
-        # Parse skills: field (SKILL_BUNDLE subset selection)
-        skills_raw = entry.get("skills")
-        if skills_raw is not None:
-            dep.skill_subset = cls._parse_skill_subset(skills_raw)
-
+        apply_optional_dependency_fields(dep, entry)
         return dep
 
     @staticmethod
@@ -582,7 +576,8 @@ class _ReferenceParseMixin:
                 elif _stripped.startswith("http://"):
                     explicit_scheme = "http"
 
-        # Phase 3: final validation and ADO field extraction
+        # Phase 3: full validation (all hosts) + ADO field extraction.
+        # canonical_ado_coordinates is for consumers with validated input only.
         ado_organization, ado_project, ado_repo = cls._validate_final_repo_fields(host, repo_url)
 
         if alias and not re.match(r"^[a-zA-Z0-9._-]+$", alias):

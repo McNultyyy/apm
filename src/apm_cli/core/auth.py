@@ -32,13 +32,14 @@ import logging
 import os
 import re
 import threading
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
 from apm_cli.core._auth_support import _AuthSupportMixin, _org_to_env_suffix
 from apm_cli.core.token_manager import GitHubTokenManager
-from apm_cli.utils.github_host import default_host, is_gitlab_hostname
+from apm_cli.utils.github_host import default_host, is_azure_devops_hostname, is_gitlab_hostname
 
 if TYPE_CHECKING:
     from apm_cli.models.dependency.reference import DependencyReference
@@ -98,6 +99,10 @@ class SecretRedactionFilter(logging.Filter):
             if redacted != msg:
                 record.msg = redacted
                 record.args = ()
+            if record.exc_info is not None:
+                formatted = "".join(traceback.format_exception(*record.exc_info))
+                record.exc_text = _redact_secrets(formatted)
+                record.exc_info = None
         except Exception:
             pass
         return True
@@ -117,6 +122,7 @@ class HostInfo:
     has_public_repos: bool
     api_base: str
     port: int | None = None  # Non-standard git port (e.g. 7999 for Bitbucket DC)
+    credential_purpose: str | None = None
 
     @property
     def display_name(self) -> str:
@@ -344,6 +350,7 @@ class AuthResolver(_AuthSupportMixin):
         auth_ctx = self.resolve(host, org, port=port)
         host_info = auth_ctx.host_info
         git_env = auth_ctx.git_env
+        unauth_env = self._build_git_env(None, host_kind=host_info.kind)
 
         def _log(msg: str) -> None:
             if verbose_callback:
@@ -471,7 +478,7 @@ class AuthResolver(_AuthSupportMixin):
             # Validation path: save rate limits, EMU-safe
             try:
                 _log(f"Trying unauthenticated access to {host_info.display_name}")
-                return operation(None, git_env)
+                return operation(None, unauth_env)
             except Exception as exc:
                 # operation is caller-provided; broad catch required -- cannot narrow
                 # without restricting the caller API.  Use %r so the type is visible.
@@ -512,7 +519,7 @@ class AuthResolver(_AuthSupportMixin):
                 if host_info.has_public_repos:
                     _log("Authenticated failed, retrying without token")
                     try:
-                        return operation(None, git_env)
+                        return operation(None, unauth_env)
                     except Exception as unauth_exc:
                         # operation is caller-provided; broad catch required.
                         logger.debug(
@@ -525,7 +532,7 @@ class AuthResolver(_AuthSupportMixin):
                 return _try_credential_fallback(exc)
         else:
             _log(f"No token available, trying unauthenticated access to {host_info.display_name}")
-            return operation(None, git_env)
+            return operation(None, unauth_env)
 
     # -- internals ----------------------------------------------------------
 
@@ -673,7 +680,12 @@ class AuthResolver(_AuthSupportMixin):
             raises (exceptions from ``bearer_op`` are swallowed).
         """
         primary = primary_op()
-        if dep_ref is None or not getattr(dep_ref, "is_azure_devops", lambda: False)():
+        is_ado = (
+            is_azure_devops_hostname(dep_ref)
+            if isinstance(dep_ref, str)
+            else dep_ref is not None and getattr(dep_ref, "is_azure_devops", lambda: False)()
+        )
+        if not is_ado:
             return BearerFallbackOutcome(primary, False)
         if not is_auth_failure(primary):
             return BearerFallbackOutcome(primary, False)
@@ -705,6 +717,7 @@ class AuthResolver(_AuthSupportMixin):
             return BearerFallbackOutcome(primary, True)
         if fallback is None or is_auth_failure(fallback):
             return BearerFallbackOutcome(primary, True)
-        host_display = getattr(dep_ref, "host", None) or "dev.azure.com"
+        host_display = dep_ref if isinstance(dep_ref, str) else getattr(dep_ref, "host", None)
+        host_display = host_display or "dev.azure.com"
         self.emit_stale_pat_diagnostic(host_display)
         return BearerFallbackOutcome(fallback, True)

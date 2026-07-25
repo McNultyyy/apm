@@ -11,10 +11,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from apm_cli.core.target_catalog import TargetCapability
 
 RULE_FORMATS: frozenset[str] = frozenset(
     {"cursor_rules", "claude_rules", "windsurf_rules", "kiro_steering", "antigravity_rules"}
@@ -109,8 +108,8 @@ class PrimitiveMapping:
 class TargetProfile:
     """Capabilities and layout of a single target tool."""
 
-    name: str
-    """Short unique identifier (``"copilot"``, ``"claude"``, ``"cursor"``)."""
+    capability: TargetCapability
+    """Command-facing metadata for this native deployment profile."""
 
     root_dir: str
     """Top-level directory in the workspace (e.g. ``".github"``)."""
@@ -186,13 +185,6 @@ class TargetProfile:
     through this root instead of ``project_root / root_dir``.
     """
 
-    requires_flag: str | None = None
-    """When set, the target is only returned by ``active_targets`` /
-    ``active_targets_user_scope`` / ``resolve_targets`` when the named
-    experimental flag is enabled.  The target entry is always visible
-    in ``KNOWN_TARGETS`` for tooling introspection.
-    """
-
     scope_invariant_resolver: bool = False
     """When True, ``user_root_resolver`` runs in BOTH project and user
     scope (the resolved deploy root does not depend on install intent).
@@ -232,28 +224,40 @@ class TargetProfile:
     ``.agents/``).
     """
 
-    compile_family: str | None = None
-    """Compiler family this target belongs to for ``apm compile`` routing.
-
-    Recognised values:
-
-    * ``"vscode"`` -- emits ``.github/copilot-instructions.md`` *and* AGENTS.md.
-    * ``"claude"`` -- emits ``CLAUDE.md`` and ``.claude/rules/`` files.
-    * ``"gemini"`` -- emits ``GEMINI.md``.
-    * ``"agents"`` -- emits AGENTS.md only (cursor, opencode, codex, windsurf).
-    * ``None`` -- target has no compile output (agent-skills, copilot-cowork).
-
-    Used by :func:`apm_cli.commands.compile.cli._resolve_compile_target` to
-    derive multi-target routing from the registry instead of hard-coded sets.
-    """
-
     hooks_config_display: str | None = None
-    """Human-readable path shown in the install log for hooks integration.
+    """Human-readable path shown in the install log for hooks integration."""
 
-    e.g. ``".claude/settings.json"`` for Claude (hooks merge into a settings
-    file rather than landing in their own subdir).  When ``None``, the
-    install log falls back to the generic ``"{root}/{subdir}/"`` formula.
-    """
+    external_locator_encoder: Callable[[Path, Path], str] | None = None
+    """Encode managed-root paths that require a native lockfile URI."""
+
+    lockfile_uri_schemes: tuple[str, ...] = ()
+    """URI prefixes governed by this target during reconciliation."""
+
+    warn_unsupported_primitives: bool = False
+    """Warn when a package contains primitives omitted by this profile."""
+
+    @property
+    def name(self) -> str:
+        """Return the canonical native target name."""
+        return self.capability.name
+
+    @property
+    def compile_family(self) -> str | None:
+        """Return the compiler family declared by the capability catalog."""
+        return self.capability.compile_family
+
+    @property
+    def requires_flag(self) -> str | None:
+        """Return the experimental feature flag declared by the catalog."""
+        return self.capability.experimental_flag
+
+    @property
+    def managed_deploy_root(self) -> Path | None:
+        """Return the resolved or absolute static deployment root."""
+        if self.resolved_deploy_root is not None:
+            return self.resolved_deploy_root
+        root = Path(self.root_dir)
+        return root if root.is_absolute() else None
 
     @property
     def prefix(self) -> str:
@@ -311,6 +315,13 @@ class TargetProfile:
             )
         base = project_root / self.root_dir
         return base.joinpath(*parts) if parts else base
+
+    def encode_external_locator(self, path: Path) -> str | None:
+        """Encode a managed-root path through the target adapter."""
+        deploy_root = self.managed_deploy_root
+        if self.external_locator_encoder is None or deploy_root is None:
+            return None
+        return self.external_locator_encoder(path, deploy_root)
 
     def for_scope(self, user_scope: bool = False) -> TargetProfile | None:
         """Return a scope-resolved copy of this profile.
@@ -398,14 +409,8 @@ class TargetProfile:
                     # Fallback: when CLAUDE_CONFIG_DIR points outside $HOME we
                     # store an absolute path. ``pathlib.Path / <absolute>`` is
                     # ``<absolute>`` so deploy + cleanup write to the right
-                    # place. Caveat: the lockfile path translator
-                    # (``install/services._deployed_path_entry``) calls
-                    # ``relative_to(project_root)`` and raises ``RuntimeError``
-                    # for out-of-tree paths that are not dynamic-root targets.
-                    # Today this is unreachable because user-scope CLAUDE
-                    # installs do not flow through that translator, but any
-                    # future refactor that lockfiles user-scope deploys must
-                    # treat absolute ``root_dir`` as a dynamic-root case.
+                    # place. The lockfile path translator treats an absolute
+                    # ``root_dir`` as a dynamic root.
                     new_root = str(abs_path)
 
         if self.unsupported_user_primitives:

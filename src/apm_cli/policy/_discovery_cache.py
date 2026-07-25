@@ -17,13 +17,13 @@ import json
 import logging
 import os
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 from ..utils.path_security import PathTraversalError, ensure_path_within
+from ..utils.yaml_io import load_yaml_str
 from .parser import load_policy
 from .project_config import (
     _DEFAULT_HASH_ALGORITHM,
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 POLICY_CACHE_DIR = ".policy-cache"
 DEFAULT_CACHE_TTL = 3600  # 1 hour
 MAX_STALE_TTL = 7 * 24 * 3600  # 7 days -- stale cache usable on refresh failure
-CACHE_SCHEMA_VERSION = "3"  # Bump when cache format changes to auto-invalidate
+CACHE_SCHEMA_VERSION = "5"  # Bump when cache format changes to auto-invalidate
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +173,7 @@ class _CacheEntry:
     age_seconds: int
     stale: bool  # True if past TTL (but within MAX_STALE_TTL)
     chain_refs: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     fingerprint: str = ""
     raw_bytes_hash: str = ""  # "<algo>:<hex>" of leaf bytes off wire (#827)
 
@@ -223,9 +224,10 @@ def _policy_to_dict(policy: ApmPolicy) -> dict:
     def _opt_list(val: tuple[str, ...] | None) -> list | None:
         return None if val is None else list(val)
 
-    return {
+    serialized = {
         "name": policy.name,
         "version": policy.version,
+        "extends": policy.extends,
         "enforcement": policy.enforcement,
         "fetch_failure": policy.fetch_failure,
         "cache": {"ttl": policy.cache.ttl},
@@ -235,6 +237,7 @@ def _policy_to_dict(policy: ApmPolicy) -> dict:
             "require": _opt_list(policy.dependencies.require),
             "require_resolution": policy.dependencies.require_resolution,
             "max_depth": policy.dependencies.max_depth,
+            "require_pinned_constraint": policy.dependencies.require_pinned_constraint,
         },
         "mcp": {
             "allow": _opt_list(policy.mcp.allow),
@@ -259,19 +262,55 @@ def _policy_to_dict(policy: ApmPolicy) -> dict:
             "required_fields": list(policy.manifest.required_fields),
             "scripts": policy.manifest.scripts,
             "content_types": policy.manifest.content_types,
+            "require_explicit_includes": policy.manifest.require_explicit_includes,
         },
         "unmanaged_files": {
             "action": policy.unmanaged_files.action,
-            "directories": list(policy.unmanaged_files.directories or ()),
-            "exclude": list(policy.unmanaged_files.exclude or ()),
+            "directories": _opt_list(policy.unmanaged_files.directories),
+            "exclude": _opt_list(policy.unmanaged_files.exclude),
+        },
+        "registry_source": {
+            "require": list(policy.registry_source.require),
+            "allow_non_registry": policy.registry_source.allow_non_registry,
+        },
+        "security": {
+            "audit": {
+                "on_install": policy.security.audit.on_install,
+                "external": _opt_list(policy.security.audit.external),
+                "scanners": None
+                if policy.security.audit.scanners is None
+                else {
+                    name: {"allow_args": governance.allow_args}
+                    for name, governance in policy.security.audit.scanners
+                },
+                "fail_on_drift": policy.security.audit.fail_on_drift,
+            },
+            "integrity": {
+                "require_hashes": policy.security.integrity.require_hashes,
+            },
+        },
+        "executables": {
+            "deny_all": policy.executables.deny_all,
+            "deny": list(policy.executables.deny),
+            "require": list(policy.executables.require),
+            "recommend": list(policy.executables.recommend),
+            "enforce": list(policy.executables.enforce),
         },
     }
+    if policy.bin_deploy.deny_all or policy.bin_deploy.deny:
+        serialized["bin_deploy"] = {
+            "deny_all": policy.bin_deploy.deny_all,
+            "deny": list(policy.bin_deploy.deny),
+        }
+    return serialized
 
 
 def _serialize_policy(policy: ApmPolicy) -> str:
     """Serialize an ApmPolicy to deterministic YAML for caching."""
+    from apm_cli.policy import discovery as _d
+
     return yaml.dump(
-        _policy_to_dict(policy), default_flow_style=False, sort_keys=True
+        _d._policy_to_dict(policy), default_flow_style=False, sort_keys=True
     )  # yaml-io-exempt
 
 
@@ -281,23 +320,47 @@ def _policy_fingerprint(serialized: str) -> str:
 
 
 def _is_policy_empty(policy: ApmPolicy) -> bool:
-    """Return True if a policy has no actionable restrictions.
-
-    An 'empty' policy is syntactically valid but imposes no constraints
-    beyond the permissive defaults.
-    """
-    return (
-        not policy.dependencies.effective_deny
-        and policy.dependencies.allow is None
-        and not policy.dependencies.effective_require
-        and not policy.mcp.deny
-        and policy.mcp.allow is None
-        and policy.mcp.transport.allow is None
-        and policy.compilation.target.allow is None
-        and not policy.manifest.required_fields
-        and policy.manifest.scripts == "allow"
-        and policy.manifest.content_types is None
-        and policy.unmanaged_files.effective_action == "ignore"
+    """Return True only when the policy has no actionable restrictions."""
+    return not any(
+        (
+            policy.fetch_failure != "warn",
+            policy.dependencies.effective_deny,
+            policy.dependencies.allow is not None,
+            policy.dependencies.effective_require,
+            policy.dependencies.require_resolution != "project-wins",
+            policy.dependencies.max_depth != 50,
+            policy.dependencies.require_pinned_constraint,
+            policy.mcp.deny,
+            policy.mcp.allow is not None,
+            policy.mcp.transport.allow is not None,
+            policy.mcp.self_defined != "warn",
+            policy.mcp.trust_transitive,
+            policy.compilation.target.allow is not None,
+            policy.compilation.target.enforce is not None,
+            policy.compilation.strategy.enforce is not None,
+            policy.compilation.source_attribution,
+            policy.manifest.required_fields,
+            policy.manifest.scripts != "allow",
+            policy.manifest.content_types is not None,
+            policy.manifest.require_explicit_includes,
+            policy.unmanaged_files.effective_action != "ignore",
+            policy.unmanaged_files.directories is not None,
+            policy.unmanaged_files.exclude is not None,
+            policy.registry_source.require,
+            not policy.registry_source.allow_non_registry,
+            policy.security.audit.on_install is not None,
+            policy.security.audit.external is not None,
+            policy.security.audit.scanners is not None,
+            policy.security.audit.fail_on_drift,
+            policy.security.integrity.require_hashes,
+            policy.bin_deploy.deny_all,
+            policy.bin_deploy.deny,
+            policy.executables.deny_all,
+            policy.executables.deny,
+            policy.executables.require,
+            policy.executables.recommend,
+            policy.executables.enforce,
+        )
     )
 
 
@@ -319,6 +382,7 @@ def _stale_fallback_or_error(
             cache_age_seconds=cache_entry.age_seconds,
             fetch_error=fetch_error_msg,
             outcome="cached_stale",
+            warnings=cache_entry.warnings,
         )
     return PolicyFetchResult(
         error=fetch_error_msg,
@@ -345,8 +409,8 @@ def _detect_garbage(
         return None
 
     try:
-        raw_data = yaml.safe_load(content)
-    except yaml.YAMLError:
+        raw_data = load_yaml_str(content)
+    except Exception:
         msg = f"Response from {identifier} is not valid YAML"
         if cache_entry is not None:
             return PolicyFetchResult(
@@ -357,6 +421,7 @@ def _detect_garbage(
                 cache_age_seconds=cache_entry.age_seconds,
                 fetch_error=msg,
                 outcome="cached_stale",
+                warnings=cache_entry.warnings,
             )
         return PolicyFetchResult(
             error=msg + " (possible captive portal or redirect)",
@@ -376,6 +441,7 @@ def _detect_garbage(
                 cache_age_seconds=cache_entry.age_seconds,
                 fetch_error=msg,
                 outcome="cached_stale",
+                warnings=cache_entry.warnings,
             )
         return PolicyFetchResult(
             error=msg,
@@ -390,7 +456,7 @@ def _detect_garbage(
 def _read_cache_entry(
     repo_ref: str,
     project_root: Path,
-    ttl: int = DEFAULT_CACHE_TTL,
+    ttl: int | None = None,
     *,
     expected_hash: str | None = None,
 ) -> _CacheEntry | None:
@@ -423,7 +489,9 @@ def _read_cache_entry(
             return None
 
         cached_at = meta.get("cached_at", 0)
-        age = int(time.time() - cached_at)
+        from apm_cli.policy import discovery as _d
+
+        age = int(_d.time.time() - cached_at)
 
         if age > MAX_STALE_TTL:
             return None  # Past MAX_STALE_TTL, unusable
@@ -445,18 +513,27 @@ def _read_cache_entry(
 
         policy, _warnings = load_policy(policy_file)
 
+        raw_warnings = meta.get("warnings")
+        if isinstance(raw_warnings, list):
+            cached_warnings: list[str] = [str(w) for w in raw_warnings]
+        else:
+            cached_warnings = []
+
         # Determine source label
         if repo_ref.startswith("http://") or repo_ref.startswith("https://"):
             source = f"url:{repo_ref}"
         else:
             source = f"org:{repo_ref}"
 
+        effective_ttl = policy.cache.ttl if ttl is None else ttl
+
         return _CacheEntry(
             policy=policy,
             source=source,
             age_seconds=age,
-            stale=age > ttl,
+            stale=age > effective_ttl,
             chain_refs=meta.get("chain_refs", [repo_ref]),
+            warnings=cached_warnings,
             fingerprint=meta.get("fingerprint", ""),
             raw_bytes_hash=raw_bytes_hash,
         )
@@ -467,7 +544,7 @@ def _read_cache_entry(
 def _read_cache(
     repo_ref: str,
     project_root: Path,
-    ttl: int = DEFAULT_CACHE_TTL,
+    ttl: int | None = None,
 ) -> object:  # PolicyFetchResult | None
     """Read policy from cache if still valid (within TTL).
 
@@ -486,6 +563,7 @@ def _read_cache(
         cached=True,
         cache_age_seconds=entry.age_seconds,
         outcome=outcome,
+        warnings=entry.warnings,
     )
 
 
@@ -496,6 +574,7 @@ def _write_cache(
     *,
     chain_refs: list[str] | None = None,
     raw_bytes_hash: str | None = None,
+    warnings: list[str] | None = None,
 ) -> None:
     """Write merged effective policy and metadata to cache atomically.
 
@@ -508,6 +587,8 @@ def _write_cache(
     sidecar so subsequent cached reads can verify against the project's
     pin without re-fetching (#827).
     """
+    from apm_cli.policy import discovery as _d  # deferred to avoid circular; enables monkeypatching
+
     cache_dir = _get_cache_dir(project_root)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -515,7 +596,7 @@ def _write_cache(
     policy_file = cache_dir / f"{key}.yml"
     meta_file = cache_dir / f"{key}.meta.json"
 
-    serialized = _serialize_policy(policy)
+    serialized = _d._serialize_policy(policy)  # route through facade for monkeypatching
     fingerprint = _policy_fingerprint(serialized)
 
     # Unique tmp suffix to avoid collisions from parallel writers
@@ -535,13 +616,16 @@ def _write_cache(
         return
 
     # Atomic write: metadata sidecar
+    from apm_cli.policy import discovery as _d
+
     meta = {
         "repo_ref": repo_ref,
-        "cached_at": time.time(),
+        "cached_at": _d.time.time(),
         "chain_refs": chain_refs if chain_refs is not None else [repo_ref],
         "schema_version": CACHE_SCHEMA_VERSION,
         "fingerprint": fingerprint,
         "raw_bytes_hash": raw_bytes_hash or "",
+        "warnings": warnings or [],
     }
     tmp_meta = cache_dir / f"{key}.{uid}.meta.json.tmp"
     try:
@@ -552,3 +636,75 @@ def _write_cache(
             tmp_meta.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Cache availability and pin helpers
+# ---------------------------------------------------------------------------
+
+
+def _cache_entry_files_exist(repo_ref: str, project_root: Path) -> bool:
+    """Return True if both cache files (policy + meta) exist on disk."""
+    cache_dir = _get_cache_dir(project_root)
+    key = _cache_key(repo_ref)
+    return (cache_dir / f"{key}.yml").exists() and (cache_dir / f"{key}.meta.json").exists()
+
+
+def _unverifiable_cache_pin(
+    repo_ref: str,
+    project_root: Path,
+    expected_hash: str | None,
+) -> bool:
+    """Return True if the cache has a valid entry but the pin hash mismatches.
+
+    Used to detect the case where a cache entry exists but cannot be served
+    because the caller provides a pin that differs from the cached one.
+    """
+    if not _cache_entry_files_exist(repo_ref, project_root):
+        return False
+    if expected_hash is None:
+        return False
+    entry = _read_cache_entry(repo_ref, project_root, expected_hash=None)
+    if entry is None:
+        return False
+    try:
+        exp_algo, exp_hex = _split_hash_pin(expected_hash)
+        expected_norm = f"{exp_algo}:{exp_hex}"
+    except ProjectPolicyConfigError:
+        return False
+    return entry.raw_bytes_hash.lower() != expected_norm
+
+
+def policy_cache_available(repo_ref: str, project_root: Path) -> bool:
+    """Return True if a usable (non-expired) cache entry exists.
+
+    Does NOT validate the pin -- used to determine whether the cache can
+    serve a cache_only request.
+    """
+    entry = _read_cache_entry(repo_ref, project_root)
+    return entry is not None and not entry.stale
+
+
+def _cache_only_policy_result(
+    repo_ref: str,
+    project_root: Path,
+) -> object:  # PolicyFetchResult
+    """Return a PolicyFetchResult from cache only, or a not_found result."""
+    from .discovery import PolicyFetchResult
+
+    entry = _read_cache_entry(repo_ref, project_root)
+    if entry is None:
+        return PolicyFetchResult(
+            outcome="not_found",
+            source=f"org:{repo_ref}",
+            error=f"No cached policy for {repo_ref} and cache_only=True",
+        )
+    outcome = "empty" if _is_policy_empty(entry.policy) else "found"
+    return PolicyFetchResult(
+        policy=entry.policy,
+        source=entry.source,
+        cached=True,
+        cache_age_seconds=entry.age_seconds,
+        outcome=outcome,
+        warnings=entry.warnings,
+    )

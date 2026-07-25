@@ -6,7 +6,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from apm_cli.core.deployment_state import MaterializationResult
 from apm_cli.integration.base_integrator import BaseIntegrator
+from apm_cli.integration.targets import TargetProfile
+from apm_cli.models.dependency.subsets import skill_subset_filter_tokens
 
 from . import skill_deploy as _skill_deploy
 from .skill_naming import _skill_name_char_error
@@ -29,6 +32,7 @@ class SkillIntegrationResult:
     bin_deployed: int = 0
     bin_skipped_reason: str | None = None
     target_paths: list[Path] | None = None
+    materializations: tuple[MaterializationResult, ...] = ()
 
     def __post_init__(self) -> None:
         if self.target_paths is None:
@@ -169,9 +173,84 @@ class SkillIntegrator(BaseIntegrator):
         )
 
     @staticmethod
-    def _skill_subset_name_filter(skill_subset: tuple[str, ...] | None) -> set[str] | None:
-        """Return promotion filter tokens for --skill subset values."""
-        return _skill_deploy._skill_subset_name_filter(skill_subset)
+    def _target_skills_root(target: TargetProfile, project_root: Path) -> Path:
+        """Return the target skills root for static and dynamic-root targets."""
+        if target.resolved_deploy_root is not None:
+            return target.deploy_path(project_root)
+        skills_mapping = target.primitives["skills"]
+        effective_root = skills_mapping.deploy_root or target.root_dir
+        return project_root / effective_root / "skills"
+
+    @staticmethod
+    def _target_skill_dir(target: TargetProfile, project_root: Path, skill_name: str) -> Path:
+        """Return the concrete directory for a deployed skill."""
+        return SkillIntegrator._target_skills_root(target, project_root) / skill_name
+
+    @staticmethod
+    def _skill_names_in_directory(skills_dir: Path) -> frozenset[str]:
+        """Return deployable skill names from a directory that may be absent."""
+        if not skills_dir.is_dir():
+            return frozenset()
+        try:
+            return frozenset(
+                child.name
+                for child in skills_dir.iterdir()
+                if child.is_dir() and (child / "SKILL.md").is_file()
+            )
+        except FileNotFoundError:
+            return frozenset()
+
+    @staticmethod
+    def available_skill_names(package_info: Any) -> frozenset[str] | None:
+        """Return names selectable through ``--skill`` for one package."""
+        package_path = package_info.install_path
+        if (package_path / "SKILL.md").is_file():
+            return None
+        from apm_cli.models.validation import PackageType
+
+        normalized = package_path / ".apm" / "skills"
+        root_bundle = package_path / "skills"
+        if package_info.package_type is PackageType.MARKETPLACE_PLUGIN:
+            return SkillIntegrator._skill_names_in_directory(normalized)
+        root_names = SkillIntegrator._skill_names_in_directory(root_bundle)
+        return root_names or SkillIntegrator._skill_names_in_directory(normalized)
+
+    @staticmethod
+    def _skill_filter_misses_available(
+        name_filter: set[str] | None,
+        available_names: frozenset[str],
+    ) -> bool:
+        """Return whether a requested subset has no deployable source match."""
+        return name_filter is not None and name_filter.isdisjoint(available_names)
+
+    @staticmethod
+    def _warn_no_skill_filter_match(
+        available_names: frozenset[str],
+        requested_names: tuple[str, ...],
+        parent_name: str,
+        diagnostics: Any = None,
+        logger: Any = None,
+    ) -> None:
+        """Report a post-validation skill selection miss through the output cascade."""
+        available_display = ", ".join(sorted(available_names)) if available_names else "(none)"
+        requested_display = ", ".join(sorted(set(requested_names)))
+        details = (
+            "Skill selection matched no available skills. "
+            f"Requested: {requested_display}. Available: {available_display}. "
+            "Edit 'skills:' in apm.yml to use an available name or remove the filter, "
+            "then run 'apm install'."
+        )
+        if diagnostics is not None:
+            diagnostics.warn(details, package=parent_name)
+        elif logger:
+            logger.warning(f"Package '{parent_name}': {details}")
+        else:
+            try:
+                from apm_cli.utils.console import _rich_warning
+
+                _rich_warning(f"Package '{parent_name}': {details}", symbol="warning")
+            except ImportError:
+                pass
 
     @staticmethod
     def _promote_sub_skills(  # noqa: PLR0913
@@ -237,6 +316,7 @@ class SkillIntegrator(BaseIntegrator):
         skip_bin: bool = False,
     ) -> tuple[int, list[Path]]:
         """Promote sub-skills from a package that is not itself a skill."""
+        name_filter = skill_subset_filter_tokens(skill_subset)
         return _skill_deploy._promote_sub_skills_standalone(
             self,
             package_info,
@@ -247,6 +327,7 @@ class SkillIntegrator(BaseIntegrator):
             logger=logger,
             targets=targets,
             skill_subset=skill_subset,
+            name_filter=name_filter,
             skip_bin=skip_bin,
         )
 
@@ -300,6 +381,7 @@ class SkillIntegrator(BaseIntegrator):
         skip_bin: bool = False,
     ) -> SkillIntegrationResult:
         """Promote every skill in a skill bundle's top-level skills directory."""
+        name_filter = skill_subset_filter_tokens(skill_subset)
         fields = _skill_deploy._integrate_skill_bundle(
             self,
             package_info,
@@ -311,6 +393,7 @@ class SkillIntegrator(BaseIntegrator):
             logger=logger,
             targets=targets,
             skill_subset=skill_subset,
+            name_filter=name_filter,
             skip_bin=skip_bin,
         )
         return SkillIntegrationResult(**fields)

@@ -17,6 +17,12 @@ from ...compilation import (
 )
 from ...constants import AGENTS_MD_FILENAME, APM_DIR, APM_MODULES_DIR, APM_YML_FILENAME
 from ...core.command_logger import CommandLogger
+from ...core.target_catalog import (
+    TARGET_CAPABILITIES,
+    expand_all,
+    get_target_capability,
+    target_help_fragment,
+)
 from ...core.target_detection import TargetParamType
 from ...primitives.discovery import clear_discovery_cache, discover_primitives
 from ...utils import perf_stats
@@ -28,8 +34,10 @@ from .._helpers import (
     _get_console,
 )
 from ._run_ops import CompilationRunConfig as CompilationRunConfig
+from ._run_ops import _handle_global_flag as _handle_global_flag
 from ._run_ops import _run_compilation as _run_compilation
-from .watcher import _watch_mode
+from ._run_ops import _run_watch_mode as _run_watch_mode
+from .watcher import _watch_mode as _watch_mode
 
 
 def _display_single_file_summary(stats, c_status, c_hash, output_path, dry_run):
@@ -70,8 +78,8 @@ def _display_single_file_summary(stats, c_status, c_hash, output_path, dry_run):
             "[+] All validated",
         )
         table.add_row(
-            "Chatmodes",
-            str(stats.get("chatmodes", 0)),
+            "Agents",
+            str(stats.get("agents", 0)),
             "[+] All validated",
         )
 
@@ -170,59 +178,9 @@ def _get_validation_suggestion(error_msg):
         return "Check primitive structure and frontmatter"
 
 
-def _resolve_list_target(target_list, KNOWN_TARGETS):
-    """Resolve a list of targets to a compiler family string or frozenset."""
-    target_set = set(target_list)
-    skip = {name for name, profile in KNOWN_TARGETS.items() if profile.compile_family is None}
-    target_set -= skip
-    if not target_set:
-        for sentinel in target_list:
-            if sentinel in skip:
-                return sentinel
-        return None
-
-    def _family_of(name: str) -> str | None:
-        if name == "vscode":
-            return "vscode"
-        profile = KNOWN_TARGETS.get(name)
-        return profile.compile_family if profile else None
-
-    families: set[str] = set()
-    for name in target_set:
-        family = _family_of(name)
-        if family is None:
-            continue
-        families.add(family)
-        if family == "vscode":
-            families.add("agents")
-
-    if len(families) >= 2:
-        # Collapse {"vscode","agents"} to bare "vscode" ONLY when the
-        # original target list contains no non-Copilot agents-family
-        # targets (e.g. codex, opencode, windsurf).  When mixed targets
-        # like [copilot, codex] are requested, keep the frozenset so
-        # downstream dedup logic knows non-Copilot targets also consume
-        # AGENTS.md (issue #1678).
-        if families == {"vscode", "agents"}:
-            _vscode_names = {"copilot", "vscode", "agents"}
-            has_non_vscode_agents = any(
-                name in target_set
-                for name, profile in KNOWN_TARGETS.items()
-                if profile.compile_family == "agents" and name not in _vscode_names
-            )
-            if not has_non_vscode_agents:
-                return "vscode"
-        return frozenset(families)
-    for fam in ("claude", "gemini", "vscode"):
-        if fam in families:
-            return fam
-    for name, profile in KNOWN_TARGETS.items():
-        if profile.compile_family == "agents" and name in target_set:
-            return name
-    return "vscode"  # defensive fallback (unreachable)
-
-
-def _resolve_compile_target(target):
+def _resolve_compile_target(  # noqa: PLR0911 -- dispatch routing, multiple exit points intentional
+    target: str | list[str] | None,
+) -> CompileTargetType | None:
     """Map CLI target input to a compiler-understood target.
 
     The compiler understands single-string targets (``"vscode"``,
@@ -236,10 +194,9 @@ def _resolve_compile_target(target):
     collapsing to ``"all"`` (which would incorrectly generate files
     for every family).
 
-    Family resolution reads ``TargetProfile.compile_family`` from
-    ``KNOWN_TARGETS`` so adding a new compile-eligible target only
-    requires populating that field.  The CLI alias ``"vscode"`` is
-    treated as ``"copilot"`` for this purpose.
+    Family resolution reads ``TargetCapability.compile_family`` from
+    ``TARGET_CAPABILITIES`` so adding a new compile-eligible target only
+    requires populating that field.
 
     Args:
         target: A single target string, a list of target strings, or ``None``.
@@ -247,13 +204,104 @@ def _resolve_compile_target(target):
     Returns:
         A single string, a ``frozenset`` of compiler families, or ``None``.
     """
-    from ...integration.targets import KNOWN_TARGETS
-
     if target is None:
         return None  # will trigger detect_target() auto-detection
-    if isinstance(target, list):
-        return _resolve_list_target(target, KNOWN_TARGETS)
-    return target  # single string pass-through
+    requested_targets = [target] if isinstance(target, str) else target
+    if len(requested_targets) > 1:
+        deployment_all = {get_target_capability(name).name for name in expand_all("install")}
+        requested_canonical = {
+            get_target_capability(name).name for name in requested_targets if name != "all"
+        }
+        if "all" in requested_targets or deployment_all <= requested_canonical:
+            explicit_targets = [
+                name
+                for name in requested_targets
+                if name != "all" and get_target_capability(name).name not in deployment_all
+            ]
+            requested_targets = [*expand_all("compile"), *explicit_targets]
+
+    target_set: set[str] = set()
+    for requested in requested_targets:
+        if requested == "all":
+            target_set.add(requested)
+            continue
+        capability = get_target_capability(requested)
+        if "compile" not in capability.commands:
+            raise click.UsageError(
+                f"Target '{requested}' is not a compile target.\n\n"
+                "Fix with one of:\n\n"
+                "  apm compile --target copilot\n"
+                "  apm compile --dry-run"
+            )
+        target_set.add(capability.name)
+
+    if target_set == {"all"}:
+        return "all"
+
+    # The "vscode" family handles copilot AND emits AGENTS.md as a
+    # bonus; the "agents" family emits AGENTS.md only.  When both
+    # appear in a multi-target compile we still need both family
+    # tokens so the agents compiler routes correctly.
+    def _family_of(name: str) -> str | None:
+        return get_target_capability(name).compile_family
+
+    families: set[str] = set()
+    for name in target_set:
+        family = _family_of(name)
+        if family is None:
+            continue
+        families.add(family)
+        if family == "vscode":
+            # copilot also emits AGENTS.md; mirror legacy behavior.
+            families.add("agents")
+
+    if len(families) >= 2:
+        # Collapse {"vscode","agents"} to bare "vscode" ONLY when the
+        # original target list contains no non-Copilot agents-family
+        # targets (e.g. codex, opencode, windsurf).  When mixed targets
+        # like [copilot, codex] are requested, keep the frozenset so
+        # downstream dedup logic knows non-Copilot targets also consume
+        # AGENTS.md (issue #1678).
+        if families == {"vscode", "agents"}:
+            has_non_vscode_agents = any(
+                name in target_set
+                for name, capability in TARGET_CAPABILITIES.items()
+                if capability.compile_family == "agents" and capability.primitive_profile == name
+            )
+            if not has_non_vscode_agents:
+                return "vscode"
+        return frozenset(families)
+    if families == {"agents"} and "antigravity" in target_set and len(target_set) > 1:
+        # Mixed Antigravity + AGENTS.md-only consumers share AGENTS.md but
+        # do not all read .agents/rules/. Preserve mixed-target context so
+        # downstream dedup stays disabled for AGENTS.md-only consumers.
+        return frozenset({"agents"})
+    if "claude" in families:
+        return "claude"
+    if "gemini" in families:
+        return "gemini"
+    if "vscode" in families:
+        return "vscode"
+    # Bare agents-family target: preserve the original target name so
+    # single-element list routing matches single-string semantics. Iterate
+    # TARGET_CAPABILITIES in insertion order so priority ties resolve
+    # deterministically to the earliest-registered target.
+    for name, capability in TARGET_CAPABILITIES.items():
+        if (
+            capability.compile_family == "agents"
+            and capability.primitive_profile == name
+            and name in target_set
+        ):
+            return name
+    if families == {"agents"}:
+        return frozenset(families)
+    for requested in requested_targets:
+        if requested == "all":
+            continue
+        capability = get_target_capability(requested)
+        if capability.compile_family is None:
+            return capability.name
+    raise click.UsageError("No compile-capable target was selected.")
 
 
 def _resolve_effective_target(
@@ -320,12 +368,20 @@ def _resolve_effective_target(
     return detected_target, detection_reason, config_target
 
 
-def _validate_project(logger: CommandLogger, dry_run: bool, source_root: Path) -> None:
+def _validate_project(
+    logger: CommandLogger,
+    dry_run: bool,
+    source_root: Path,
+    *,
+    allow_empty: bool = False,
+) -> None:
     """Check APM project exists and has content.
 
     Calls ``sys.exit(1)`` on fatal errors.  In dry-run mode the function
     emits diagnostic messages but does *not* exit so callers can test the
-    full compile path even without real content.
+    full compile path even without real content.  ``allow_empty`` lets
+    ``compile --clean`` reach the compiler's APM-owned orphan cleanup;
+    callers must keep validation and watch modes on the content-required path.
     """
     from ...compilation.constitution import find_constitution
 
@@ -342,29 +398,32 @@ def _validate_project(logger: CommandLogger, dry_run: bool, source_root: Path) -
     # Check if .apm directory has actual content
     apm_dir = source_root / APM_DIR
     local_apm_has_content = apm_dir.exists() and (
-        any(apm_dir.rglob("*.instructions.md")) or any(apm_dir.rglob("*.chatmode.md"))
+        any(apm_dir.rglob("*.instructions.md")) or any(apm_dir.rglob("*.agent.md"))
     )
 
     # If no primitive sources exist, check deeper to provide better feedback
     if not apm_modules_exists and not local_apm_has_content and not constitution_exists:
+        if allow_empty:
+            return
+
         # Check if .apm directories exist but are empty
         has_empty_apm = (
             apm_dir.exists()
             and not any(apm_dir.rglob("*.instructions.md"))
-            and not any(apm_dir.rglob("*.chatmode.md"))
+            and not any(apm_dir.rglob("*.agent.md"))
         )
 
         if has_empty_apm:
             logger.error("No instruction files found in .apm/ directory")
             logger.progress(" To add instructions, create files like:")
             logger.progress("   .apm/instructions/coding-standards.instructions.md")
-            logger.progress("   .apm/chatmodes/backend-engineer.chatmode.md")
+            logger.progress("   .apm/agents/backend-engineer.agent.md")
         else:
             logger.error("No APM content found to compile")
             logger.progress(" To get started:")
             logger.progress("   1. Install APM dependencies: apm install <owner>/<repo>")
             logger.progress("   2. Or create local instructions: mkdir -p .apm/instructions")
-            logger.progress("   3. Then create .instructions.md or .chatmode.md files")
+            logger.progress("   3. Then create .instructions.md or .agent.md files")
 
         if not dry_run:  # Don't exit on dry-run to allow testing
             sys.exit(1)
@@ -413,45 +472,6 @@ def _run_validation_mode(logger: CommandLogger, verbose: bool, source_root: Path
     perf_stats.render_summary(logger, project_root=str(source_root))
 
 
-def _run_watch_mode(
-    logger: CommandLogger,
-    target: str | list[str] | None,
-    output: str,
-    chatmode: str | None,
-    no_links: bool,
-    dry_run: bool,
-    verbose: bool,
-    clean: bool,
-    source_root: Path | None = None,
-) -> None:
-    """Set up and run watch mode (``--watch`` flag).
-
-    Resolves the effective compile target using the same logic as the
-    one-shot path so that ``targets: [claude, cursor]`` in apm.yml does
-    not silently regress on every recompile (#1345), then delegates to
-    :func:`_watch_mode`.
-    """
-    if clean:
-        logger.warning(
-            "--clean is ignored in watch mode; run 'apm compile --clean' "
-            "separately to remove orphaned outputs."
-        )
-    effective_target, _detection_reason, config_target = _resolve_effective_target(
-        target, source_root=source_root
-    )
-    _watch_mode(
-        output,
-        chatmode,
-        no_links,
-        dry_run,
-        verbose=verbose,
-        effective_target=effective_target,
-        target_label_user=target,
-        target_label_config=config_target,
-        cli_target=target,
-    )
-
-
 @click.command(help="Compile APM context into distributed AGENTS.md files")
 @click.option(
     "--output",
@@ -464,7 +484,10 @@ def _run_watch_mode(
     "-t",
     type=TargetParamType(),
     default=None,
-    help="Target platform (comma-separated). Values: copilot, claude, cursor, opencode, codex, gemini, antigravity, windsurf, kiro, agent-skills, all. 'agent-skills' deploys to .agents/skills/ (cross-client). 'antigravity' (alias 'agy') deploys to .agents/ and is explicit-only -- not part of 'all'. 'all' = copilot+claude+cursor+opencode+codex+gemini+windsurf+kiro (excludes agent-skills and antigravity); combine with 'agent-skills' or 'antigravity' to add them.",
+    help=f"Target platform (comma-separated). {target_help_fragment('compile')} "
+    "'antigravity' (alias 'agy') deploys to .agents/ and is explicit-only -- not part of 'all'. "
+    "'all' excludes antigravity and experimental targets; "
+    "combine explicit-only targets when needed.",
 )
 @click.option(
     "--dry-run",
@@ -525,23 +548,24 @@ def _run_watch_mode(
     help="Compile for all canonical targets. Equivalent to --target all.",
 )
 @click.option(
-    "--no-dedup/--no-force-instructions",
+    "--force-instructions/--no-force-instructions",
     "no_dedup",
-    is_flag=True,
     default=False,
     help=(
         "Include the instructions section in CLAUDE.md even when .claude/rules/ is "
-        "already populated. Overrides the default deduplication that normally omits "
-        "the section to avoid duplicate context in Claude Code. Affects the Claude "
-        "target only. Alias: --force-instructions."
+        "already populated, and in AGENTS.md even when .github/instructions/ is "
+        "already populated, or .agents/rules/ for Antigravity. Overrides the "
+        "default deduplication that normally omits these sections to avoid "
+        "duplicate context. Affects the Claude, Copilot, and Antigravity "
+        "deduplication paths. Alias: --no-dedup."
     ),
 )
 @click.option(
-    "--force-instructions",
+    "--no-dedup",
     "no_dedup",
     is_flag=True,
     default=False,
-    help="Alias for --no-dedup.",
+    help="Alias for --force-instructions.",
     hidden=True,
 )
 @click.option(
@@ -555,6 +579,19 @@ def _run_watch_mode(
         "sources (apm.yml, .apm/, project tree for placement scoring) "
         "continue resolving from $PWD. Pairs with 'apm install --root' "
         "for scratch-dir verification. Cannot be combined with --watch."
+    ),
+)
+@click.option(
+    "--global",
+    "-g",
+    "global_",
+    is_flag=True,
+    default=False,
+    help=(
+        "Compile user-scope root context files (~/.claude/CLAUDE.md, etc.) "
+        "from ~/.apm/apm_modules. Cannot be combined with project-scoped output "
+        "flags such as --target, --all, --watch, --root, or --output; use with "
+        "--dry-run to preview changes."
     ),
 )
 @click.pass_context
@@ -576,11 +613,15 @@ def compile(  # noqa: PLR0913 -- Click handler
     compile_all,
     no_dedup,
     root,
+    global_,
 ):
     """Compile APM context into distributed AGENTS.md files.
 
     By default, uses distributed compilation to generate multiple focused AGENTS.md
     files across your directory structure following the Minimal Context Principle.
+
+    Use --global / -g to compile user-scope root context files from globally
+    installed packages.
 
     Use --single-agents for traditional single-file compilation when needed.
 
@@ -618,6 +659,39 @@ def compile(  # noqa: PLR0913 -- Click handler
         # consumers running with -W default, which we have none of.
         logger.warning("'--target all' is deprecated; use '--all' instead.")
 
+    # --global: compile user-scope root context files from ~/.apm/apm_modules.
+    # Must be checked before --watch / --root guards so we return early.
+    if global_:
+        from click.core import ParameterSource
+
+        allowed_with_global = {"global_", "dry_run", "verbose"}
+        flag_names = {
+            "chatmode": "--chatmode",
+            "clean": "--clean",
+            "compile_all": "--all",
+            "legacy_skill_paths": "--legacy-skill-paths",
+            "local_only": "--local-only",
+            "no_dedup": "--force-instructions/--no-force-instructions",
+            "no_links": "--no-links",
+            "output": "--output",
+            "root": "--root",
+            "single_agents": "--single-agents",
+            "target": "--target",
+            "validate": "--validate",
+            "verbose": "--verbose",
+            "watch": "--watch",
+            "with_constitution": "--with-constitution/--no-constitution",
+        }
+        for name in sorted(set(ctx.params) - allowed_with_global):
+            if ctx.get_parameter_source(name) is ParameterSource.DEFAULT:
+                continue
+            flag = flag_names.get(name, f"--{name.replace('_', '-')}")
+            raise click.UsageError(f"--global is not valid with {flag}")
+        rc = _handle_global_flag(dry_run=dry_run, logger=logger)
+        if rc != 0:
+            ctx.exit(rc)
+        return
+
     # --root + --watch is rejected: ``_watch_mode`` uses bare-relative
     # paths (``Path(APM_DIR)``, ``AgentsCompiler(".")``) and the watch
     # loop would scan the deploy root rather than the source tree. The
@@ -645,7 +719,12 @@ def compile(  # noqa: PLR0913 -- Click handler
         # from. Equals $PWD unless --root redirects writes elsewhere.
         source_root = get_source_root(InstallScope.PROJECT)
 
-        _validate_project(logger, dry_run, source_root)
+        _validate_project(
+            logger,
+            dry_run,
+            source_root,
+            allow_empty=clean and not validate and not watch,
+        )
 
         if validate:
             _run_validation_mode(logger, verbose, source_root)
@@ -682,6 +761,8 @@ def compile(  # noqa: PLR0913 -- Click handler
         logger.error(f"Compilation module not available: {e}")
         logger.progress("This might be a development environment issue.")
         sys.exit(1)
+    except click.ClickException:
+        raise
     except Exception as e:
         logger.error(f"Error during compilation: {e}")
         sys.exit(1)

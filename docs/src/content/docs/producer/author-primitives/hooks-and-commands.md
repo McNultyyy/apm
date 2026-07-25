@@ -10,13 +10,13 @@ each target's own format. Author them when the value to a specific
 harness justifies the per-target maintenance.
 
 This page covers both. For the cross-harness reach map, see
-[Primitives and targets](../../concepts/primitives-and-targets/).
+[Primitives and targets](../../../concepts/primitives-and-targets/).
 For dev-only versus prod separation in the manifest, see
-[Dev-only primitives](../../concepts/primitives-and-targets/#dev-only-primitives).
+[Dev-only primitives](../../../concepts/primitives-and-targets/#dev-only-primitives).
 
 ## Why they are target-specific
 
-A skill is a markdown file APM can route to seven harnesses. A hook
+A skill is a markdown file APM can route to every canonical skill target. A hook
 is a runtime callback fired by one harness inside its own tool loop.
 A slash command is a command-palette entry surfaced by an IDE.
 Neither generalizes: nothing reaches `AGENTS.md`, nothing routes to
@@ -80,7 +80,51 @@ authors notice empty merges during development.
 
 The `${PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_ROOT}`, `${CURSOR_PLUGIN_ROOT}`, and `${KIRO_PLUGIN_ROOT}`
 tokens resolve to the installed package root and are rewritten per
-target. Plain `./script.sh` resolves relative to the hook file.
+target. Plain `./script.sh` resolves relative to the hook file. If the hook
+file lives in `hooks/` or `.apm/hooks/`, a path like
+`./hooks/run-hook.sh` resolves from the package root so the deployed
+path is not doubled.
+
+When a hook command points at a script inside a package hook directory,
+APM deploys the hook source bundle so sibling helper modules stay
+available at runtime:
+
+- Claude-family merged targets (Claude, Cursor, Codex, Gemini,
+  Antigravity, and Windsurf), Copilot, and Kiro receive the same bundle.
+- Root hook JSON descriptors, symlinks, and `.apm-pin` markers are not
+  deployed.
+- JavaScript and TypeScript hook bundles get a minimal `package.json`
+  sidecar with the nearest source package's Node `type`; packages
+  without an explicit `type` deploy as `commonjs`, and shell-only
+  bundles do not get a sidecar.
+
+For multi-target packages, prefer simple hook filenames plus consumer
+per-dependency `targets:` in `dependencies.apm` to limit reach. If the
+same manifest stem is mirrored in both `hooks/` and `.apm/hooks/`, APM
+integrates the `.apm/hooks/` copy once per target.
+
+:::note
+See the object-form dependency field in
+[Manifest Schema](../../../reference/manifest-schema/#412-object-form) and
+the target vocabulary in
+[Primitives and targets](../../../concepts/primitives-and-targets/).
+:::
+
+:::caution[Deprecated]
+Hook filename routing (`*-<harness>-hooks.json`) is deprecated. Ship one
+hook manifest; consumers scope harness reach with the per-dependency
+`targets:` field. The filename router still works during the deprecation
+window and warns at install time. If both are present, `targets:` narrows the
+active harness set and filename routing still applies within that set.
+
+Before: name the manifest `my-pkg-codex-hooks.json`. After: keep
+`hooks.json` generic and let the consumer set `targets: [codex]`.
+Combined deprecated stems such as `claude-codex-hooks.json` route to every
+named target token during the migration window.
+Stems with target tokens outside the trailing target suffix (for example
+`codex-launch-hooks.json`) fall back to universal or suffix routing and print a
+warning naming the ignored token.
+:::
 
 Supported targets and where the integrator writes:
 
@@ -95,17 +139,26 @@ Supported targets and where the integrator writes:
 | kiro     | `.kiro/hooks/<package-slug>-<hook-file-stem-slug>-<event-slug>-<n>.json` | one file per hook action |
 | opencode | -- not supported --                   | silently skipped     |
 
+APM parses the source into vendor-neutral hook intent, then each target
+integrator renders its native schema. Flat command entries become Claude's
+required `{ "matcher": "*", "hooks": [...] }` entries in
+`.claude/settings.json`. Kiro receives its current v1 standalone schema:
+`{ "version": "v1", "hooks": [{ "name", "trigger", "matcher", "action" }] }`.
+Kiro trigger names are PascalCase and command timeouts remain in seconds.
+
 Copilot hook files are namespaced with the source package name to avoid
 collisions across installed deps; bundled scripts land alongside under
 `.github/hooks/scripts/<pkg>/`.
 
-Claude's `settings.json` uses `additionalProperties: false` in its JSON
-schema, which rejects any unknown keys (including APM's internal
-`_apm_source` ownership marker).  APM therefore writes a companion sidecar
-file `.claude/apm-hooks.json` that stores the ownership metadata separately.
-This sidecar is created and cleaned up automatically alongside
-`settings.json`; it is an APM implementation detail and should not be edited
-by hand.
+Merged hook files contain only each target's native upstream fields. APM writes
+ownership metadata to a sibling `apm-hooks.json` sidecar for Claude, Cursor,
+Gemini, Codex, Windsurf, and Antigravity. The sidecar is created and cleaned up
+automatically alongside the native config; it is an APM implementation detail
+and should not be edited by hand. When a target is dropped from `targets:` in
+`apm.yml`, the next `apm install`, `apm compile`, or `apm update` also removes
+that target's own hook entries and sidecar -- see
+[`apm install`'s target-contraction note](../../../reference/cli/install/#notes)
+for the exact preserve/remove contract.
 
 Verified against `src/apm_cli/integration/targets.py` and
 `src/apm_cli/integration/hook_integrator.py`.
@@ -176,10 +229,10 @@ agent a procedure" fits a skill -- and reaches every harness.
   paths break on consumers' machines.
 - **Hook script path resolution.** `apm install -g` (user-scope)
   rewrites `${PLUGIN_ROOT}` and relative `./` references to absolute
-  paths so Claude Code can execute scripts regardless of the working
-  directory. Project-scope `apm install` (no `-g`) keeps `command`
-  paths repo-relative so checked-in configs stay portable across
-  clones, contributors, and CI. Either way, if a referenced script
+  paths so Claude Code and Copilot CLI can execute scripts regardless
+  of the working directory. Project-scope `apm install` (no `-g`)
+  keeps `command` paths repo-relative so checked-in configs stay portable
+  across clones, contributors, and CI. Either way, if a referenced script
   is missing at install time the installer emits a warning -- in
   user-scope the unexpanded variable is rewritten to the absolute
   source path so the hook fails loudly at runtime; in project-scope
@@ -195,4 +248,4 @@ agent a procedure" fits a skill -- and reaches every harness.
 
 Once your hooks and commands are in place, run `apm install --dry-run`
 to preview what each target will receive, then `apm pack` to bundle.
-See [Compile](../compile/) and [Pack a bundle](../pack-a-bundle/).
+See [Compile](../../compile/) and [Pack a bundle](../../pack-a-bundle/).

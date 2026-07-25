@@ -1,84 +1,19 @@
 """Pure helper functions extracted from ``install/services.py``.
 
-None of these touch any security gate or canvas-trust wiring -- those stay
-in services.py adjacent to their call sites.  This module is a leaf: it does
-NOT import from services.py at module scope (only via lazy function-local
-imports where strictly necessary to avoid circular dependencies).
+Canvas-trust wiring and local-bundle deploy helpers live here so
+``integrate_local_bundle`` stays within the Stage-2 complexity budget.
+This module is a leaf: it does NOT import from services.py at module scope.
 """
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..core.command_logger import InstallLogger
-
-
-def _deployed_path_entry(
-    target_path: Path,
-    project_root: Path,
-    targets: Any,
-) -> str:
-    """Return the lockfile-safe path string for a deployed file."""
-
-    def _try_dynamic_root(tgts: Any, *, strict: bool = False) -> str | None:
-        for _t in tgts:
-            if _t.resolved_deploy_root is None:
-                continue
-            if not strict:
-                try:
-                    target_path.relative_to(_t.resolved_deploy_root)
-                except ValueError:
-                    continue
-            if _t.name == "copilot-app":
-                from apm_cli.integration.copilot_app_db import to_lockfile_uri
-
-                return to_lockfile_uri(target_path.name)
-            from apm_cli.integration.copilot_cowork_paths import to_lockfile_path
-
-            return to_lockfile_path(target_path, _t.resolved_deploy_root)
-        return None
-
-    if targets:
-        result = _try_dynamic_root(targets)
-        if result is not None:
-            return result
-    try:
-        return target_path.relative_to(project_root).as_posix()
-    except ValueError:
-        # Fallback: let to_lockfile_path run its own security
-        # validation (PathTraversalError) without pre-filtering.
-        if targets:
-            result = _try_dynamic_root(targets, strict=True)
-            if result is not None:
-                return result
-        raise RuntimeError(  # noqa: B904
-            f"Cannot translate {target_path!r} to a lockfile path: "
-            f"path is outside the project tree and no dynamic-root "
-            f"target matched. This is a bug -- please report it."
-        )
-
-
-def _skill_bundle_file_entries(
-    skill_dir: Path,
-    project_root: Path,
-    targets: Any,
-) -> list[str]:
-    """Expand a deployed skill directory into per-file lockfile entries."""
-    try:
-        if not (skill_dir.is_dir() and not skill_dir.is_symlink()):
-            return []
-    except OSError:
-        return []
-    entries: list[str] = []
-    for bundle_file in sorted(skill_dir.rglob("*")):
-        try:
-            if bundle_file.is_file() and not bundle_file.is_symlink():
-                entries.append(_deployed_path_entry(bundle_file, project_root, targets))
-        except OSError:
-            continue
-    return entries
+    from ..install.diagnostics import DiagnosticCollector
 
 
 def _label_and_deploy_dir(
@@ -138,3 +73,166 @@ def _log_hooks_skip(
             f"Run 'apm approve {pkg_label}' to approve.",
             symbol="warning",
         )
+
+
+def _check_executable_approval(
+    package_name: str,
+    package_info: Any,
+    allow_executables: dict[str, dict[str, bool]] | None,
+    *,
+    ctx: Any = None,
+) -> tuple[bool, bool, bool, bool]:
+    """Delegate to ``exec_gate.check_executable_approval``."""
+    from apm_cli.install.exec_gate import check_executable_approval
+
+    return check_executable_approval(package_name, package_info, allow_executables, ctx=ctx)
+
+
+def _log_canvas_skip(package_name: str, package_info: Any, logger: InstallLogger | None) -> None:
+    """Warn about skipped canvas extensions when the package ships them."""
+    _install = Path(package_info.install_path)
+    extensions_root = _install / ".apm" / "extensions"
+    try:
+        has_canvas = extensions_root.is_dir() and any(
+            (d / "extension.mjs").is_file() for d in extensions_root.iterdir() if d.is_dir()
+        )
+    except OSError:
+        has_canvas = False
+    if not has_canvas:
+        return
+    _pkg_label = package_name or getattr(package_info, "name", "unknown")
+    if logger:
+        logger.warning(
+            f"{_pkg_label}: canvas extension(s) skipped (not approved in allowExecutables). "
+            f"Run 'apm approve {_pkg_label}' to approve.",
+            symbol="warning",
+        )
+
+
+def _load_bundle_pack_files(bundle_info: Any) -> dict[str, str]:
+    """Load and filter the file manifest for a local bundle.
+
+    Reads ``pack.bundle_files`` from the bundle lockfile when present;
+    falls back to walking the bundle directory.  Either way, strips
+    bundle-metadata entries (plugin.json, .mcp.json, apm.lock.yaml).
+    """
+    bundle_dir: Path = bundle_info.source_dir
+    pack_files: dict[str, str] = {}
+    if bundle_info.lockfile:
+        pack = bundle_info.lockfile.get("pack") or {}
+        bf = pack.get("bundle_files") or {}
+        if isinstance(bf, dict):
+            pack_files = {str(k): str(v) for k, v in bf.items()}
+
+    if not pack_files:
+        for fp in bundle_dir.rglob("*"):
+            if not fp.is_file() or fp.is_symlink():
+                continue
+            rel = fp.relative_to(bundle_dir).as_posix()
+            lower = rel.lower()
+            if rel == "apm.lock.yaml" or lower in {"plugin.json", ".mcp.json"}:
+                continue
+            pack_files[rel] = hashlib.sha256(fp.read_bytes()).hexdigest()
+
+    return {r: h for r, h in pack_files.items() if r.lower() not in {"plugin.json", ".mcp.json"}}
+
+
+def _apply_canvas_gate(
+    pack_files: dict[str, str],
+    slug: str,
+    allow_executables: dict[str, dict[str, bool]] | None,
+    *,
+    logger: InstallLogger | None,
+    diagnostics: DiagnosticCollector | None,
+) -> tuple[dict[str, str], int]:
+    """Filter canvas extension files from *pack_files* per feature + approval gate.
+
+    Returns ``(filtered_pack_files, extra_skipped)`` where *extra_skipped* is
+    non-zero only when canvas is enabled but the bundle is NOT approved -- in
+    that case the caller's skipped counter should be incremented.  When canvas
+    is disabled the files are silently dropped without counting as skipped.
+    """
+    from ..core.experimental import is_enabled
+    from ..integration.canvas_integrator import is_canvas_bundle_path
+
+    _canvas_enabled = is_enabled("canvas")
+    if _canvas_enabled:
+        from ..security.executables import EXEC_TYPE_CANVAS, is_package_approved
+
+        _canvas_approved = allow_executables is None or is_package_approved(
+            allow_executables, slug, EXEC_TYPE_CANVAS
+        )
+    else:
+        _canvas_approved = False
+
+    if _canvas_enabled and _canvas_approved:
+        return pack_files, 0
+
+    _blocked = sorted(r for r in pack_files if is_canvas_bundle_path(r))
+    filtered = {k: v for k, v in pack_files.items() if k not in _blocked}
+    if not _blocked:
+        return filtered, 0
+
+    if not _canvas_enabled:
+        # Canvas feature is off -- drop silently, do NOT count as skipped.
+        return filtered, 0
+
+    # Canvas is on but not approved: warn and count.
+    _msg = (
+        f"Blocked {len(_blocked)} canvas extension file(s) from bundle "
+        f"'{slug}': canvas extensions are executable extension.mjs code "
+        f"and are not approved in allowExecutables. "
+        f"Run 'apm approve {slug}' to approve them."
+    )
+    if diagnostics is not None:
+        diagnostics.warn(message=_msg, package=str(slug))
+    elif logger is not None:
+        logger.warning(_msg)
+    return filtered, len(_blocked)
+
+
+def _resolve_bundle_file_dest(
+    rel: str,
+    target: Any,
+    default_deploy_root: Path,
+    project_root: Path,
+    slug: str,
+    primitive_roots: dict[str, Path],
+    *,
+    logger: InstallLogger | None,
+) -> tuple[Path, Path] | None:
+    """Return ``(dest, deploy_root)`` for one bundle file in one target.
+
+    Returns ``None`` when the file should be skipped for this target
+    (non-Copilot canvas extension, invalid slug for compile-only staging,
+    or path traversal in stage root).  The caller must handle
+    ``PathTraversalError`` on *dest* itself -- this function only resolves
+    where the file would go and handles the instructions-staging branch.
+    """
+    from ..utils.path_security import PathTraversalError, ensure_path_within
+
+    _rel_norm = rel.replace("\\", "/")
+    _first_seg = _rel_norm.split("/", 1)[0] if "/" in _rel_norm else ""
+
+    if _first_seg.lower() == "extensions" and target.name != "copilot":
+        return None
+
+    if _first_seg == "instructions" and "instructions" not in (target.primitives or {}):
+        # Compile-only target: stage under apm_modules/<slug>/.apm/instructions/
+        from .services_integrate import _validate_bundle_slug
+
+        _slug_str = str(slug)
+        if not _validate_bundle_slug(_slug_str, logger):
+            return None
+        stage_root = project_root / "apm_modules" / slug / ".apm" / "instructions"
+        try:
+            ensure_path_within(stage_root, project_root / "apm_modules")
+        except PathTraversalError as exc:
+            if logger is not None:
+                logger.warning(f"Skipped unsafe stage root for {slug!r}: {exc}")
+            return None
+        _rel_under = rel.split("/", 1)[1] if "/" in rel else Path(rel).name
+        return stage_root / _rel_under, stage_root
+
+    deploy_root = primitive_roots.get(_first_seg, default_deploy_root)
+    return deploy_root / rel, deploy_root

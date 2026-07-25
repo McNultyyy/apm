@@ -38,22 +38,27 @@ from ..utils.github_host import (
 )
 from ..utils.path_security import PathTraversalError
 from .git_file_transport import (
+    GitFileFetchResult,
     GitFileTransportError,
     GitFileTransportSecurityError,
     GitSparseFileTransport,
 )
+from .github_rate_limit import GitHubThrottleError, github_throttle_error
 from .host_backends import backend_for
-
-# ---------------------------------------------------------------------------
-# Module-level debug helper (mirrors the one in github_downloader so that
-# this module has no import dependency on the orchestrator).
-# ---------------------------------------------------------------------------
 
 
 def _debug(message: str) -> None:
     """Print debug message if APM_DEBUG environment variable is set."""
     if os.environ.get("APM_DEBUG"):
         print(f"[DEBUG] {message}", file=sys.stderr)
+
+
+def _close_response(response: requests.Response, context: str) -> None:
+    """Close an HTTP response and preserve failures in debug diagnostics."""
+    try:
+        response.close()
+    except Exception as exc:
+        _debug(f"{context} response close failed: {exc}")
 
 
 def _close_git_file_transports(transports: dict[object, object]) -> None:
@@ -116,14 +121,21 @@ class DownloadDelegate:
         headers: dict[str, str],
         timeout: int = 30,
         max_retries: int = 3,
+        *,
+        stream: bool = False,
+        retry_throttles: bool = True,
     ) -> requests.Response:
-        """HTTP GET with retry on 429/503 and rate-limit header awareness.
+        """HTTP GET with selectable retries for transient HTTP failures.
 
         Args:
             url: Request URL
             headers: HTTP headers
             timeout: Request timeout in seconds
-            max_retries: Maximum retry attempts for transient failures
+            max_retries: Maximum total attempts, including the initial request
+            stream: Whether to stream the response body instead of buffering it
+            retry_throttles: Whether general callers retry a classified
+                throttle. Virtual-file download callers disable this so they
+                can select sparse Git without a retry or sleep.
 
         Returns:
             requests.Response (caller should call .raise_for_status() as needed)
@@ -135,50 +147,38 @@ class DownloadDelegate:
         last_response = None
         for attempt in range(max_retries):
             try:
-                response = requests.get(url, headers=headers, timeout=timeout)
+                response = requests.get(url, headers=headers, timeout=timeout, stream=stream)
 
-                # Handle rate limiting -- GitHub returns 429 for secondary limits
-                # and 403 with X-RateLimit-Remaining: 0 for primary limits.
-                is_rate_limited = response.status_code in (429, 503)
-                if not is_rate_limited and response.status_code == 403:
-                    try:
-                        remaining = response.headers.get("X-RateLimit-Remaining")
-                        if remaining is not None and int(remaining) == 0:
-                            is_rate_limited = True
-                    except (TypeError, ValueError):
-                        pass
-
-                if is_rate_limited:
+                throttle = github_throttle_error(response, "GitHub API")
+                if throttle is not None:
+                    if not retry_throttles:
+                        return response
                     last_response = response
-                    retry_after = response.headers.get("Retry-After")
-                    reset_at = response.headers.get("X-RateLimit-Reset")
-                    if retry_after:
-                        try:
-                            wait = min(float(retry_after), 60)
-                        except (TypeError, ValueError):
-                            # Retry-After may be an HTTP-date; fall back to exponential backoff
+                    if attempt < max_retries - 1:
+                        wait = throttle.throttle.retry_after_seconds
+                        if wait is None:
                             wait = min(2**attempt, 30) * (0.5 + random.random())  # noqa: S311
-                    elif reset_at:
-                        try:
-                            wait = max(0, min(int(reset_at) - time.time(), 60))
-                        except (TypeError, ValueError):
-                            wait = min(2**attempt, 30) * (0.5 + random.random())  # noqa: S311
-                    else:
-                        wait = min(2**attempt, 30) * (0.5 + random.random())  # noqa: S311
-                    _debug(
-                        f"Rate limited ({response.status_code}), retry in "
-                        f"{wait:.1f}s (attempt {attempt + 1}/{max_retries})"
-                    )
-                    time.sleep(wait)
+                        else:
+                            wait = min(wait, 60)
+                        _debug(
+                            f"Rate limited ({response.status_code}), retry in "
+                            f"{wait:.1f}s (attempt {attempt + 1}/{max_retries})"
+                        )
+                        _close_response(response, "rate-limit retry")
+                        time.sleep(wait)
                     continue
 
-                # Log rate limit proximity
-                remaining = response.headers.get("X-RateLimit-Remaining")
-                try:
-                    if remaining and int(remaining) < 10:
-                        _debug(f"GitHub API rate limit low: {remaining} requests remaining")
-                except (TypeError, ValueError):
-                    pass
+                if response.status_code == 503:
+                    last_response = response
+                    if attempt < max_retries - 1:
+                        wait = min(2**attempt, 30) * (0.5 + random.random())  # noqa: S311
+                        _debug(
+                            f"Service unavailable, retry in {wait:.1f}s "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        _close_response(response, "service-unavailable retry")
+                        time.sleep(wait)
+                    continue
 
                 return response
             except requests.exceptions.ConnectionError as e:
@@ -195,9 +195,8 @@ class DownloadDelegate:
                 if attempt < max_retries - 1:
                     _debug(f"Timeout, retrying (attempt {attempt + 1}/{max_retries})")
 
-        # If rate limiting exhausted all retries, return the last response so
-        # callers can inspect headers (e.g. X-RateLimit-Remaining) and raise
-        # an appropriate user-facing error.
+        # A retryable service failure returns its final response for the caller
+        # to inspect and render.
         if last_response is not None:
             return last_response
 
@@ -392,13 +391,13 @@ class DownloadDelegate:
 
         return _impl(self, dep_ref, file_path, ref)
 
-    def _gitlab_file_transport_key(
+    def _git_file_transport_key(
         self, dep_ref: DependencyReference, ref: str
     ) -> tuple[str, str, str, int | None]:
-        """Return the cache key for one GitLab git-file checkout."""
+        """Return the cache key for one path-scoped Git file checkout."""
         return (dep_ref.host or default_host(), dep_ref.repo_url, ref, dep_ref.port)
 
-    def _discard_gitlab_file_transport(self, key: tuple[str, str, str, int | None]) -> None:
+    def _discard_git_file_transport(self, key: tuple[str, str, str, int | None]) -> None:
         """Close and remove a failed cached git-file checkout."""
         with self._git_file_transports_lock:
             transport = self._git_file_transports.pop(key, None)
@@ -412,24 +411,34 @@ class DownloadDelegate:
         ref: str,
     ) -> bytes:
         """Fetch a GitLab path: file via a reusable sparse checkout."""
-        key = self._gitlab_file_transport_key(dep_ref, ref)
-        with self._git_file_transports_lock:
-            transport = self._git_file_transports.get(key)
-            if transport is None:
-                git_env = {**os.environ, **(self._host.git_env or {})}
-                transport_factory = self._git_file_transport_factory or GitSparseFileTransport
-                transport = transport_factory(
-                    dep_ref,
-                    ref,
-                    build_repo_url_fn=self.build_repo_url,
-                    git_env=git_env,
-                )
-                self._git_file_transports[key] = transport
-        try:
-            return transport.fetch_file(file_path)
-        except GitFileTransportError:
-            self._discard_gitlab_file_transport(key)
-            raise
+        from .download_strategies_ops import _download_gitlab_file_via_git_impl
+
+        return _download_gitlab_file_via_git_impl(self, dep_ref, file_path, ref)
+
+    def _download_github_file_via_git(
+        self,
+        dep_ref: DependencyReference,
+        file_path: str,
+        ref: str,
+    ) -> GitFileFetchResult:
+        """Fetch a throttled GitHub virtual file through one sparse Git transport."""
+        from .download_strategies_ops import _download_github_file_via_git_impl
+
+        return _download_github_file_via_git_impl(self, dep_ref, file_path, ref)
+
+    def download_github_file_via_throttle_fallback(
+        self,
+        dep_ref: DependencyReference,
+        file_path: str,
+        ref: str,
+        throttle: GitHubThrottleError,
+    ) -> GitFileFetchResult:
+        """Select the sole sparse-Git fallback for a confirmed GitHub throttle."""
+        from .download_strategies_ops import download_github_file_via_throttle_fallback_impl
+
+        return download_github_file_via_throttle_fallback_impl(
+            self, dep_ref, file_path, ref, throttle
+        )
 
     # ------------------------------------------------------------------
     # GitLab file download
@@ -707,7 +716,7 @@ class DownloadDelegate:
             return body
         try:
             payload = json.loads(body.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError, AttributeError):
+        except (ValueError, UnicodeDecodeError, AttributeError, RecursionError, MemoryError):
             return body
         if not isinstance(payload, dict) or "content" not in payload:
             return body

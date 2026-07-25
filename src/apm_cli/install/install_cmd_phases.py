@@ -7,6 +7,10 @@ from pathlib import Path
 
 import click
 
+from .local_bundle_handler import (
+    _BundleSecurityCtx as _BundleSecurityCtx,
+)
+
 
 def _try_local_bundle_install(
     packages,
@@ -19,7 +23,7 @@ def _try_local_bundle_install(
     alias,
     logger,
     legacy_skill_paths,
-    trust_canvas,
+    security_ctx: _BundleSecurityCtx,
     rejected_flags,
 ):
     """Detect and install a local bundle; return True if handled (caller should return).
@@ -46,11 +50,11 @@ def _try_local_bundle_install(
             force=force,
             dry_run=dry_run,
             verbose=verbose,
+            security_ctx=security_ctx,
             alias=alias,
             logger=logger,
             legacy_skill_paths=legacy_skill_paths,
             rejected_flags=rejected_flags,
-            trust_canvas=trust_canvas,
         )
         return True
     # IM7: path exists but isn't a recognised bundle.  For archive extensions
@@ -125,7 +129,9 @@ def _resolve_scope_and_paths(global_, logger):
     return scope, manifest_path, apm_dir, manifest_display, project_root
 
 
-def _setup_auth_and_check_manifest(scope, packages, manifest_path, manifest_display, logger):
+def _setup_auth_and_check_manifest(
+    scope, packages, manifest_path, manifest_display, logger, target=None
+):
     """Create shared :class:`AuthResolver`; bootstrap or error-check ``apm.yml``.
 
     May call ``sys.exit(1)`` when no manifest exists and no packages are given.
@@ -148,8 +154,20 @@ def _setup_auth_and_check_manifest(scope, packages, manifest_path, manifest_disp
     if not apm_yml_exists and packages:
         project_name = Path.cwd().name if scope is InstallScope.PROJECT else Path.home().name
         config = _get_default_config(project_name)
+        try:
+            from apm_cli.core.target_detection import manifest_targets_from_target_option
+
+            manifest_targets = manifest_targets_from_target_option(target)
+        except (ImportError, Exception):
+            manifest_targets = None
+        if manifest_targets:
+            config["targets"] = manifest_targets
         _create_minimal_apm_yml(config, target_path=manifest_path)
         logger.success(f"Created {manifest_display}")
+        if manifest_targets:
+            logger.progress(
+                f"Targets set: {', '.join(manifest_targets)} (persisted to {manifest_display})"
+            )
 
     # Error when NO apm.yml AND NO packages
     if not apm_yml_exists and not packages:
@@ -167,16 +185,46 @@ def _setup_auth_and_check_manifest(scope, packages, manifest_path, manifest_disp
 def _execute_install_and_summary(install_ctx, outcome, frozen, install_started_at):
     """Run the install pipeline and emit the post-install summary.
 
-    Returns ``apm_count`` (number of installed APM packages).
+    Returns the final :class:`~apm_cli.models.results.InstallResult` so the
+    CLI command boundary can map ``result.exit_code`` to the process exit code.
+
+    Implements main's semantics faithfully:
+      1. Recover CANCELLED/non-SUCCESS disposition via ``install_ctx.install_result``.
+      2. Set DRY_RUN disposition when ``install_ctx.dry_run`` is True.
+      3. Finalize (classify diagnostics) before transaction completion.
+      4. Complete the transaction BEFORE rendering the summary so the summary
+         line reflects the committed result, not a diagnostics-only guess.
     """
     # RULE B: _install_apm_packages, _post_install_summary, _rich_info are patched
     # at apm_cli.commands.install.* in tests.
     import apm_cli.commands.install as _m
+    from apm_cli.install.outcome import finalize_install_result
+    from apm_cli.models.results import InstallDisposition, InstallResult
 
     apm_count, mcp_count, lsp_count, apm_diagnostics = _m._install_apm_packages(
         install_ctx, outcome
     )
-    _m._post_install_summary(
+
+    # Delta 1: recover CANCELLED disposition set by _install_apm_packages early return.
+    command_result = install_ctx.install_result or InstallResult(
+        installed_count=apm_count,
+        diagnostics=apm_diagnostics,
+    )
+    command_result.installed_count = apm_count
+    command_result.diagnostics = apm_diagnostics
+
+    # Delta 2: --dry-run sets DRY_RUN disposition.
+    if install_ctx.dry_run:
+        command_result.disposition = InstallDisposition.DRY_RUN
+
+    # Delta 3: finalize (classify diagnostics) before transaction completion.
+    command_result = finalize_install_result(command_result, force=install_ctx.force)
+
+    # Delta 4: complete transaction BEFORE summary so summary reflects committed result.
+    if install_ctx.transaction is not None:
+        command_result = install_ctx.transaction.complete(command_result)
+
+    result = _m._post_install_summary(
         logger=install_ctx.logger,
         apm_count=apm_count,
         mcp_count=mcp_count,
@@ -184,6 +232,7 @@ def _execute_install_and_summary(install_ctx, outcome, frozen, install_started_a
         apm_diagnostics=apm_diagnostics,
         force=install_ctx.force,
         elapsed_seconds=time.perf_counter() - install_started_at,
+        result=command_result,
     )
     if frozen and apm_count > 0:
         # --frozen verifies LOCKFILE STRUCTURE (every apm.yml dep has a lock entry),
@@ -192,7 +241,7 @@ def _execute_install_and_summary(install_ctx, outcome, frozen, install_started_a
             "Lockfile presence verified. Run 'apm audit' for on-disk content integrity.",
             symbol="info",
         )
-    return apm_count
+    return result
 
 
 def _compute_argv_pre_dash(packages):

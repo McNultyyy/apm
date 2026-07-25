@@ -3,14 +3,81 @@
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from apm_cli.compilation.link_resolver import UnifiedLinkResolver
+from apm_cli.core.deployment_state import MaterializationResult
+from apm_cli.integration._base_integrator_adopt import _AdoptMixin
 from apm_cli.primitives.discovery import discover_primitives
 from apm_cli.utils.console import _rich_warning
+from apm_cli.utils.path_security import PathTraversalError, ensure_path_within
 
 # Re-exported so the original ``base_integrator`` import/patch path keeps
 # working after the TOCTOU-safe read primitive moved to a sibling module.
-from .base_integrator_io import _read_bytes_no_follow, _SymlinkRaceError
+from .base_integrator_io import (  # noqa: F401
+    _read_bytes_no_follow,
+    _SymlinkRaceError,
+)
+
+
+def _managed_absolute_target_root(candidate: Path, targets: Any) -> Path | None:
+    """Return the managed root for *candidate*, or ``None`` if unmanaged."""
+    from apm_cli.integration.targets import KNOWN_TARGETS
+
+    source = targets
+    if source is None:
+        source = []
+        for profile in KNOWN_TARGETS.values():
+            if not profile.user_supported or profile.user_root_resolver is not None:
+                continue
+            scoped = profile.for_scope(user_scope=True)
+            if scoped is not None:
+                source.append(scoped)
+    try:
+        resolved = candidate.resolve()
+        for target_profile in source:
+            if target_profile is None:
+                continue
+            deploy_root = target_profile.managed_deploy_root
+            if deploy_root is None:
+                continue
+            resolved_root = deploy_root.resolve()
+            for mapping in target_profile.primitives.values():
+                if not mapping.subdir:
+                    continue
+                primitive_root = (resolved_root / mapping.subdir).resolve()
+                try:
+                    contained = ensure_path_within(resolved, primitive_root)
+                except PathTraversalError:
+                    continue
+                if contained != primitive_root:
+                    return resolved_root
+            if target_profile.hooks_config_display:
+                hooks_file = resolved_root / Path(target_profile.hooks_config_display).name
+                if resolved == hooks_file.resolve():
+                    return resolved_root
+    except (ValueError, OSError):
+        return None
+    return None
+
+
+def _validate_cowork_path(rel_path: str, allowed_prefixes: tuple) -> bool:
+    """Return True if a cowork:// *rel_path* resolves within the cowork root."""
+    if not rel_path.startswith(allowed_prefixes):
+        return False
+    try:
+        from apm_cli.integration.copilot_cowork_paths import (
+            from_lockfile_path,
+            resolve_copilot_cowork_skills_dir,
+        )
+
+        cowork_root = resolve_copilot_cowork_skills_dir()
+        if cowork_root is None:
+            return False
+        from_lockfile_path(rel_path, cowork_root)
+        return True
+    except Exception:
+        return False
 
 
 @dataclass
@@ -28,6 +95,7 @@ class IntegrationResult:
     files_skipped: int
     target_paths: list[Path]
     links_resolved: int = 0
+    materializations: tuple[MaterializationResult, ...] = ()
 
     # Hook-specific (default 0 when not applicable)
     scripts_copied: int = 0
@@ -49,13 +117,22 @@ class IntegrationResult:
     display_payloads: list = field(default_factory=list)
 
 
-class BaseIntegrator:
+class BaseIntegrator(_AdoptMixin):
     """Shared infrastructure for file-level integrators.
 
     Subclasses only need to override the abstract hooks; the collision
     detection, sync removal, and link resolution logic is
     handled here.
     """
+
+    # Deploy-mode for the shared adopt predicate (:meth:`_check_adopt_or_skip`).
+    # ``False`` = byte-preserving identity (the safe default any future
+    # byte-preserving integrator inherits). Integrators that deploy via
+    # ``write_text_lf`` (instruction / command / agent) override this to
+    # ``True`` so a CRLF-source file already deployed as LF is adopted rather
+    # than churned. Making the mode an explicit, named class attribute keeps
+    # it out of a hardcoded literal buried inside the predicate.
+    _LF_NORMALIZED_DEPLOY = False
 
     def __init__(self):
         self.link_resolver: UnifiedLinkResolver | None = None
@@ -124,146 +201,6 @@ class BaseIntegrator:
             return None
         return {p.replace("\\", "/") for p in managed_files}
 
-    @staticmethod
-    def is_content_identical_to_source(target_path: Path, source_path: Path) -> bool:
-        """Return True if *target_path* is byte-identical to *source_path*.
-
-        Used by non-skill integrators to silently *adopt* a pre-existing
-        on-disk file that already matches what APM would deploy.
-
-        Why this exists
-        ---------------
-        Without this short-circuit, the per-file loops in
-        ``agent_integrator``, ``instruction_integrator``, ``prompt_integrator``
-        and ``command_integrator`` would route the file straight into
-        :meth:`check_collision`. When the path is missing from
-        ``managed_files`` (e.g. lockfile was wiped, hand-edited, regenerated
-        by an older APM build, or the user's previous install crashed before
-        ``deployed_files`` was persisted) the file is treated as
-        "user-authored", *skipped*, and never appended to ``target_paths``.
-
-        That in turn leaves ``deployed_files`` empty in the new lockfile,
-        which trips the ``required-packages-deployed`` policy check at the
-        next install. Because ``policy_gate`` runs *before* ``integrate``
-        in ``pipeline.py``, the install can never self-heal -- a permanent
-        catch-22 lockout.
-
-        ``skill_integrator`` already has an equivalent content-identity
-        adopt at ``_promote_sub_skills`` (target.exists() +
-        ``_dirs_equal``). This helper restores symmetry for non-skill
-        primitives.
-
-        Conservative by design
-        ----------------------
-        Only fires for *byte-identical* matches. Format-transforming
-        targets (``codex_agent``, ``cursor_rules``, ``claude_rules``,
-        ``windsurf_rules``, ``gemini_command``, ...) won't match -- they
-        keep the existing skip behavior. This means we never silently
-        adopt content that *might* have come from somewhere else; we only
-        adopt files that are demonstrably the package's own bytes already
-        on disk.
-
-        TOCTOU hardening
-        ----------------
-        The classic ``is_symlink()`` -> ``read_bytes()`` sequence has a
-        race window: a hostile co-tenant on the same machine could swap
-        a regular file for a symlink between the two calls and cause
-        ``read_bytes()`` to follow it to an attacker-controlled path,
-        whose bytes might match source by construction. We close the
-        race by reading through ``os.open(..., O_NOFOLLOW)`` so the
-        kernel rejects the open atomically if the final component is a
-        symlink. ``O_NOFOLLOW`` is a no-op constant on platforms that
-        lack it (Windows), where the upfront ``is_symlink()`` check
-        plus ``ensure_path_within`` at the call site provide adequate
-        coverage (Windows also lacks the cheap unprivileged-symlink
-        creation primitive that makes this race practical on POSIX).
-        """
-        try:
-            if not target_path.exists() or not source_path.exists():
-                return False
-            # Cheap pre-check: reject obvious symlinks so we never even
-            # attempt the open. Race-free verification follows below via
-            # O_NOFOLLOW.
-            if target_path.is_symlink() or source_path.is_symlink():
-                return False
-            try:
-                target_bytes = _read_bytes_no_follow(target_path)
-                source_bytes = _read_bytes_no_follow(source_path)
-            except _SymlinkRaceError:
-                # The path turned into a symlink between the pre-check
-                # and the open() -- treat as non-identical so the caller
-                # falls through to ``check_collision`` and the file is
-                # NOT adopted. Silent (no diagnostic) because adopt is
-                # an optimisation; the user-authored skip path is the
-                # safe fallback.
-                return False
-            return target_bytes == source_bytes
-        except OSError:
-            return False
-
-    @staticmethod
-    def try_adopt_identical(target_path: Path, source_path: Path, target_paths: list) -> bool:
-        """Adopt *target_path* when it is byte-identical to *source_path*.
-
-        Encapsulates the ``is_content_identical_to_source`` + append pattern
-        so secondary call sites in agent/prompt/hook integrators share a
-        single predicate call instead of repeating the three-line block.
-
-        Returns ``True`` and appends *target_path* to *target_paths* when the
-        files are identical; returns ``False`` and leaves *target_paths*
-        unchanged otherwise.
-        """
-        if BaseIntegrator.is_content_identical_to_source(target_path, source_path):
-            target_paths.append(target_path)
-            return True
-        return False
-
-    def _check_adopt_or_skip(
-        self,
-        target_path: Path,
-        source_file: Path,
-        rel_path: str,
-        managed_files: set[str] | None,
-        force: bool,
-        diagnostics,
-        target_paths: list,
-    ) -> tuple[bool, bool]:
-        """Check whether *target_path* should be adopted or skipped.
-
-        Combines :meth:`is_content_identical_to_source` (adopt) and
-        :meth:`check_collision` (skip) into a single call so integrators
-        share the decision logic without code duplication.
-
-        When adopting, *target_path* is appended to *target_paths* as a
-        side effect so the caller's bookkeeping stays correct.
-
-        Args:
-            target_path: Destination path on disk.
-            source_file: Source file to compare against for byte-identity.
-            rel_path: Relative path string used for collision detection and
-                diagnostics.
-            managed_files: Set of APM-managed relative paths; ``None`` means
-                none managed.
-            force: When ``True``, collisions are silently overwritten.
-            diagnostics: Optional diagnostics collector; forwarded to
-                :meth:`check_collision`.
-            target_paths: Mutable list; *target_path* is appended on adopt.
-
-        Returns:
-            ``(skip, adopted)`` — when ``skip`` is ``True`` the caller must
-            ``continue`` (or otherwise skip writing this file); ``adopted``
-            is ``True`` only when the existing file was byte-identical and
-            has been silently adopted.
-        """
-        if self.is_content_identical_to_source(target_path, source_file):
-            target_paths.append(target_path)
-            return True, True
-        if self.check_collision(
-            target_path, rel_path, managed_files, force, diagnostics=diagnostics
-        ):
-            return True, False
-        return False, False
-
     # Known integration prefixes that APM is allowed to deploy/remove under.
     # Derived from ``targets.KNOWN_TARGETS`` so adding a target auto-propagates.
     @staticmethod
@@ -291,35 +228,23 @@ class BaseIntegrator:
         Checks:
         1. No path-traversal components (``..``)
         2. Starts with an allowed integration prefix
-        3. Resolves within *project_root* (or within the cowork root
-           for ``cowork://`` paths)
+        3. Resolves within *project_root*, a configured absolute target root,
+           or the cowork root for ``cowork://`` paths
         """
         from apm_cli.integration.copilot_cowork_paths import COWORK_URI_SCHEME
 
-        if allowed_prefixes is None:
-            allowed_prefixes = BaseIntegrator._get_integration_prefixes(targets=targets)
         if ".." in rel_path:
             return False
 
-        # --- cowork:// paths: validate against cowork root ---
-        if rel_path.startswith(COWORK_URI_SCHEME):
-            if not rel_path.startswith(allowed_prefixes):
-                return False
-            # Resolve to absolute and validate containment against cowork root.
-            try:
-                from apm_cli.integration.copilot_cowork_paths import (
-                    from_lockfile_path,
-                    resolve_copilot_cowork_skills_dir,
-                )
+        candidate = Path(rel_path)
+        if candidate.is_absolute():
+            return _managed_absolute_target_root(candidate, targets) is not None
 
-                cowork_root = resolve_copilot_cowork_skills_dir()
-                if cowork_root is None:
-                    return False
-                # from_lockfile_path internally calls ensure_path_within.
-                from_lockfile_path(rel_path, cowork_root)
-                return True
-            except Exception:
-                return False
+        if allowed_prefixes is None:
+            allowed_prefixes = BaseIntegrator._get_integration_prefixes(targets=targets)
+
+        if rel_path.startswith(COWORK_URI_SCHEME):
+            return _validate_cowork_path(rel_path, allowed_prefixes)
 
         if not rel_path.startswith(allowed_prefixes):
             return False
@@ -491,8 +416,16 @@ class BaseIntegrator:
         # Collect unique parents (skip stop_at itself)
         candidates: set = set()
         for p in deleted_paths:
+            cleanup_boundary = stop_resolved
+            try:
+                if not p.resolve().is_relative_to(stop_resolved):
+                    cleanup_boundary = _managed_absolute_target_root(p, targets=None)
+                    if cleanup_boundary is None:
+                        cleanup_boundary = p.parent.resolve()
+            except (ValueError, OSError):
+                cleanup_boundary = p.parent.resolve()
             parent = p.parent
-            while parent != stop_at and parent.resolve() != stop_resolved:
+            while parent not in (parent.parent, stop_at) and parent.resolve() != cleanup_boundary:
                 candidates.add(parent)
                 parent = parent.parent
         # Sort deepest-first for safe bottom-up removal
@@ -569,6 +502,9 @@ class BaseIntegrator:
             if install_path.resolve() != home_root.resolve() and install_path.is_dir():
                 if narrowed_local or (len(scan_roots) == 1 and scan_roots[0] == install_path):
                     self.link_resolver.package_root = Path(install_path)
+                    self.link_resolver.deployment_package_root = Path(
+                        package_info.deployment_package_root or install_path
+                    )
         except Exception:
             self.link_resolver = None
 

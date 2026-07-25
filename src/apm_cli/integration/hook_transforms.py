@@ -55,23 +55,47 @@ _HOOK_EVENT_MAP: dict[str, dict[str, str]] = {
         "postToolUse": "AfterTool",
         "Stop": "SessionEnd",
     },
-    "kiro": {
-        # Copilot / Claude -> Kiro camelCase events
+    "copilot": {
+        # Claude PascalCase -> Copilot camelCase
         "PreToolUse": "preToolUse",
         "preToolUse": "preToolUse",
         "PostToolUse": "postToolUse",
         "postToolUse": "postToolUse",
-        "UserPromptSubmit": "promptSubmit",
-        "userPromptSubmit": "promptSubmit",
-        "promptSubmit": "promptSubmit",
-        "Stop": "agentStop",
-        "stop": "agentStop",
+        "UserPromptSubmit": "userPromptSubmit",
+        "userPromptSubmit": "userPromptSubmit",
+        "Stop": "stop",
+        "stop": "stop",
         "AgentStop": "agentStop",
         "agentStop": "agentStop",
         "PreTaskExecution": "preTaskExecution",
         "preTaskExecution": "preTaskExecution",
         "PostTaskExecution": "postTaskExecution",
         "postTaskExecution": "postTaskExecution",
+    },
+    "kiro": {
+        # Portable and legacy spellings -> Kiro v1 PascalCase triggers.
+        "PreToolUse": "PreToolUse",
+        "preToolUse": "PreToolUse",
+        "PostToolUse": "PostToolUse",
+        "postToolUse": "PostToolUse",
+        "UserPromptSubmit": "UserPromptSubmit",
+        "userPromptSubmit": "UserPromptSubmit",
+        "promptSubmit": "UserPromptSubmit",
+        "Stop": "Stop",
+        "stop": "Stop",
+        "AgentStop": "Stop",
+        "agentStop": "Stop",
+        "SessionStart": "SessionStart",
+        "sessionStart": "SessionStart",
+        "PreTaskExecution": "PreTaskExec",
+        "preTaskExecution": "PreTaskExec",
+        "PreTaskExec": "PreTaskExec",
+        "PostTaskExecution": "PostTaskExec",
+        "postTaskExecution": "PostTaskExec",
+        "PostTaskExec": "PostTaskExec",
+        "PostFileCreate": "PostFileCreate",
+        "PostFileSave": "PostFileSave",
+        "PostFileDelete": "PostFileDelete",
     },
 }
 
@@ -87,7 +111,7 @@ _HOOK_EVENT_EXPECTED_CASING: dict[str, str] = {
     "gemini": "PascalCase",
     "antigravity": "PascalCase",
     "windsurf": "PascalCase",
-    "kiro": "camelCase",
+    "kiro": "PascalCase",
 }
 
 # Mapping from hook-file stem suffix to the set of target keys that
@@ -115,7 +139,7 @@ class _MergeHookConfig:
     config_filename: str  # e.g. "settings.json" or "hooks.json"
     target_key: str  # target name passed to _rewrite_hooks_data
     require_dir: bool  # True = skip if target dir doesn't exist
-    schema_strict: bool = False  # True = strip _apm_source before writing to disk
+    schema_strict: bool = True  # Ownership always lives outside native files.
     # Top-level JSON key the merged event map lives under.  Defaults to
     # "hooks" (Claude/Cursor/Codex/Gemini/Windsurf).  Antigravity's native
     # schema keys hooks by an arbitrary hook *name*, so APM reserves the
@@ -393,48 +417,69 @@ def _reinject_apm_source_from_sidecar(hooks: dict, sidecar_data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hook file routing
+# Copilot payload validation
 # ---------------------------------------------------------------------------
 
 
-def _filter_hook_files_for_target(
-    hook_files: list[Path],
-    target_key: str,
-) -> list[Path]:
-    """Return only hook files intended for *target_key*.
-
-    Routing is based on the file stem (case-insensitive):
-      - Stems ending with a known ``-<target>-hooks`` suffix are
-        restricted to matching targets.
-      - All other stems (e.g. ``hooks``, ``my-custom-hooks``) are
-        universal and pass through for every target.
-
-    Args:
-        hook_files: All discovered hook JSON files.
-        target_key: Lowercase target name (e.g. ``"claude"``, ``"cursor"``).
-
-    Returns:
-        Filtered list preserving original order.
-    """
-    result: list[Path] = []
-    for hf in hook_files:
-        stem_lower = hf.stem.lower()
-        matched_suffix: str | None = None
-        for suffix, allowed_targets in _HOOK_FILE_TARGET_SUFFIXES.items():
-            if stem_lower == suffix or stem_lower.endswith(f"-{suffix}"):
-                matched_suffix = suffix
-                if target_key in allowed_targets:
-                    result.append(hf)
-                break
-        if matched_suffix is None:
-            # Universal file -- deploy to all targets
-            result.append(hf)
-    return result
+def _validate_copilot_payload(payload: dict) -> list[str]:
+    """Return native payload shape errors before any filesystem mutation."""
+    errors: list[str] = []
+    if payload.get("version") != 1:
+        errors.append("top-level version must equal 1")
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        return [*errors, "top-level hooks must be an object"]
+    for event, entries in hooks.items():
+        if not isinstance(entries, list):
+            errors.append(f"hook event {event!r} must contain a list")
+            continue
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                errors.append(f"hook event {event!r} entry {index} must be an object")
+                continue
+            handlers = entry.get("hooks")
+            if handlers is not None and (
+                not isinstance(handlers, list)
+                or not all(isinstance(handler, dict) for handler in handlers)
+            ):
+                errors.append(f"hook event {event!r} entry {index} handlers must be objects")
+    return errors
 
 
 # ---------------------------------------------------------------------------
 # Command path rewriting
 # ---------------------------------------------------------------------------
+
+
+def _relative_hook_script_bases(
+    package_path: Path,
+    hook_file_dir: Path | None,
+) -> list[Path]:
+    """Return candidate bases for resolving a relative hook script path."""
+    bases: list[Path] = []
+    if hook_file_dir is not None:
+        bases.append(hook_file_dir)
+    if package_path not in bases:
+        bases.append(package_path)
+    return bases
+
+
+def _resolve_relative_hook_script(
+    package_path: Path,
+    hook_file_dir: Path | None,
+    rel_path: str,
+) -> Path | None:
+    """Resolve a relative hook script path without escaping the package."""
+    last_candidate: Path | None = None
+    for base in _relative_hook_script_bases(package_path, hook_file_dir):
+        try:
+            candidate = ensure_path_within(base / rel_path, package_path)
+        except PathTraversalError:
+            continue
+        last_candidate = candidate
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return last_candidate
 
 
 def _rewrite_command_for_target(
@@ -537,17 +582,15 @@ def _rewrite_command_for_target(
     # like ".github/..." not "./" or ".\")
     # Match both forward-slash and backslash separators (Windows hook JSON
     # may use backslashes: .\scripts\scan.ps1)
-    # Resolve from hook file's directory if available, else fall back to package root
-    resolve_base = hook_file_dir if hook_file_dir else package_path
+    # Resolve from hook file context, falling back to package root.
     rel_pattern = r"(\.[\\/][^\s\"']+)"
     for match in re.finditer(rel_pattern, new_command):
         rel_ref = match.group(1)
         # Normalize to forward slashes for path resolution
         rel_path = rel_ref[2:].replace("\\", "/")
 
-        try:
-            source_file = ensure_path_within(resolve_base / rel_path, package_path)
-        except PathTraversalError:
+        source_file = _resolve_relative_hook_script(package_path, hook_file_dir, rel_path)
+        if source_file is None:
             continue
         if source_file.exists() and source_file.is_file():
             target_rel = f"{scripts_base}/{rel_path}"

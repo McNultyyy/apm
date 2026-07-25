@@ -7,12 +7,12 @@ paths stay stable while this module owns the full install flow.
 from __future__ import annotations
 
 import builtins
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from apm_cli.core.null_logger import NullCommandLogger
-from apm_cli.integration._shared import _hermes_runtime_opted_in, _runtime_opted_in
+from apm_cli.integration._shared import _hermes_runtime_opted_in as _hermes_opted_in_impl
+from apm_cli.integration._shared import _RegistryDepGroup, _runtime_opted_in
 from apm_cli.runtime.utils import find_runtime_binary
 from apm_cli.utils.console import STATUS_SYMBOLS
 
@@ -30,13 +30,14 @@ _DIR_GATED_RUNTIMES: dict[str, str] = {
 }
 
 
-@dataclass(frozen=True)
-class _RegistryDepGroup:
-    """One group of registry deps sharing a single target registry endpoint."""
+def _hermes_runtime_opted_in() -> bool:
+    """Wrapper that passes this module's find_runtime_binary so monkeypatch seams work.
 
-    deps: list
-    names: list
-    dep_map: dict
+    Tests that patch ``mcp_integrator_install.find_runtime_binary`` must call
+    this wrapper -- not ``_shared._hermes_runtime_opted_in`` directly -- so
+    the patched reference is picked up at call time.
+    """
+    return _hermes_opted_in_impl(_find_binary=find_runtime_binary)
 
 
 def _install_registry_group(
@@ -51,6 +52,7 @@ def _install_registry_group(
     verbose: bool,
     console: Any,
     logger: Any,
+    managed_target_servers: dict[str, builtins.set[str]] | None,
 ) -> int:
     """Process one group of registry deps through a single ``MCPServerOperations`` instance.
 
@@ -184,6 +186,7 @@ def _install_registry_group(
                         logger=logger,
                     ):
                         any_ok = True
+                        _record_managed_server(managed_target_servers, rt, dep)
 
                 if any_ok:
                     if console:
@@ -205,6 +208,16 @@ def _install_registry_group(
                     logger.error(f"{dep} -- failed for all runtimes")
 
     return configured_count
+
+
+def _record_managed_server(
+    managed_target_servers: dict[str, builtins.set[str]] | None,
+    runtime: str,
+    server_name: str,
+) -> None:
+    """Record a server only after APM successfully writes its target config."""
+    if managed_target_servers is not None:
+        managed_target_servers.setdefault(runtime, set()).add(server_name)
 
 
 def _discover_installed_runtimes_fallback(
@@ -370,16 +383,14 @@ def _resolve_target_runtimes(
     apm_config: dict | None,
     project_root,
     user_scope: bool,
-    explicit_target: str | None,
+    explicit_target: str | list[str] | None,
     scope: InstallScope | None,
     logger,
     console,
 ) -> list[str] | None:
     """Detect, filter, and gate the target runtimes for MCP installation.
 
-    Returns a (possibly empty) list of runtime names to target, or ``None``
-    when the caller should immediately return 0 (e.g. all runtimes excluded,
-    no user-scope-capable runtimes available).
+    Returns a list of runtime names, or ``None`` when nothing to configure.
     """
     from apm_cli.integration.mcp_integrator import MCPIntegrator
 
@@ -387,6 +398,12 @@ def _resolve_target_runtimes(
         # Single runtime mode - skip auto-discovery entirely.
         logger.progress(f"Targeting specific runtime: {runtime}")
         target_runtimes: list[str] = [runtime]
+    elif explicit_target is not None:
+        target_runtimes = (
+            [explicit_target] if isinstance(explicit_target, str) else list(explicit_target)
+        )
+        runtime_label = "runtime" if len(target_runtimes) == 1 else "runtimes"
+        logger.progress(f"Targeting specific {runtime_label}: {', '.join(target_runtimes)}")
     else:
         project_root_path = Path(project_root) if project_root is not None else Path.cwd()
 
@@ -459,12 +476,9 @@ def _install_self_defined_deps(
     verbose: bool,
     console,
     logger,
+    managed_target_servers: dict[str, builtins.set[str]] | None,
 ) -> int:
-    """Install self-defined (``registry: false``) MCP deps for all target runtimes.
-
-    Mutates ``servers_to_update`` and ``successful_updates`` in-place.
-    Returns the number of servers newly configured or updated.
-    """
+    """Install self-defined (``registry: false``) MCP deps for all target runtimes."""
     from apm_cli.integration.mcp_integrator import MCPIntegrator
 
     configured_count = 0
@@ -515,9 +529,8 @@ def _install_self_defined_deps(
         is_update = dep.name in servers_to_update
         synthetic_info = MCPIntegrator._build_self_defined_info(dep)
         self_defined_cache = {dep.name: synthetic_info}
-        self_defined_env = dep.env or {}
-
         transport_label = dep.transport or "stdio"
+        self_defined_env = {} if transport_label == "stdio" else dep.env or {}
         action_text = "Updating" if is_update else "Configuring"
         if console:
             console.print(
@@ -546,6 +559,7 @@ def _install_self_defined_deps(
                 logger=logger,
             ):
                 any_ok = True
+                _record_managed_server(managed_target_servers, rt, dep.name)
 
         if any_ok:
             if console:
@@ -592,7 +606,7 @@ def _print_mcp_summary(
         console.print(f"[green]{STATUS_SYMBOLS['success']} All servers up to date[/green]")
 
 
-def run_mcp_install(
+def run_mcp_install(  # noqa: PLR0913
     mcp_deps: list,
     runtime: str | None = None,
     exclude: str | None = None,
@@ -601,31 +615,26 @@ def run_mcp_install(
     stored_mcp_configs: dict | None = None,
     project_root=None,
     user_scope: bool = False,
-    explicit_target: str | None = None,
+    explicit_target: str | list[str] | None = None,
     logger=None,
     diagnostics=None,
     scope: InstallScope | None = None,
+    managed_target_servers: dict[str, builtins.set[str]] | None = None,
 ) -> int:
     """Install MCP dependencies.
 
     Args:
-        mcp_deps: List of MCP dependency entries (registry strings or
-            MCPDependency objects).
+        mcp_deps: MCP dependency entries (registry strings or MCPDependency objects).
         runtime: Target specific runtime only.
-        exclude: Exclude specific runtime from installation.
-        verbose: Show detailed installation information.
-        apm_config: The parsed apm.yml configuration dict (optional).
-            When not provided, this function loads ``apm.yml`` from the project
-            root if it exists.
-        stored_mcp_configs: Previously stored MCP configs from lockfile
-            for diff-aware installation.  When provided, servers whose
-            manifest config has changed are re-applied automatically.
+        exclude: Exclude specific runtime.
+        verbose: Show detailed information.
+        apm_config: Parsed apm.yml config dict (loaded from disk when None).
+        stored_mcp_configs: Lockfile MCP configs for diff-aware install.
         project_root: Project root for repo-local runtime configs.
-        user_scope: Whether runtime configuration is being resolved at user scope.
+        user_scope: Whether resolving at user scope.
         explicit_target: Explicit target selected by CLI or manifest.
-        scope: InstallScope (PROJECT or USER). When USER, only
-            runtimes whose adapter declares ``supports_user_scope``
-            are targeted; workspace-only runtimes are skipped.
+        scope: InstallScope (PROJECT or USER).
+        managed_target_servers: Mutable per-target APM ownership state.
 
     Returns:
         Number of MCP servers newly configured or updated.
@@ -703,6 +712,19 @@ def run_mcp_install(
     if target_runtimes is None:
         return 0
 
+    if managed_target_servers is not None:
+        active_targets = set(target_runtimes)
+        current_names = {
+            dep.name if hasattr(dep, "name") else dep
+            for dep in mcp_deps
+            if isinstance(dep, str) or hasattr(dep, "name")
+        }
+        for target in list(managed_target_servers):
+            if target not in active_targets:
+                del managed_target_servers[target]
+            else:
+                managed_target_servers[target].intersection_update(current_names)
+
     # Use the new registry operations module for better server detection
     configured_count = 0
 
@@ -745,6 +767,7 @@ def run_mcp_install(
                     verbose=verbose,
                     console=console,
                     logger=logger,
+                    managed_target_servers=managed_target_servers,
                 )
 
         except ImportError:
@@ -765,6 +788,7 @@ def run_mcp_install(
             verbose=verbose,
             console=console,
             logger=logger,
+            managed_target_servers=managed_target_servers,
         )
 
     # Close the panel

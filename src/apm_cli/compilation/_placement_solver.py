@@ -58,11 +58,10 @@ class _PlacementSolverMixin:
         Returns:
             List[Path]: Mathematically optimal placement(s).
         """
-        pattern = instruction.apply_to
+        pattern = instruction.apply_to.strip()
 
         # Find all directories with matching files
         matching_directories = self._find_matching_directories(pattern)
-
         if not matching_directories:
             # Smart fallback: Try to place in semantically appropriate directory
             intended_dir = self._extract_intended_directory_from_pattern(pattern)

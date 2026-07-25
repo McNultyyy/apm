@@ -71,15 +71,13 @@ def download_subdirectory_package(
 
     shared_cache = downloader.shared_clone_cache
     use_shared = shared_cache is not None
-    cache_host = dep_ref.host or _gh.default_host()
-    cache_owner = dep_ref.repo_url.split("/")[0] if "/" in dep_ref.repo_url else ""
-    cache_repo = dep_ref.repo_url.split("/")[1] if "/" in dep_ref.repo_url else dep_ref.repo_url
+    repository_url = dep_ref.to_github_url()
 
     # WS3: try persistent cross-run cache first.
     persistent_checkout: Path | None = None
     if downloader.persistent_git_cache is not None:
         persistent_checkout = _subdir_persistent_checkout(
-            downloader, dep_ref, ref, subdir_path, cache_host, cache_owner, cache_repo
+            downloader, dep_ref, ref, subdir_path, repository_url
         )
 
     state = _SubdirCloneState()
@@ -96,9 +94,7 @@ def download_subdirectory_package(
                 dep_ref,
                 ref,
                 subdir_path,
-                cache_host,
-                cache_owner,
-                cache_repo,
+                repository_url,
                 shared_cache,
                 perf_logger,
                 dep_display,
@@ -135,31 +131,23 @@ def download_subdirectory_package(
 
 
 def _subdir_persistent_checkout(
-    downloader, dep_ref, ref, subdir_path, cache_host, cache_owner, cache_repo
+    downloader, dep_ref, ref, subdir_path, repository_url
 ) -> Path | None:
     """WS3: resolve a sparse-keyed checkout from the persistent cross-run cache."""
     persistent_cache = downloader.persistent_git_cache
-    canonical_url = f"https://{cache_host}/{cache_owner}/{cache_repo}"
     try:
-        # Tiered ref resolution (#1433): resolve the ref BEFORE get_checkout so
-        # the cache skips its internal ls-remote (same pattern as the non-subdir
-        # path which passes locked_sha=resolved).
         try:
             resolved_sha = downloader.resolve_git_reference(dep_ref).resolved_commit
         except Exception:
             resolved_sha = None
-        # Sparse-cone (#1433): keying the persistent shard by (sha, subdir)
-        # ensures the cached working tree is the subdir only (<2 MB) instead of
-        # the full repo. Bare cache is unchanged so variants share object data.
         return persistent_cache.get_checkout(
-            canonical_url,
+            repository_url,
             resolved_sha or ref,
             locked_sha=resolved_sha,
-            env=downloader._git_env_dict(),
+            env=downloader._cache_git_env(dep_ref),
             sparse_paths=[subdir_path],
         )
     except Exception:
-        # Cache miss or failure -- fall through to normal clone path.
         return None
 
 
@@ -187,20 +175,13 @@ def _subdir_shared_bare_materialize(
     dep_ref,
     ref,
     subdir_path,
-    cache_host,
-    cache_owner,
-    cache_repo,
+    repository_url,
     shared_cache,
     perf_logger,
     dep_display,
     state,
 ) -> Path:
-    """WS2: share a BARE clone keyed by (host, owner, repo, ref); materialize per consumer.
-
-    The bare is subdir-agnostic, so concurrent consumers requesting different
-    subdirectories of the same repo+ref share one bare without racing on
-    sparse-checkout. Each consumer materializes its own working tree.
-    """
+    """WS2: share a BARE clone keyed by (repository URL, ref); materialize per consumer."""
     from apm_cli.deps import github_downloader as _gh
 
     from ..config import get_apm_temp_dir
@@ -223,9 +204,7 @@ def _subdir_shared_bare_materialize(
 
     try:
         shared_bare_path = shared_cache.get_or_clone(
-            cache_host,
-            cache_owner,
-            cache_repo,
+            repository_url,
             ref,
             _shared_bare_clone_fn,
             fetch_fn=_shared_bare_fetch_fn if is_commit_sha else None,
@@ -256,8 +235,7 @@ def _subdir_shared_bare_materialize(
             shared_bare_path,
             temp_clone_path,
             ref=ref,
-            env=downloader._git_env_dict(),
-            # Only short-circuit SHA resolution for a full 40-char SHA;
+            env=downloader._cache_git_env(dep_ref),
             # abbreviated SHAs must be resolved against the bare so
             # resolved_commit matches head.commit.hexsha (#1135).
             known_sha=ref if (is_commit_sha and len(ref) == 40) else None,

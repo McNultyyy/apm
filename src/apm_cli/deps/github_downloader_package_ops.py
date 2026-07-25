@@ -61,6 +61,16 @@ def download_virtual_file_package(
 
     try:
         file_content = downloader.download_raw_file(dep_ref, dep_ref.virtual_path, ref)
+        resolved_commit = resolved_commit  # unchanged on the API path
+    except _gh.GitHubThrottleError as throttle:
+        fetched = downloader._strategies.download_github_file_via_throttle_fallback(
+            dep_ref,
+            dep_ref.virtual_path,
+            ref,
+            throttle,
+        )
+        file_content = fetched.content
+        resolved_commit = fetched.resolved_commit
     except RuntimeError as e:
         raise RuntimeError(f"Failed to download virtual package: {e}") from e
 
@@ -92,7 +102,7 @@ def download_virtual_file_package(
     apm_yml_content = _gh.yaml_to_str(apm_yml_data)
 
     apm_yml_path = target_path / "apm.yml"
-    apm_yml_path.write_text(apm_yml_content, encoding="utf-8")
+    _gh.atomic_write_text(apm_yml_path, apm_yml_content)
 
     package = _gh.APMPackage(
         name=package_name,
@@ -131,7 +141,6 @@ def _virtual_subdir_for(virtual_path: str) -> str | None:
     subdirs = {
         ".prompt.md": "prompts",
         ".instructions.md": "instructions",
-        ".chatmode.md": "chatmodes",
         ".agent.md": "agents",
     }
     for ext, dir_name in subdirs.items():
@@ -343,15 +352,12 @@ def _package_try_persistent_cache(downloader, dep_ref, resolved_ref, target_path
 
     persistent_cache = downloader.persistent_git_cache
     try:
-        cache_host = dep_ref.host or _gh.default_host()
-        cache_owner = dep_ref.repo_url.split("/")[0] if "/" in dep_ref.repo_url else ""
-        cache_repo = dep_ref.repo_url.split("/")[1] if "/" in dep_ref.repo_url else dep_ref.repo_url
-        canonical_url = f"https://{cache_host}/{cache_owner}/{cache_repo}"
+        repository_url = dep_ref.to_github_url()
         cached = persistent_cache.get_checkout(
-            canonical_url,
+            repository_url,
             resolved_ref.resolved_commit or resolved_ref.ref_name,
             locked_sha=resolved_ref.resolved_commit,
-            env=downloader._git_env_dict(),
+            env=downloader._cache_git_env(dep_ref),
         )
         from ..utils.file_ops import robust_copy2, robust_copytree
 

@@ -48,6 +48,7 @@ def run_mcp_install(
     logger,
     apm_dir: Path,
     scope: str | None,
+    target: str | list[str] | None = None,
 ) -> None:
     """Execute the --mcp install path. ``registry_url`` is the validated
     --registry value; the caller resolved precedence vs MCP_REGISTRY_URL.
@@ -117,8 +118,10 @@ def run_mcp_install(
     # MCPServerOperations() (constructed deep inside MCPIntegrator.install)
     # picks up the override; prior env restored on exit.
     if APM_DEPS_AVAILABLE:
-        if registry_url and logger and verbose:
+        if registry_url and logger:
             logger.verbose_detail(f"Registry: {registry_url}")
+        if target and logger:
+            logger.verbose_detail(f"Target: {target}")
         with registry_env_override(registry_url):
             try:
                 _mcp_lock_path = get_lockfile_path(apm_dir)
@@ -127,11 +130,12 @@ def run_mcp_install(
                 old_configs = dict(_existing_lock.mcp_configs) if _existing_lock else {}
                 MCPIntegrator.install(
                     [dep],
-                    runtime,
+                    target if isinstance(target, str) else runtime,
                     exclude,
                     verbose,
                     stored_mcp_configs=old_configs,
                     scope=scope,
+                    explicit_target=target,
                 )
                 new_names = MCPIntegrator.get_server_names([dep])
                 new_configs = MCPIntegrator.get_server_configs([dep])

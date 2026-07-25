@@ -27,11 +27,29 @@ from typing import Literal, Union
 
 import click
 
+from apm_cli.core.target_catalog import (
+    TARGET_CAPABILITIES,
+    accepted_target_values,
+    expand_all,
+    get_target_capability,
+    normalize_target_name,
+    target_error_values,
+)
+
 from ._target_detection_helpers import _target_error as _target_error
 from ._target_detection_helpers import (
     can_dedup_agents_md_instructions as can_dedup_agents_md_instructions,
 )
 from ._target_detection_helpers import format_provenance as format_provenance
+from ._target_detection_helpers import (
+    get_dedup_rules_dir as get_dedup_rules_dir,
+)
+from ._target_detection_helpers import (
+    manifest_targets_from_target_option as manifest_targets_from_target_option,
+)
+from ._target_detection_helpers import (
+    normalize_policy_targets as normalize_policy_targets,
+)
 from ._target_detection_helpers import (
     should_compile_agents_md as should_compile_agents_md,
 )
@@ -213,12 +231,16 @@ def detect_target(
         canonical = _NAME_TO_CANONICAL.get(explicit_target)
         if canonical is not None:
             return canonical, "explicit --target flag"
+        if explicit_target in MCP_ONLY_TARGETS:
+            return "vscode", "explicit --target flag"
 
     # Priority 2: apm.yml target setting.
     if config_target:
         canonical = _NAME_TO_CANONICAL.get(config_target)
         if canonical is not None:
             return canonical, "apm.yml target"
+        if config_target in MCP_ONLY_TARGETS:
+            return "vscode", "apm.yml target"
 
     # Priority 3: auto-detect from existing integration folders.
     return _detect_from_folders(project_root)
@@ -245,7 +267,7 @@ def get_target_description(target: UserTargetType) -> str:
         "codex": "AGENTS.md + .agents/skills/ + .codex/agents/ + .codex/hooks.json",
         "gemini": "GEMINI.md + .gemini/commands/ + .gemini/skills/ + .gemini/settings.json (MCP/hooks)",
         "antigravity": "AGENTS.md + .agents/rules/ + .agents/skills/ + .agents/hooks.json + .agents/mcp_config.json (explicit --target only)",
-        "windsurf": "AGENTS.md + .windsurf/rules/ + .windsurf/skills/ + .windsurf/workflows/ + .windsurf/hooks.json",
+        "windsurf": "AGENTS.md + .windsurf/rules/ + .agents/skills/ + .windsurf/workflows/ + .windsurf/hooks.json",
         "kiro": "AGENTS.md + .kiro/steering/ + .kiro/skills/ + .kiro/hooks/ + .kiro/settings/mcp.json",
         "agent-skills": ".agents/skills/ only (cross-client shared skills -- no agents, hooks, or commands)",
         "openclaw": ".agents/skills/ (project) or ~/.openclaw/skills/ (--global) -- experimental",
@@ -262,16 +284,16 @@ def get_target_description(target: UserTargetType) -> str:
 
 #: The complete set of real (non-pseudo) canonical targets.
 #: "minimal" is intentionally excluded -- it is a fallback pseudo-target.
-ALL_CANONICAL_TARGETS = frozenset(
-    {"vscode", "claude", "cursor", "opencode", "codex", "gemini", "windsurf", "kiro"}
-)
+ALL_CANONICAL_TARGETS = frozenset(expand_all("install"))
 
 #: Targets that the parser must accept but that are gated at runtime by
 #: ``is_enabled()`` in ``core/experimental.py`` and ``_flag_gated()`` in
 #: ``integration/targets.py``.  They are NOT included in the
 #: ``parse_target_arg("all")`` expansion -- explicit opt-in only.
 EXPERIMENTAL_TARGETS: frozenset[str] = frozenset(
-    {"copilot-cowork", "copilot-app", "openclaw", "hermes"}
+    capability.name
+    for capability in TARGET_CAPABILITIES.values()
+    if capability.experimental_flag is not None
 )
 
 #: Stable targets excluded from "all" expansion (cross-client deploy
@@ -279,14 +301,30 @@ EXPERIMENTAL_TARGETS: frozenset[str] = frozenset(
 #: not represent a single client tool.  Antigravity is explicit-only
 #: because its workspace config lives under the SHARED ``.agents/`` root,
 #: so there is no Antigravity-unique signal to auto-detect on.
-EXPLICIT_ONLY_TARGETS: frozenset[str] = frozenset({"agent-skills", "antigravity"})
+EXPLICIT_ONLY_TARGETS: frozenset[str] = frozenset(
+    capability.name for capability in TARGET_CAPABILITIES.values() if capability.explicit_only
+)
+
+#: MCP-only pseudo-targets that have a client adapter but no
+#: ``KNOWN_TARGETS`` entry (they map to a canonical target for primitive
+#: deployment via ``RUNTIME_TO_CANONICAL_TARGET``).  They must be accepted
+#: by ``--target`` so the CLI validates them, but they are excluded from
+#: ``"all"`` expansion and do not participate in target-profile machinery.
+MCP_ONLY_TARGETS: frozenset[str] = frozenset(
+    capability.name for capability in TARGET_CAPABILITIES.values() if capability.mcp_only
+)
 
 #: Alias mapping: user-facing name -> canonical internal name.
 TARGET_ALIASES: dict[str, str] = {
-    "copilot": "vscode",
-    "agents": "vscode",
-    "vscode": "vscode",
-    "agy": "antigravity",
+    value: (
+        capability.compile_family
+        if capability.compile_family in capability.aliases
+        else capability.name
+    )
+    for capability in TARGET_CAPABILITIES.values()
+    for value in (capability.name, *capability.aliases)
+    if capability.aliases
+    and (value != capability.name or capability.compile_family in capability.aliases)
 }
 
 
@@ -318,12 +356,17 @@ def normalize_target_list(
     # "all" anywhere in the input means "every target" -- expand to the
     # full sorted list of canonical targets.
     if "all" in raw:
-        return sorted(ALL_CANONICAL_TARGETS)
+        return list(expand_all("install"))
 
     seen: set[str] = set()
     result: list[str] = []
     for item in raw:
-        canonical = TARGET_ALIASES.get(item, item)
+        capability = get_target_capability(item)
+        canonical = (
+            capability.compile_family
+            if capability.compile_family in capability.aliases
+            else normalize_target_name(item)
+        )
         if canonical not in seen:
             seen.add(canonical)
             result.append(canonical)
@@ -336,13 +379,10 @@ def normalize_target_list(
 
 #: All values accepted by the ``--target`` CLI option.
 #: Derived from canonical targets, alias keys, and the ``"all"`` keyword.
-VALID_TARGET_VALUES: frozenset[str] = (
-    ALL_CANONICAL_TARGETS
-    | EXPERIMENTAL_TARGETS
-    | EXPLICIT_ONLY_TARGETS
-    | frozenset(TARGET_ALIASES)
-    | frozenset({"all"})
-)
+VALID_TARGET_VALUES: frozenset[str] = accepted_target_values()
+
+#: Stable user-facing projection of every value accepted by ``--target``.
+TARGET_VALUES_HELP = ", ".join(sorted(accepted_target_values()))
 
 
 def parse_target_field(
@@ -431,11 +471,11 @@ def parse_target_field(
 
     # ---- validate every token ----
     for p in raw_parts:
-        if p not in VALID_TARGET_VALUES:
+        if p not in accepted_target_values():
             raise ValueError(
                 _target_error(
                     f"'{p}' is not a valid target. "
-                    f"Choose from: {', '.join(sorted(VALID_TARGET_VALUES))}",
+                    f"Choose from: {', '.join(sorted(accepted_target_values()))}",
                     source_path,
                 )
             )
@@ -454,7 +494,7 @@ def parse_target_field(
     # ---- "all" handling ----
     if "all" in raw_parts:
         non_all_tokens = {t for t in raw_parts if t != "all"}
-        if non_all_tokens - EXPLICIT_ONLY_TARGETS:
+        if non_all_tokens - EXPLICIT_ONLY_TARGETS - MCP_ONLY_TARGETS:
             raise ValueError(
                 _target_error(
                     "'all' cannot be combined with other targets",
@@ -465,7 +505,7 @@ def parse_target_field(
             return "all"
         # "all" + explicit-only tokens (e.g. "all,agent-skills"):
         # expand "all" to canonical targets and append the explicit-only ones.
-        expanded = sorted(ALL_CANONICAL_TARGETS) + sorted(non_all_tokens)
+        expanded = list(expand_all("install")) + sorted(non_all_tokens)
         return expanded
 
     # Single-token input is returned as-is (no alias resolution).  This
@@ -485,7 +525,12 @@ def parse_target_field(
     seen: set[str] = set()
     result: list[str] = []
     for p in raw_parts:
-        canonical = TARGET_ALIASES.get(p, p)
+        capability = get_target_capability(p)
+        canonical = (
+            capability.compile_family
+            if capability.compile_family in capability.aliases
+            else normalize_target_name(p)
+        )
         if canonical not in seen:
             seen.add(canonical)
             result.append(canonical)
@@ -524,13 +569,17 @@ class TargetParamType(click.ParamType):
             # Use the v2 three-section error renderer for unknown targets
             # so that CLI, apm.yml, and auto-detect all share the same
             # error format (#1154).
-            from apm_cli.core.apm_yml import CANONICAL_TARGETS
             from apm_cli.core.errors import UnknownTargetError, render_unknown_target_error
 
             err_msg = str(e)
             if "is not a valid target" in err_msg:
                 target_name = value if isinstance(value, str) else ",".join(value or [])
-                rendered = render_unknown_target_error(target_name, sorted(CANONICAL_TARGETS))
+                command = ctx.command.name if ctx is not None and ctx.command.name else "install"
+                rendered = render_unknown_target_error(
+                    target_name,
+                    list(target_error_values(command)),
+                    command=command,
+                )
                 raise UnknownTargetError(rendered) from None
             # Click idiom: route validation errors through self.fail so the
             # user sees a clean "Invalid value for '--target': ..." message
@@ -648,10 +697,17 @@ def resolve_targets(
     *,
     flag: str | list[str] | None = None,
     yaml_targets: list[str] | None = None,
+    flag_source: str = "--target flag",
 ) -> ResolvedTargets:
     """Resolve effective targets. Raises on error.
 
     Priority: flag > yaml_targets > auto-detect signals.
+
+    ``flag_source`` labels the provenance reported when ``flag`` wins. It
+    defaults to ``"--target flag"`` (an explicit CLI selector) but callers
+    pass a different label -- e.g. ``"apm config target"`` -- when the flag
+    value originated from a configured default rather than the CLI, so the
+    provenance line does not misattribute a config default to ``--target``.
     """
     from apm_cli.core.errors import (
         AmbiguousHarnessError,
@@ -666,7 +722,7 @@ def resolve_targets(
         _validate_canonical_v2(tokens)
         return ResolvedTargets(
             targets=sorted(tokens),
-            source="--target flag",
+            source=flag_source,
             auto_create=True,
         )
 

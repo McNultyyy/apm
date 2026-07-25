@@ -12,7 +12,7 @@ explicitly. Instructions shape *how* the model behaves on any given
 file. Agents shape *who* the model becomes when summoned.
 
 Reach across harnesses differs and matters when you choose. See
-[Primitives and targets](../../concepts/primitives-and-targets/)
+[Primitives and targets](../../../concepts/primitives-and-targets/)
 for the full matrix; the gist is below.
 
 ## Instructions
@@ -70,9 +70,10 @@ applyTo:
   - "**/*.py"
 ```
 
-When a YAML sequence contains multiple patterns, APM uses the first
-pattern and ignores the rest (single-pattern limitation of downstream
-consumers). Prefer the comma-separated string form for multiple globs.
+When a YAML sequence contains multiple patterns, APM preserves the full
+sequence for targets whose native rule format supports multiple globs.
+Prefer the comma-separated string form when you want identical output
+across every target.
 
 ```markdown
 ---
@@ -82,8 +83,9 @@ applyTo: "**/*.{css,scss},**/*.tsx"
 ```
 
 On Copilot the comma-list is preserved verbatim (Copilot splits it
-natively). On Claude, Cursor, Windsurf, and Kiro the list is expanded to a
-YAML array under `paths:` / `globs:` / `fileMatchPattern:`.
+natively). On Claude, Cursor, Windsurf, Kiro, and Antigravity the list is
+expanded to a YAML array under `paths:` / `globs:` /
+`fileMatchPattern:`.
 
 ### Body conventions
 
@@ -104,6 +106,7 @@ YAML array under `paths:` / `globs:` / `fileMatchPattern:`.
 | cursor | `.cursor/rules/<name>.mdc` | `applyTo` -> `globs:` (scalar for single glob, YAML array for comma-lists); description auto-derived if missing |
 | windsurf | `.windsurf/rules/<name>.md` | `applyTo` -> `trigger: glob` + `globs:` (scalar or YAML array); missing `applyTo` -> `trigger: always_on` |
 | kiro | `.kiro/steering/<name>.md` | `applyTo` -> `inclusion: fileMatch` + `fileMatchPattern:`; missing `applyTo` -> `inclusion: always` |
+| antigravity | `.agents/rules/<name>.md` | `applyTo` -> `trigger: glob` + `globs:` (scalar or YAML array); missing `applyTo` -> no frontmatter (unconditional rule) |
 | codex | folded into `AGENTS.md` | compile-only, no per-file deploy |
 | gemini | folded into `GEMINI.md` | compile-only, no per-file deploy |
 | opencode | folded into `AGENTS.md` | compile-only, no per-file deploy |
@@ -128,9 +131,7 @@ my-package/
       migration-assistant.agent.md
 ```
 
-File names end in `.agent.md`. APM also accepts `.chatmode.md` and the
-legacy `.apm/chatmodes/` directory for backward compatibility; new
-work should use `.agent.md` under `.apm/agents/`.
+File names end in `.agent.md` and live under `.apm/agents/`.
 
 ### Frontmatter
 
@@ -158,9 +159,15 @@ for...
 | `handoffs` | optional | List of agent names (or VS Code structured handoff objects) this agent can hand off to |
 
 `model` and `tools` reach Copilot, Claude, Cursor, and OpenCode
-verbatim. Codex receives a TOML translation. Windsurf and Gemini do
-not receive `.agent.md` files at all -- Cascade auto-invokes any
-`SKILL.md` by its description, and Gemini CLI has no agents primitive.
+verbatim. Codex translates only `name`, `description`, and the Markdown
+body; APM does not yet generate the complete per-agent MCP transport
+definitions needed to preserve `model` or `tools`. When `tools` is
+present, `apm install` warns that the generated agent may inherit every
+project or session MCP server. Remove `tools` if unrestricted access is
+intentional; otherwise, do not use the generated agent with Codex.
+Windsurf, Kiro, and Gemini do not receive `.agent.md` files at all --
+use skills for Windsurf or Kiro personas; Gemini CLI has no agents
+primitive.
 
 OpenCode is the strictest of the verbatim targets: it requires
 `tools` as a `tool-name: boolean` **mapping** (not a list, not a
@@ -191,7 +198,7 @@ offending package and field so you can fix the source.
 | claude | `.claude/agents/<name>.md` | verbatim |
 | cursor | `.cursor/agents/<name>.md` | verbatim |
 | opencode | `.opencode/agents/<name>.md` | verbatim |
-| codex | `.codex/agents/<name>.toml` | YAML frontmatter -> TOML; body becomes `developer_instructions` |
+| codex | `.codex/agents/<name>.toml` | `name` and `description` -> TOML; body becomes `developer_instructions`; unsupported `tools` emits a warning |
 | windsurf | not deployed | Windsurf has no agents primitive -- author personas as skills (Cascade auto-invokes by description) |
 | kiro | not deployed | Kiro target v1 ships personas as skills, not `.agent.md` files |
 | gemini | not deployed | Gemini CLI has no agents primitive |
@@ -266,7 +273,7 @@ apm preview <script>             # if the agent is wired to a script
 ```
 
 For the full primitive catalogue and target matrix, see
-[Primitives and targets](../../concepts/primitives-and-targets/).
+[Primitives and targets](../../../concepts/primitives-and-targets/).
 For prompts and slash-commands, see
-[Prompts](./prompts/). For packing and publishing, see
-[Pack a bundle](../pack-a-bundle/).
+[Prompts](../prompts/). For packing and publishing, see
+[Pack a bundle](../../pack-a-bundle/).
