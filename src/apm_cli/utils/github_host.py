@@ -4,6 +4,15 @@ import os
 import re
 import urllib.parse
 
+from ._github_host_ado_urls import (
+    build_ado_api_url as build_ado_api_url,
+)
+from ._github_host_ado_urls import (
+    build_ado_ssh_url as build_ado_ssh_url,
+)
+from ._github_host_ado_urls import (
+    parse_ado_repo_url as parse_ado_repo_url,
+)
 from ._github_host_artifactory import (
     build_artifactory_archive_url as build_artifactory_archive_url,
 )
@@ -477,6 +486,12 @@ def build_authorization_header_git_env(scheme: str, credential: str) -> dict:
     Note:
         Callers MUST NOT log the returned dict.  ``GIT_CONFIG_VALUE_0``
         contains the credential.
+
+    Warning:
+        Do NOT dict-merge this overlay onto an env that may already carry
+        indexed ``GIT_CONFIG_*`` entries -- the hardcoded count resets the
+        set and clobbers index 0 (#2368).  Use
+        :func:`set_authorization_header_git_env` for that case.
     """
     return {
         "GIT_CONFIG_COUNT": "1",
@@ -501,6 +516,87 @@ def build_ado_bearer_git_env(bearer_token: str) -> dict:
         dict: env-var overlay for the spawned git subprocess.
     """
     return build_authorization_header_git_env("Bearer", bearer_token)
+
+
+def set_authorization_header_git_env(env: dict[str, str], scheme: str, credential: str) -> None:
+    """Make ``Authorization: <scheme> <credential>`` the sole auth header in *env*.
+
+    :func:`build_authorization_header_git_env` returns an overlay whose
+    ``GIT_CONFIG_COUNT`` is hardcoded to ``"1"``.  Dict-merging that overlay
+    onto a base env that already carries indexed git config entries
+    (``GIT_CONFIG_COUNT=N`` with keys ``0..N-1``) resets the count and
+    overwrites index 0, silently dropping non-auth entries such as
+    ``safe.bareRepository=explicit`` or ``http.sslCAInfo`` (#2368).
+
+    This helper instead rewrites the indexed set in place: existing
+    auth-channel entries (any ``*extraheader*`` key, or a value that IS an
+    ``Authorization:`` header -- the same policy as
+    ``AuthResolver._clear_git_auth_env``) are removed so layered callers
+    cannot stack duplicate Authorization headers, every other entry is
+    preserved, and the new header is appended at the end.  Orphaned
+    ``GIT_CONFIG_KEY_/VALUE_`` entries at or beyond the count are also
+    dropped so no stale credential lingers in the child-process env table.
+
+    Note:
+        The retain/reindex predicate below intentionally mirrors
+        ``AuthResolver._clear_git_auth_env`` (``core/auth.py``) rather than
+        delegating to a shared primitive.  Extracting a single owner (e.g.
+        ``utils/git_env.py``) is the right end state -- see PR discussion on
+        #2368 and follow-up #2398 -- but doing so means editing
+        ``_clear_git_auth_env``, a security-critical function this bug does
+        not otherwise touch, which deserves its own focused security review
+        rather than riding along in this fix.
+        TODO(#2398): extract a shared ``_is_auth_channel_entry`` /
+        retain-reindex helper into ``utils/git_env.py``, and delegate both
+        this function and ``AuthResolver._clear_git_auth_env`` to it.
+
+    Args:
+        env: The subprocess env dict to mutate (base env already merged in).
+        scheme: HTTP auth scheme, e.g. ``"Bearer"`` or ``"Basic"``.
+        credential: The credential value (token or base64-encoded user:pass).
+
+    Raises:
+        ValueError: If *scheme* or *credential* contains a carriage-return
+            or newline, which would let the appended git-config value smuggle
+            a second config entry or header (defense-in-depth; no known
+            caller in this codebase can trigger this today).
+
+    Note:
+        Callers MUST NOT log *env* afterwards.  The appended
+        ``GIT_CONFIG_VALUE_N`` contains the credential.
+    """
+    if "\r" in scheme or "\n" in scheme or "\r" in credential or "\n" in credential:
+        raise ValueError("scheme and credential must not contain CR or LF")
+    try:
+        count = max(0, int(env.get("GIT_CONFIG_COUNT", "0") or "0"))
+    except ValueError:
+        count = 0
+    retained: list[tuple[str, str]] = []
+    for index in range(count):
+        key = env.get(f"GIT_CONFIG_KEY_{index}", "")
+        value = env.get(f"GIT_CONFIG_VALUE_{index}", "")
+        if "extraheader" in key.lower() or value.strip().lower().startswith("authorization:"):
+            continue
+        if key:
+            retained.append((key, value))
+    for key in tuple(env):
+        if key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            env.pop(key, None)
+    retained.append(("http.extraheader", f"Authorization: {scheme} {credential}"))
+    env["GIT_CONFIG_COUNT"] = str(len(retained))
+    for index, (key, value) in enumerate(retained):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+
+
+def set_ado_bearer_git_env(env: dict[str, str], bearer_token: str) -> None:
+    """Set an ADO AAD bearer Authorization header on *env* in place.
+
+    In-place variant of :func:`build_ado_bearer_git_env`; see
+    :func:`set_authorization_header_git_env` for why rewriting (rather
+    than dict-merging) the ``GIT_CONFIG_*`` set matters.
+    """
+    set_authorization_header_git_env(env, "Bearer", bearer_token)
 
 
 # Single source of truth for the ADO auth-failure signal set.
@@ -591,110 +687,6 @@ def is_ssh_auth_failure_signal(text: str | None) -> bool:
         return False
     lowered = text.lower()
     return any(signal in lowered for signal in _SSH_AUTH_FAILURE_SIGNALS)
-
-
-def build_ado_ssh_url(org: str, project: str, repo: str, host: str = "ssh.dev.azure.com") -> str:
-    """Build Azure DevOps SSH clone URL for cloud or server.
-
-    For Azure DevOps Services (cloud):
-        git@ssh.dev.azure.com:v3/{org}/{project}/{repo}
-
-    For Azure DevOps Server (on-premises):
-        ssh://git@{host}/{org}/{project}/_git/{repo}
-
-    Args:
-        org: Azure DevOps organization name
-        project: Azure DevOps project name
-        repo: Repository name
-        host: SSH host (default: ssh.dev.azure.com for cloud; set to your server for on-prem)
-
-    Returns:
-        str: SSH clone URL for Azure DevOps
-    """
-    quoted_project = urllib.parse.quote(project, safe="")
-    if host == "ssh.dev.azure.com":
-        # Cloud format
-        return f"git@ssh.dev.azure.com:v3/{org}/{quoted_project}/{repo}"
-    else:
-        # Server format (user@host is optional, but commonly 'git@host')
-        return f"ssh://git@{host}/{org}/{quoted_project}/_git/{repo}"
-
-
-def build_ado_api_url(
-    org: str, project: str, repo: str, path: str, ref: str = "main", host: str = "dev.azure.com"
-) -> str:
-    """Build Azure DevOps REST API URL for file contents.
-
-    API format: https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/items
-
-    Args:
-        org: Azure DevOps organization name
-        project: Azure DevOps project name
-        repo: Repository name
-        path: Path to file within the repository
-        ref: Git reference (branch, tag, or commit). Defaults to "main"
-        host: Azure DevOps host (default: dev.azure.com)
-
-    Returns:
-        str: API URL for retrieving file contents
-    """
-    api_host = "dev.azure.com" if host == "ssh.dev.azure.com" else host
-    encoded_path = urllib.parse.quote(path, safe="")
-    quoted_org = urllib.parse.quote(org, safe="")
-    quoted_project = urllib.parse.quote(project, safe="")
-    quoted_repo = urllib.parse.quote(repo, safe="")
-    quoted_ref = urllib.parse.quote(ref, safe="")
-    org_path = "" if is_visualstudio_legacy_hostname(api_host) else f"{quoted_org}/"
-    return (
-        f"https://{api_host}/{org_path}{quoted_project}/_apis/git/repositories/{quoted_repo}/items"
-        f"?path={encoded_path}&versionDescriptor.version={quoted_ref}&api-version=7.0"
-    )
-
-
-def parse_ado_repo_url(url: str | None) -> tuple[str, str, str] | None:
-    """Decompose an Azure DevOps repo URL into ``(org, project, repo)``.
-
-    Accepts the standard ``_git`` clone shape on both ADO hostnames:
-
-    - ``https://dev.azure.com/{org}/{project}/_git/{repo}`` (org in path)
-    - ``https://{org}.visualstudio.com/{project}/_git/{repo}`` (org in subdomain)
-
-    A trailing ``.git`` and any segments after ``{repo}`` are ignored. Path
-    segments are percent-decoded. Returns ``None`` when the URL is not an ADO
-    host, lacks the ``_git`` marker, or cannot be decomposed.
-    """
-    if not url:
-        return None
-    try:
-        parsed = urllib.parse.urlsplit(url)
-    except ValueError:
-        return None
-    hostname = parsed.hostname or ""
-    if not is_azure_devops_hostname(hostname):
-        return None
-
-    path = parsed.path.strip("/")
-    if path.endswith(".git"):
-        path = path[: -len(".git")]
-    segments = [urllib.parse.unquote(s) for s in path.split("/") if s]
-    if "_git" not in segments:
-        return None
-    git_idx = segments.index("_git")
-    if git_idx + 1 >= len(segments):
-        return None
-    repo = segments[git_idx + 1]
-    before = segments[:git_idx]
-
-    if is_visualstudio_legacy_hostname(hostname):
-        # Legacy ``*.visualstudio.com``: org lives in the subdomain.
-        org, project = hostname.split(".")[0], (before[-1] if before else "")
-    else:
-        # ``dev.azure.com``: org and project both precede ``_git``.
-        org, project = (before[0], before[1]) if len(before) >= 2 else ("", "")
-
-    if not (org and project and repo):
-        return None
-    return org, project, repo
 
 
 def is_valid_fqdn(hostname: str) -> bool:

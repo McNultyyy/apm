@@ -43,14 +43,11 @@ def download_github_file(
     # Parse owner/repo from repo_url
     owner, repo = dep_ref.repo_url.split("/", 1)
 
-    # Resolve token via AuthResolver for CDN fast-path decision
-    org = None
-    if dep_ref and dep_ref.repo_url:
-        parts = dep_ref.repo_url.split("/")
-        if parts:
-            org = parts[0]
-    file_ctx = delegate._host.auth_resolver.resolve(host, org, port=dep_ref.port)
-    token = file_ctx.token
+    # Resolve auth once through the same per-dependency boundary used by
+    # clone URLs. Generic hosts intentionally return None here so APM
+    # does not attach managed PATs to ad-hoc HTTP requests.
+    file_ctx = delegate._host._resolve_dep_auth_ctx(dep_ref)
+    token = file_ctx.token if file_ctx else None
 
     # --- CDN fast-path for github.com without a token ---
     if host.lower() == "github.com" and not token:
@@ -117,16 +114,18 @@ def _gh_generic_raw_attempt(
         verbose_callback(f"Trying raw URL on generic host {host}: {raw_url}")
     try:
         response = delegate._host._resilient_get(raw_url, headers=raw_headers, timeout=30)
-        if response.status_code == 200:
-            if verbose_callback:
-                verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
-            return response.content
     except (requests.RequestException, OSError) as raw_err:
+        raise RuntimeError(
+            delegate._build_download_network_error(host, file_path, "raw URL", raw_err)
+        ) from raw_err
+    if response.status_code == 200:
         if verbose_callback:
-            verbose_callback(
-                f"Raw URL on {host} failed for {file_path}@{ref}: "
-                f"{type(raw_err).__name__}; falling back to Contents API."
-            )
+            verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
+        return response.content
+    if response.status_code != 404:
+        raise RuntimeError(
+            delegate._build_download_http_error(host, file_path, response.status_code, "raw URL")
+        )
     return None
 
 
@@ -204,9 +203,15 @@ def _gh_contents_api(
                 is_github_host,
                 verbose_callback,
             )
-        raise RuntimeError(f"Failed to download {file_path}: HTTP {e.response.status_code}") from e
+        raise RuntimeError(
+            delegate._build_download_http_error(
+                host, file_path, e.response.status_code, "Contents API"
+            )
+        ) from e
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Network error downloading {file_path}: {e}")  # noqa: B904
+        raise RuntimeError(
+            delegate._build_download_network_error(host, file_path, "Contents API", e)
+        ) from e
 
 
 def _gh_handle_404(
@@ -236,10 +241,15 @@ def _gh_handle_404(
                 verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
             return delegate._extract_contents_api_payload(candidate_resp, is_github_host)
         except requests.exceptions.HTTPError as ce:
-            if ce.response.status_code != 404:
+            status = ce.response.status_code if ce.response is not None else "unknown"
+            if status != 404:
                 raise RuntimeError(  # noqa: B904
-                    f"Failed to download {file_path}: HTTP {ce.response.status_code}"
+                    delegate._build_download_http_error(host, file_path, status, "Contents API")
                 )
+        except requests.exceptions.RequestException as ce:
+            raise RuntimeError(  # noqa: B904
+                delegate._build_download_network_error(host, file_path, "Contents API", ce)
+            )
 
     # Try fallback branches if the specified ref fails
     if ref not in ["main", "master"]:
@@ -278,8 +288,14 @@ def _gh_handle_404(
                     raise _throttle from fe
             if fe.response.status_code != 404:
                 raise RuntimeError(  # noqa: B904
-                    f"Failed to download {file_path}: HTTP {fe.response.status_code}"
+                    delegate._build_download_http_error(
+                        host, file_path, fe.response.status_code, "Contents API"
+                    )
                 )
+        except requests.exceptions.RequestException as fe:
+            raise RuntimeError(  # noqa: B904
+                delegate._build_download_network_error(host, file_path, "Contents API", fe)
+            )
 
     raise RuntimeError(
         delegate._build_unsupported_or_missing_error(
@@ -333,18 +349,21 @@ def _download_github_file_via_git_impl(
 ):
     """Fetch a GitHub virtual file via sparse-Git transport (throttle fallback path)."""
     from apm_cli.deps import download_strategies as _ds
-    from apm_cli.utils.github_host import build_authorization_header_git_env
+    from apm_cli.utils.github_host import set_authorization_header_git_env
 
     key = delegate._git_file_transport_key(dep_ref, ref)
     auth_ctx = delegate._host.auth_resolver.resolve_for_dep(dep_ref)
     if auth_ctx.token:
-        git_env = {
-            **auth_ctx.git_env,
-            **build_authorization_header_git_env("Bearer", auth_ctx.token),
-        }
+        # AuthResolver owns credential resolution. Convert its resolved
+        # GitHub credential into Git's header channel so the token remains
+        # out of the remote URL and is actually consumed by git.
+        git_env = dict(auth_ctx.git_env)
+        set_authorization_header_git_env(git_env, "Bearer", auth_ctx.token)
         git_env.pop("GIT_TOKEN", None)
         auth_scheme = "basic"
     else:
+        # Public repositories use normal non-interactive Git. Do not
+        # inherit an unrelated downloader token into this fallback.
         git_env = delegate._host._build_noninteractive_git_env()
         auth_scheme = "basic"
 
@@ -466,13 +485,22 @@ def _gh_auth_failed_msg(
     """Build the auth-failure error message for a GitHub 401/403."""
     error_msg = f"Authentication failed for {dep_ref.repo_url} (file: {file_path}, ref: {ref}). "
     if not token:
-        error_msg += delegate._host.auth_resolver.build_error_context(
-            host,
-            "download",
-            org=owner,
-            port=dep_ref.port if dep_ref else None,
-            dep_url=dep_ref.repo_url if dep_ref else None,
-        )
+        if is_github_host:
+            error_msg += delegate._host.auth_resolver.build_error_context(
+                host,
+                "download",
+                org=owner,
+                port=dep_ref.port if dep_ref else None,
+                dep_url=dep_ref.repo_url if dep_ref else None,
+            )
+        else:
+            error_msg += (
+                "No APM-managed token was sent for generic host file download. "
+                "Use a whole-repo git dependency for full clone auth support. "
+                "For platform-specific HTTP file reads, use object-form type: gitlab "
+                f"for GitLab-compatible hosts or set GITHUB_HOST={host} for GitHub "
+                "Enterprise Server. Re-run with --verbose to see attempted URLs."
+            )
     elif is_github_host and not host.lower().endswith(".ghe.com"):
         error_msg += (
             "Both authenticated and unauthenticated access were attempted. "
@@ -490,4 +518,6 @@ def _gh_auth_failed_msg(
             f"GITHUB_APM_PAT_<ORG> env var, or GITHUB_HOST={host} when this "
             "host is your GitHub Enterprise Server."
         )
+    if is_github_host:
+        error_msg += " Re-run with --verbose to see attempted URLs."
     return error_msg

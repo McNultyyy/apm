@@ -50,24 +50,14 @@ marketplace:
         assert parsed.path == "/contoso/platform/_git/my-package"
         assert parsed.username is None
         env = kwargs["env"]
-        # The env may contain inherited non-auth GIT_CONFIG entries (e.g.
-        # safe.bareRepository, credential.interactive) retained from the
-        # host process by _clear_git_auth_env.  Assert on the SUBSTANCE:
-        # an Authorization: Bearer header exists at SOME index within the
-        # config, not at a fixed position.
-        count = int(env.get("GIT_CONFIG_COUNT", "0"))
-        assert count >= 1, "expected at least one GIT_CONFIG entry"
-        auth_found = False
-        for i in range(count):
-            if (
-                env.get(f"GIT_CONFIG_KEY_{i}") == "http.extraheader"
-                and env.get(f"GIT_CONFIG_VALUE_{i}") == f"Authorization: Bearer {bearer}"
-            ):
-                auth_found = True
-                break
-        assert auth_found, (
-            f"no GIT_CONFIG entry with Authorization: Bearer header found in indices 0..{count - 1}"
-        )
+        # Header index is not fixed (#2368: appended after retained entries),
+        # so locate it instead of assuming slot 0.
+        headers = [
+            (env[f"GIT_CONFIG_KEY_{i}"], v)
+            for i in range(int(env["GIT_CONFIG_COUNT"]))
+            if "Authorization" in (v := env[f"GIT_CONFIG_VALUE_{i}"])
+        ]
+        assert headers == [("http.extraheader", f"Authorization: Bearer {bearer}")]
         return subprocess.CompletedProcess(
             command,
             0,

@@ -31,6 +31,8 @@ from ..utils.github_host import (
     default_host,
     is_ado_auth_failure_signal,
     is_azure_devops_hostname,
+    set_ado_bearer_git_env,
+    set_authorization_header_git_env,
 )
 from ._git_utils import redact_token as _redact_token
 from .errors import GitLsRemoteError, OfflineMissError
@@ -153,26 +155,6 @@ class RefCache:
 # ---------------------------------------------------------------------------
 # Resolver
 # ---------------------------------------------------------------------------
-
-
-def _append_git_config_entry(env: dict, key: str, value: str) -> None:
-    """Append a GIT_CONFIG_KEY/VALUE entry without clobbering existing entries.
-
-    ``_clear_git_auth_env`` deliberately retains non-auth config inherited from
-    the parent process (e.g. ``safe.bareRepository=explicit``,
-    ``credential.interactive=never`` injected by the Copilot CLI host).
-    Naively calling ``env.update(build_ado_bearer_git_env(...))`` would overwrite
-    ``GIT_CONFIG_COUNT`` to 1 and clobber those retained entries.  This helper
-    appends at the next available index and increments COUNT, preserving
-    everything ``_clear_git_auth_env`` intentionally kept.
-    """
-    try:
-        count = int(env.get("GIT_CONFIG_COUNT", "0") or "0")
-    except ValueError:
-        count = 0
-    env["GIT_CONFIG_COUNT"] = str(count + 1)
-    env[f"GIT_CONFIG_KEY_{count}"] = key
-    env[f"GIT_CONFIG_VALUE_{count}"] = value
 
 
 def _parse_ls_remote_output(output: str) -> list[RemoteRef]:
@@ -362,10 +344,11 @@ class RefResolver:
             # self._git_env from AuthContext); just ensure GIT_TOKEN is absent
             # so the JWT never leaks into the child-process env table.
             env.pop("GIT_TOKEN", None)
+            set_ado_bearer_git_env(env, self._token)
         elif ado_host and url_token:
             # ADO PAT via Basic header -- append to retained config entries.
             credential = base64.b64encode(f":{url_token}".encode()).decode()
-            _append_git_config_entry(env, "http.extraheader", f"Authorization: Basic {credential}")
+            set_authorization_header_git_env(env, "Basic", credential)
         return url, env
 
     def list_remote_refs(
@@ -493,9 +476,7 @@ class RefResolver:
                 dict(self._git_env) if self._git_env is not None else AuthResolver._build_git_env()
             )
             AuthResolver._clear_git_auth_env(bearer_env)
-            _append_git_config_entry(
-                bearer_env, "http.extraheader", f"Authorization: Bearer {bearer}"
-            )
+            set_ado_bearer_git_env(bearer_env, bearer)
             bearer_env["GIT_TERMINAL_PROMPT"] = "0"
             bearer_env["GIT_ASKPASS"] = "echo"
             resolver = RefResolver(
