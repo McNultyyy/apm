@@ -161,8 +161,7 @@ def get_latest_version_from_github(
     """
     pinned = _get_air_gap_version()
     if pinned is not None:
-        tag = pinned.lstrip("v")
-        return tag if re.match(r"^\d+\.\d+\.\d+(a\d+|b\d+|rc\d+)?$", tag) else None
+        return _normalize_release_tag(pinned)
 
     try:
         import requests
