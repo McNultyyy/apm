@@ -30,7 +30,12 @@ def write_mcp_state(
     mcp_config_provenance: builtins.dict | None = None,
     logger: CommandLogger | None = None,
 ) -> None:
-    """Persist the current set of APM-managed MCP servers to the lockfile."""
+    """Persist the current set of APM-managed MCP servers to the lockfile.
+
+    Raises:
+        LockfileFormatError: If the existing lockfile is malformed.
+        OSError: If the atomic lockfile write fails.
+    """
     import apm_cli.integration.mcp_integrator as _mi
 
     if lock_path is None:
@@ -71,13 +76,13 @@ def write_mcp_state(
         lockfile.save(lock_path)
     except Exception:
         _mi._log.debug(
-            "Failed to update MCP servers in lockfile at %s",
+            "MCP lockfile persistence failed at %s",
             lock_path,
             exc_info=True,
         )
         if creating:
             _warn_create_failed(lock_path, logger)
-            raise
+        raise
 
 
 def _apply_mcp_state(

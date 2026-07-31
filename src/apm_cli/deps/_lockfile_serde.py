@@ -83,9 +83,23 @@ def _validate_lockfile_container(data: object) -> dict[str, Any]:
         if not isinstance(dependency, dict):
             raise LockfileFormatError(f"Lockfile dependency at index {index} must be a mapping")
     for target, servers in (data.get("mcp_target_servers") or {}).items():
-        if not isinstance(target, str) or not isinstance(servers, list):
+        if not isinstance(target, str) or not target or not isinstance(servers, list):
             raise LockfileFormatError(
                 "Lockfile mcp_target_servers values must be string-to-list mappings"
+            )
+        if not all(isinstance(server, str) and bool(server) for server in servers):
+            raise LockfileFormatError("Lockfile mcp_target_servers entries must be strings")
+    for server, provenance in (data.get("mcp_config_provenance") or {}).items():
+        if not isinstance(server, str) or not (
+            (isinstance(provenance, str) and bool(provenance))
+            or (
+                isinstance(provenance, list)
+                and bool(provenance)
+                and all(isinstance(owner, str) and bool(owner) for owner in provenance)
+            )
+        ):
+            raise LockfileFormatError(
+                "Lockfile mcp_config_provenance values must be strings or string lists"
             )
     if "deployments" in data:
         from ..core.deployment_ledger import DeploymentLedgerCodec
@@ -95,6 +109,16 @@ def _validate_lockfile_container(data: object) -> dict[str, Any]:
         except ValueError as exc:
             raise LockfileFormatError(str(exc)) from exc
     return data
+
+
+def _normalized_mcp_provenance(
+    provenance: dict[str, str | list[str]],
+) -> dict[str, str | list[str]]:
+    """Return deterministic MCP provenance with list-valued owners sorted."""
+    return {
+        server: sorted(owners) if isinstance(owners, list) else owners
+        for server, owners in sorted(provenance.items())
+    }
 
 
 def _normalize_exec_status(raw: Any) -> str | None:

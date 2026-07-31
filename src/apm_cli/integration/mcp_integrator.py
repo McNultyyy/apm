@@ -603,7 +603,12 @@ class MCPIntegrator:
         mcp_config_provenance: builtins.dict | None = None,
         logger: CommandLogger | None = None,
     ) -> None:
-        """Update the lockfile with the current set of APM-managed MCP server names."""
+        """Update the lockfile with the current set of APM-managed MCP server names.
+
+        Raises:
+            LockfileFormatError: If the existing lockfile is malformed.
+            OSError: If the atomic lockfile write fails.
+        """
         from apm_cli.integration.mcp_lockfile_state import write_mcp_state
 
         write_mcp_state(

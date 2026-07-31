@@ -26,6 +26,7 @@ from ._lockfile_serde import (
     _dedupe_preserving_order,
     _normalize_exec_status,  # noqa: F401 -- re-exported for test seam
     _normalize_lockfile_host_type,  # noqa: F401 -- re-exported for test seam
+    _normalized_mcp_provenance,
     _validate_lockfile_container,
     locked_dependency_from_dict,
     locked_dependency_from_ref,
@@ -361,7 +362,7 @@ class LockFile:
     # ``resolved_by is None`` convention). Kept OUT of ``mcp_configs`` values so
     # it never pollutes config comparisons. Consistency diagnostics use this as
     # ownership context only; provenance never exempts a lock-only server.
-    mcp_config_provenance: dict[str, str] = field(default_factory=dict)
+    mcp_config_provenance: dict[str, str | list[str]] = field(default_factory=dict)
     lsp_servers: list[str] = field(default_factory=list)
     lsp_configs: dict[str, dict] = field(default_factory=dict)
     local_deployed_files: list[str] = field(default_factory=list)
@@ -469,7 +470,9 @@ class LockFile:
                     for target, servers in sorted(self.mcp_target_servers.items())
                 }
             if self.mcp_config_provenance:
-                data["mcp_config_provenance"] = dict(sorted(self.mcp_config_provenance.items()))
+                data["mcp_config_provenance"] = _normalized_mcp_provenance(
+                    self.mcp_config_provenance
+                )
             if self.lsp_servers:
                 data["lsp_servers"] = sorted(self.lsp_servers)
             if self.lsp_configs:
@@ -682,9 +685,10 @@ class LockFile:
             or self.mcp_target_servers != other.mcp_target_servers
         ):
             return False
-        if (
-            dict(self.deployment_ledger.records) != dict(other.deployment_ledger.records)
-            or self.mcp_config_provenance != other.mcp_config_provenance
+        if dict(self.deployment_ledger.records) != dict(
+            other.deployment_ledger.records
+        ) or _normalized_mcp_provenance(self.mcp_config_provenance) != _normalized_mcp_provenance(
+            other.mcp_config_provenance
         ):
             return False
         if (
