@@ -11,6 +11,7 @@ from __future__ import annotations
 import builtins
 from typing import Any
 
+from apm_cli.install.errors import InstallFailureAlreadyRendered
 from apm_cli.integration._shared import _RegistryDepGroup
 from apm_cli.utils.console import STATUS_SYMBOLS
 
@@ -193,3 +194,60 @@ def _install_registry_group(
                     logger.error(f"{dep} -- failed for all runtimes")
 
     return configured_count
+
+
+def _raise_strict_config_failures(
+    failed_installations: list[str],
+    *,
+    console,
+    logger,
+) -> None:
+    """Render one failure footer, then fail without a success summary."""
+    if not failed_installations:
+        return
+    message = (
+        "MCP configuration failed for selected runtime(s): "
+        + ", ".join(failed_installations)
+        + ". Fix the failed runtime MCP config and rerun apm install."
+    )
+    if console:
+        console.print(f"[red]{STATUS_SYMBOLS['cross']} {message}[/red]")
+    else:
+        logger.error(message)
+    raise InstallFailureAlreadyRendered(message)
+
+
+def _migrate_intellij_managed_config(
+    target_runtimes: list[str],
+    managed_target_servers: dict[str, builtins.set[str]] | None,
+    *,
+    project_root,
+    user_scope: bool,
+    logger,
+) -> None:
+    """Route provenance-owned IntelliJ path migration through its adapter."""
+    if "intellij" not in target_runtimes or managed_target_servers is None:
+        return
+    from apm_cli.factory import ClientFactory
+
+    client = ClientFactory.create_client(
+        "intellij",
+        project_root=project_root,
+        user_scope=user_scope,
+    )
+    from apm_cli.adapters.client.intellij import IntelliJConfigError
+
+    try:
+        migrated = client.migrate_legacy_managed_servers(
+            builtins.set(managed_target_servers.get("intellij", set()))
+        )
+    except IntelliJConfigError as exc:
+        logger.error(str(exc))
+        raise InstallFailureAlreadyRendered(str(exc)) from exc
+    if migrated:
+        count = len(migrated)
+        logger.success(
+            f"Migrated {count} IntelliJ MCP server{'s' if count != 1 else ''} "
+            f"to {client.get_config_path()}",
+            symbol="check",
+        )

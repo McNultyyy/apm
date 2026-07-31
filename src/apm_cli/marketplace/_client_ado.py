@@ -79,6 +79,7 @@ def _fetch_ado_rest(
     project: str,
     repo: str,
     host: str,
+    port: int | None = None,
     auth_resolver,
 ) -> dict | None:
     """Read a single metadata file from Azure DevOps via the REST items API.
@@ -89,7 +90,7 @@ def _fetch_ado_rest(
     from ..utils.github_host import build_ado_api_url
     from .errors import MarketplaceFetchError
 
-    url = build_ado_api_url(org, project, repo, file_path, source.ref, host)
+    url = build_ado_api_url(org, project, repo, file_path, source.ref, host, port=port)
 
     def _do_fetch(token, git_env):
         headers = {"User-Agent": "apm-cli"}
@@ -112,10 +113,7 @@ def _fetch_ado_rest(
             if callable(close):
                 close()
 
-    return auth_resolver.try_with_fallback(
-        host,
-        _do_fetch,
-        org=org,
-        path=f"{org}/{project}/{repo}",
-        unauth_first=False,
-    )
+    fallback_kwargs: dict = {"org": org, "path": f"{org}/{project}/{repo}", "unauth_first": False}
+    if port is not None:
+        fallback_kwargs["port"] = port
+    return auth_resolver.try_with_fallback(host, _do_fetch, **fallback_kwargs)

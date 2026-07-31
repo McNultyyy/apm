@@ -674,16 +674,28 @@ def resolve_marketplace_plugin(
             from .version_resolver import resolve_version_constraint
 
             owner_repo = f"{source.owner}/{source.repo}"
-            token, auth_scheme = _extract_auth(auth_resolver, source.host, org=source.owner)
+            token, auth_scheme, git_env = _extract_auth(
+                auth_resolver,
+                source.host,
+                org=source.owner,
+                port=source.port,
+            )
+            version_auth = {
+                "host": source.host,
+                "token": token,
+                "auth_scheme": auth_scheme,
+                "auth_resolver": auth_resolver,
+            }
+            if git_env is not None:
+                version_auth["git_env"] = git_env
+            if source.port is not None:
+                version_auth["port"] = source.port
             try:
                 tag_name, _sha = resolve_version_constraint(
                     plugin_name,
                     owner_repo,
                     version_spec,
-                    host=source.host,
-                    token=token,
-                    auth_scheme=auth_scheme,
-                    auth_resolver=auth_resolver,
+                    **version_auth,
                 )
                 resolved_override = tag_name
                 logger.debug(

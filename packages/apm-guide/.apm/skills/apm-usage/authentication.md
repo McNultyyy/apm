@@ -88,8 +88,9 @@ For SSO-protected orgs, authorize the token under Settings > Tokens > Configure 
 
 ## Azure DevOps (ADO)
 
-ADO supports two auth modes; the GitHub token chain does not apply. The recommended
-approach is `az login`; explicit PATs are also supported. Resolution order:
+Azure DevOps Services supports two auth modes; the GitHub token chain does
+not apply. The recommended approach is `az login`; explicit PATs are also
+supported. Resolution order:
 
 1. `ADO_APM_PAT` env var if set
 2. AAD bearer from `az account get-access-token` if `az` is installed and signed in
@@ -115,11 +116,45 @@ or run `az login` and inspect `az account show --query tenantId -o tsv`.
 
 If `ADO_APM_PAT` is set but ADO returns 401, APM silently retries with the `az`
 bearer for clone, preflight, semver tag, and marketplace ref resolution, then warns:
-`[!] ADO_APM_PAT was rejected for {host} (HTTP 401); fell back to az cli bearer.`
+`[!] ADO_APM_PAT was rejected for {host}; fell back to az cli bearer.`
 
 When auth fails entirely, APM prints a targeted diagnostic (not a generic "not accessible"
 message). For `--update` operations, a pre-flight auth check runs before any files are
 modified -- on failure you see `No files were modified`.
+
+### On-prem Azure DevOps Server
+
+For self-hosted Azure DevOps Server installations (not Azure DevOps Services at
+`dev.azure.com`), tell APM which hostname to treat as ADO:
+
+```bash
+# Single server
+export ADO_HOST=ado.corp.example.com
+export ADO_APM_PAT=your_ado_pat
+apm install ado.corp.example.com/DefaultCollection/project/_git/repo
+
+# Explicit HTTPS port belongs in the dependency URL, not ADO_HOST
+apm install https://ado.corp.example.com:8443/DefaultCollection/project/_git/repo
+
+# Multiple servers
+export APM_ADO_HOSTS=ado1.corp.example.com,ado2.corp.example.com
+```
+
+`ADO_HOST` registers a single on-prem host; `APM_ADO_HOSTS` accepts a
+comma-separated list for environments with multiple ADO Server instances.
+Values are hostnames only (no scheme, port, or path), trimmed, matched
+case-insensitively, and must be valid FQDNs. Explicit HTTPS ports belong in
+the dependency URL. The first path segment is the server collection.
+Root-hosted collection URLs are supported; `/tfs/` or another server
+base-path prefix is not currently supported.
+
+Azure DevOps Server authentication is PAT-only in APM. Set `ADO_APM_PAT`;
+the Azure CLI bearer fallback applies to Azure DevOps Services, not Server.
+
+`GITHUB_HOST` alone classifies a custom hostname as GitHub Enterprise Server.
+When `ADO_HOST` or `APM_ADO_HOSTS` also names that host, the ADO
+configuration takes precedence and excludes GitHub credentials. You do not
+need to unset `GITHUB_HOST`.
 
 ### ADO auth troubleshooting
 
@@ -129,6 +164,7 @@ modified -- on failure you see `No files were modified`.
 | `az CLI is installed but no active session was found` | `az account show` fails | Run `az login --tenant <tenant>` against the tenant that owns the org |
 | `az CLI returned a token but the org does not accept it (likely a tenant mismatch)` | Wrong tenant | Run `az login --tenant <correct-tenant>`, or set `ADO_APM_PAT` |
 | `ADO_APM_PAT was rejected (HTTP 401) and no az cli fallback was available` | Stale PAT, no `az` | Rotate the PAT, or install `az` and run `az login --tenant <tenant>` |
+| On-prem host classified as GHES / GitHub credentials selected | `GITHUB_HOST` set without an ADO host configuration | Add `ADO_HOST=your-ado-server.example.com` (or list it in `APM_ADO_HOSTS`); ADO takes precedence |
 
 ## GitHub Enterprise Server (GHES)
 

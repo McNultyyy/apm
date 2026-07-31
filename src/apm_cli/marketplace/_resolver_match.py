@@ -389,22 +389,31 @@ def _dependency_reference_from_packed_source(
 
 
 def _extract_auth(
-    auth_resolver: object | None, host: str, org: str | None = None
-) -> tuple[str | None, str]:
-    """Extract the token and auth scheme from the auth resolver for the given host."""
+    auth_resolver: object | None,
+    host: str,
+    org: str | None = None,
+    port: int | None = None,
+) -> tuple[str | None, str, dict | None]:
+    """Extract the token, auth scheme, and git env from the auth resolver."""
     if auth_resolver is None:
-        return None, "basic"
+        return None, "basic", None
     try:
-        ctx = auth_resolver.resolve(host, org=org)  # type: ignore[union-attr]
-        if ctx is None or not ctx.token:
-            return None, "basic"
-        return ctx.token, ctx.auth_scheme
+        ctx = auth_resolver.resolve(host, org=org, port=port)  # type: ignore[union-attr]
+        if ctx is None:
+            return None, "basic", None
+        if not ctx.token and ctx.host_info.kind != "ado":
+            return None, "basic", None
+        return (
+            ctx.token,
+            ctx.auth_scheme,
+            auth_resolver.hardened_git_env_for_context(ctx),  # type: ignore[union-attr]
+        )
     except Exception as exc:
         logger.debug("Could not extract auth for host '%s': %s", host, type(exc).__name__)
-        return None, "basic"
+        return None, "basic", None
 
 
 def _extract_token(auth_resolver: object | None, host: str, org: str | None = None) -> str | None:
     """Compatibility wrapper -- returns only the token."""
-    token, _ = _extract_auth(auth_resolver, host, org)
+    token, _, _ = _extract_auth(auth_resolver, host, org)
     return token

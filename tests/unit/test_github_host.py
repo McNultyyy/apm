@@ -247,6 +247,9 @@ def test_unsupported_host_error_message():
     assert "export GITHUB_HOST=" in error_msg
     assert "$env:GITHUB_HOST" in error_msg
     assert "set GITHUB_HOST=" in error_msg
+    assert "export ADO_HOST=" in error_msg
+    assert "$env:ADO_HOST" in error_msg
+    assert "set ADO_HOST=" in error_msg
 
 
 def test_unsupported_host_error_shows_current_host(monkeypatch):
@@ -282,6 +285,24 @@ def test_build_ado_https_clone_url():
         "myorg", "myproject", "myrepo", host="ado.company.internal"
     )
     assert url == "https://ado.company.internal/myorg/myproject/_git/myrepo"
+
+    # With a custom host and explicit HTTPS port (ADO Server)
+    url = github_host.build_ado_https_clone_url(
+        "DefaultCollection",
+        "myproject",
+        "myrepo",
+        host="ado.company.internal",
+        port=8443,
+    )
+    assert url == ("https://ado.company.internal:8443/DefaultCollection/myproject/_git/myrepo")
+
+    legacy = github_host.build_ado_https_clone_url(
+        "contoso",
+        "Platform",
+        "standards",
+        host="contoso.visualstudio.com",
+    )
+    assert legacy == "https://contoso.visualstudio.com/Platform/_git/standards"
 
 
 def test_build_ado_ssh_url():
@@ -329,6 +350,19 @@ def test_build_ado_api_url():
         "contoso", "_apm", "_apm", "apm-policy.yml", host="ssh.dev.azure.com"
     )
     assert ssh_url.startswith("https://dev.azure.com/contoso/_apm/_apis/")
+
+    custom_url = github_host.build_ado_api_url(
+        "DefaultCollection",
+        "Platform",
+        "standards",
+        "SKILL.md",
+        host="ado.corp.example.com",
+        port=8443,
+    )
+    custom = urlparse(custom_url)
+    assert custom.hostname == "ado.corp.example.com"
+    assert custom.port == 8443
+    assert custom.path == ("/DefaultCollection/Platform/_apis/git/repositories/standards/items")
 
 
 def test_parse_ado_repo_url_dev_azure():
@@ -715,3 +749,65 @@ class TestIsGitHubHostnameGHES:
     def test_ghes_rejects_invalid_fqdn(self, monkeypatch):
         monkeypatch.setenv("GITHUB_HOST", "not-a-fqdn")
         assert github_host.is_github_hostname("not-a-fqdn") is False
+
+    def test_ghes_host_does_not_claim_custom_ado_host(self, monkeypatch):
+        """GITHUB_HOST set to an on-prem ADO Server host must not be treated as GHES."""
+        monkeypatch.setenv("GITHUB_HOST", "ado.corp.example.com")
+        monkeypatch.setenv("ADO_HOST", "ado.corp.example.com")
+        assert github_host.is_github_hostname("ado.corp.example.com") is False
+
+
+class TestIsAzureDevOpsHostnameEnvVars:
+    """Env-var driven ADO Server host recognition -- regression for #2338."""
+
+    def test_ado_host_single_host(self, monkeypatch):
+        monkeypatch.setenv("ADO_HOST", "ado.corp.example.com")
+        assert github_host.is_azure_devops_hostname("ado.corp.example.com") is True
+
+    def test_ado_host_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("ADO_HOST", "ADO.corp.Example.COM")
+        assert github_host.is_azure_devops_hostname("ado.corp.example.com") is True
+
+    def test_ado_host_does_not_match_other_hosts(self, monkeypatch):
+        monkeypatch.setenv("ADO_HOST", "ado.corp.example.com")
+        assert github_host.is_azure_devops_hostname("other.corp.example.com") is False
+
+    def test_ado_host_invalid_fqdn_rejected(self, monkeypatch):
+        monkeypatch.setenv("ADO_HOST", "localhost")
+        assert github_host.is_azure_devops_hostname("localhost") is False
+
+    @pytest.mark.parametrize("hostname", ("127.0.0.1", "10.0.0.1"))
+    def test_ado_host_ip_literal_rejected(self, monkeypatch, hostname):
+        monkeypatch.setenv("ADO_HOST", hostname)
+        assert github_host.is_azure_devops_hostname(hostname) is False
+
+    def test_ado_host_with_port_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("ADO_HOST", "ado.corp.example.com:8443")
+        assert github_host.is_azure_devops_hostname("ado.corp.example.com") is False
+
+    def test_ado_host_with_collection_path_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("ADO_HOST", "ado.corp.example.com/tfs/DefaultCollection")
+        assert github_host.is_azure_devops_hostname("ado.corp.example.com") is False
+
+    def test_apm_ado_hosts_comma_separated(self, monkeypatch):
+        monkeypatch.setenv("APM_ADO_HOSTS", "ado1.corp.example.com, ado2.corp.example.com")
+        assert github_host.is_azure_devops_hostname("ado1.corp.example.com") is True
+        assert github_host.is_azure_devops_hostname("ado2.corp.example.com") is True
+        assert github_host.is_azure_devops_hostname("ado3.corp.example.com") is False
+
+    def test_apm_ado_hosts_unknown_host_not_matched(self, monkeypatch):
+        monkeypatch.setenv("APM_ADO_HOSTS", "ado.corp.example.com")
+        assert github_host.is_azure_devops_hostname("evil.corp.example.com") is False
+
+    def test_cloud_ado_hosts_still_work_without_env(self):
+        assert github_host.is_azure_devops_hostname("dev.azure.com") is True
+        assert github_host.is_azure_devops_hostname("ssh.dev.azure.com") is True
+        assert github_host.is_azure_devops_hostname("myorg.visualstudio.com") is True
+
+    def test_parse_ado_repo_url_custom_host(self, monkeypatch):
+        """parse_ado_repo_url works for on-prem ADO Server URLs once host is recognised."""
+        monkeypatch.setenv("ADO_HOST", "ado.corp.example.com")
+        result = github_host.parse_ado_repo_url(
+            "https://ado.corp.example.com/myorg/myproject/_git/myrepo"
+        )
+        assert result == ("myorg", "myproject", "myrepo")

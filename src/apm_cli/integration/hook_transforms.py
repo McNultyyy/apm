@@ -43,9 +43,11 @@ _HOOK_COMMAND_KEYS: tuple[str, ...] = (
 # different conventions get their events renamed during merge.
 _HOOK_EVENT_MAP: dict[str, dict[str, str]] = {
     "claude": {
-        # Copilot camelCase -> Claude PascalCase
+        # Copilot camelCase and portable lifecycle aliases -> Claude PascalCase
         "preToolUse": "PreToolUse",
         "postToolUse": "PostToolUse",
+        **dict.fromkeys(("SessionStart", "sessionStart"), "SessionStart"),
+        **dict.fromkeys(("Stop", "AgentStop", "agentStop"), "Stop"),
     },
     "gemini": {
         # Copilot / Claude -> Gemini
@@ -63,10 +65,8 @@ _HOOK_EVENT_MAP: dict[str, dict[str, str]] = {
         "postToolUse": "postToolUse",
         "UserPromptSubmit": "userPromptSubmit",
         "userPromptSubmit": "userPromptSubmit",
-        "Stop": "stop",
-        "stop": "stop",
-        "AgentStop": "agentStop",
-        "agentStop": "agentStop",
+        **dict.fromkeys(("SessionStart", "sessionStart"), "sessionStart"),
+        **dict.fromkeys(("Stop", "AgentStop", "agentStop"), "agentStop"),
         "PreTaskExecution": "preTaskExecution",
         "preTaskExecution": "preTaskExecution",
         "PostTaskExecution": "postTaskExecution",

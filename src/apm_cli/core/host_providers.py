@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -30,13 +31,30 @@ class HostProviderDescriptor:
     allow_credential_helper: bool = True
     manifest_types: tuple[str, ...] = ()
 
+    def build_api_base(self, host: str, port: int | None = None) -> str:
+        """Return the provider API base, preserving a self-hosted port."""
+        base = self.api_base(host)
+        if port is None:
+            return base
+        parsed = urllib.parse.urlsplit(base)
+        if parsed.hostname != host.lower() or parsed.port is not None:
+            return base
+        netloc = f"{parsed.hostname}:{port}"
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+        )
+
 
 def _github_api(_host: str) -> str:
     return "https://api.github.com"
 
 
-def _ado_api(_host: str) -> str:
-    return "https://dev.azure.com"
+def _ado_api(host: str) -> str:
+    if host in {"dev.azure.com", "ssh.dev.azure.com"} or host.endswith(".visualstudio.com"):
+        return "https://dev.azure.com"
+    if not is_valid_fqdn(host):
+        raise ValueError(f"Invalid Azure DevOps Server host: {host!r}")
+    return f"https://{host}"
 
 
 def _api_v3(host: str) -> str:
@@ -66,6 +84,7 @@ def _matches_ghes(host: str) -> bool:
         and configured == host
         and configured not in {"github.com", "gitlab.com"}
         and not configured.endswith(".ghe.com")
+        and not is_azure_devops_hostname(configured)
         and is_valid_fqdn(configured)
     )
 
@@ -97,7 +116,7 @@ _HOST_PROVIDERS = (
         kind="ado",
         matcher=_matches_ado,
         api_base=_ado_api,
-        has_public_repos=True,
+        has_public_repos=False,
         credential_purpose="ado_modules",
         allow_credential_helper=False,
     ),

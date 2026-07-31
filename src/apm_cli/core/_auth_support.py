@@ -20,6 +20,7 @@ module scope -- ``HostInfo`` is imported lazily inside :meth:`classify_host`.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
@@ -32,6 +33,24 @@ _PORT_CREDENTIAL_DOCS_URL = (
     "https://microsoft.github.io/apm/getting-started/authentication/"
     "#custom-port-hosts-and-per-port-credentials"
 )
+
+_GIT_CHILD_TOKEN_ENV_NAMES = frozenset(
+    {
+        "ADO_APM_PAT",
+        "COPILOT_GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_APM_PAT",
+        "GITHUB_COPILOT_PAT",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GITHUB_MODELS_KEY",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "GITHUB_TOKEN",
+        "GITLAB_APM_PAT",
+        "GITLAB_TOKEN",
+    }
+)
+_GIT_CHILD_TOKEN_ENV_PREFIXES = ("GITHUB_APM_PAT_",)
 
 
 def _org_to_env_suffix(org: str) -> str:
@@ -76,7 +95,7 @@ class _AuthSupportMixin:
             host=host,
             kind=provider.kind,
             has_public_repos=provider.has_public_repos,
-            api_base=provider.api_base(host.lower()),
+            api_base=provider.build_api_base(host.lower(), port),
             port=port,
             credential_purpose=provider.credential_purpose,
         )
@@ -166,8 +185,9 @@ class _AuthSupportMixin:
             # Provider access is routed through the auth-boundary accessor on
             # AuthResolver so the bearer-provider symbol stays inside
             # core/auth.py (see scripts/lint-auth-signals.sh, Rule A).
-            provider = self._ado_bearer_provider()
-            az_available = provider.is_available()
+            bearer_supported = self._supports_ado_bearer(host_info.host)
+            provider = self._ado_bearer_provider() if bearer_supported else None
+            az_available = bool(provider and provider.is_available())
             pat_set = bool(os.environ.get("ADO_APM_PAT"))
 
             org_part = org or ""
@@ -181,9 +201,17 @@ class _AuthSupportMixin:
                         org_part = parts[1] if len(parts) > 1 else ""
 
             token_url = (
-                f"https://dev.azure.com/{org_part}/_usersSettings/tokens"
+                (
+                    f"https://dev.azure.com/{org_part}/_usersSettings/tokens"
+                    if bearer_supported
+                    else f"https://{display}/{org_part}/_usersSettings/tokens"
+                )
                 if org_part
-                else "https://dev.azure.com/<org>/_usersSettings/tokens"
+                else (
+                    "https://dev.azure.com/<org>/_usersSettings/tokens"
+                    if bearer_supported
+                    else f"https://{display}/<collection>/_usersSettings/tokens"
+                )
             )
 
             if pat_set:
@@ -221,6 +249,19 @@ class _AuthSupportMixin:
                 )
 
             # No PAT set
+            if not bearer_supported:
+                return (
+                    "\n    Azure DevOps Server requires ADO_APM_PAT.\n\n"
+                    "    To fix:\n"
+                    "      1. Create a PAT with Code (Read) scope in your "
+                    "Azure DevOps Server collection.\n"
+                    "      2. Set it for this process: export ADO_APM_PAT=your_token\n"
+                    "      3. Retry: apm install\n\n"
+                    "    Azure CLI bearer authentication applies to Azure DevOps "
+                    "Services, not Server.\n\n"
+                    "    Docs: https://microsoft.github.io/apm/"
+                    "getting-started/authentication/#on-prem-azure-devops-server"
+                )
             if not az_available:
                 # Case 1: no az, no PAT
                 return (
@@ -516,31 +557,91 @@ class _AuthSupportMixin:
         *,
         scheme: str = "basic",
         host_kind: str = "github",
+        base_env: dict | None = None,
     ) -> dict:
         """Pre-built env dict for subprocess git calls.
 
-        For ADO bearer tokens (scheme='bearer'), injects an Authorization header
-        via GIT_CONFIG_COUNT/KEY/VALUE env vars (see github_host.set_ado_bearer_git_env).
-        For all other cases, behavior is unchanged.
+        ADO PATs and bearer tokens use an Authorization header via
+        GIT_CONFIG_COUNT/KEY/VALUE. Other host classes retain GIT_TOKEN.
         """
-        env = os.environ.copy()
+        env = dict(base_env) if base_env is not None else os.environ.copy()
+        _AuthSupportMixin._clear_platform_token_env(env)
         _AuthSupportMixin._clear_git_auth_env(env)
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_ASKPASS"] = "echo"
-        if scheme == "bearer" and token and host_kind == "ado":
-            # B2 #852: skip GIT_TOKEN for bearer scheme -- the JWT is injected via
-            # a GIT_CONFIG_VALUE_N header only; GIT_TOKEN here would leak it into
-            # every child-process env (visible in /proc/<pid>/environ, ps eww).
+        if token and host_kind == "ado" and scheme in {"basic", "bearer"}:
+            # ADO credentials use an Authorization header, never argv or
+            # GIT_TOKEN. This keeps PATs and bearer JWTs out of process lists.
             #
             # #2368: set (append-after-retained) rather than dict-merge, so the
             # non-auth entries _clear_git_auth_env just retained (e.g.
             # http.sslCAInfo) are not clobbered by a hardcoded COUNT=1 overlay.
-            from apm_cli.utils.github_host import set_ado_bearer_git_env
+            from apm_cli.utils.github_host import set_authorization_header_git_env
 
-            set_ado_bearer_git_env(env, token)
+            if scheme == "bearer":
+                credential = token
+                header_scheme = "Bearer"
+            else:
+                credential = base64.b64encode(f":{token}".encode()).decode()
+                header_scheme = "Basic"
+            set_authorization_header_git_env(
+                env,
+                header_scheme,
+                credential,
+            )
         elif token:
             env["GIT_TOKEN"] = token
         return env
+
+    @staticmethod
+    def _supports_ado_bearer(host: str) -> bool:
+        """Return whether Azure CLI bearer auth applies to this ADO host.
+
+        Bearer (AAD/Entra ID) authentication is only available for Azure
+        DevOps Services (dev.azure.com / *.visualstudio.com). Azure DevOps
+        Server (on-premises) uses Personal Access Tokens only.
+        """
+        normalized = host.lower()
+        return normalized in {"dev.azure.com", "ssh.dev.azure.com"} or normalized.endswith(
+            ".visualstudio.com"
+        )
+
+    @staticmethod
+    def _clear_platform_token_env(env: dict) -> None:
+        """Neutralise raw platform token sources before spawning git.
+
+        Tokens inherited from the calling process could silently satisfy
+        credentials.helper prompts on behalf of the wrong identity. Clearing
+        them here ensures APM-managed credentials are the sole source.
+        """
+        for key in tuple(env):
+            if key in _GIT_CHILD_TOKEN_ENV_NAMES or key.startswith(_GIT_CHILD_TOKEN_ENV_PREFIXES):
+                env[key] = ""
+
+    @staticmethod
+    def git_env_for_context(ctx, *, base_env: dict) -> dict:
+        """Apply one resolved credential to a hardened Git base environment."""
+        return _AuthSupportMixin._build_git_env(
+            ctx.token,
+            scheme=ctx.auth_scheme,
+            host_kind=ctx.host_info.kind,
+            base_env=base_env,
+        )
+
+    def hardened_git_base_env(self) -> dict:
+        """Build the credential-free hardened base for Git subprocesses."""
+        from apm_cli.deps.git_auth_env import GitAuthEnvBuilder
+
+        return GitAuthEnvBuilder(self._token_manager).setup_environment()
+
+    def hardened_git_env_for_context(self, ctx) -> dict:
+        """Build a hardened Git environment for one resolved context."""
+        return self.git_env_for_context(ctx, base_env=self.hardened_git_base_env())
+
+    @staticmethod
+    def _dep_ref_host(dep_ref) -> str:
+        """Extract the hostname string from a dep_ref (str or DependencyReference)."""
+        return dep_ref if isinstance(dep_ref, str) else getattr(dep_ref, "host", "") or ""
 
     @staticmethod
     def _clear_git_auth_env(env: dict) -> None:

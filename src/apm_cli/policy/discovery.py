@@ -32,12 +32,15 @@ import threading  # noqa: F401
 import time  # noqa: F401 -- seam: _discovery_cache.py uses _d.time.time() to allow test patching
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse  # noqa: F401 -- re-exported seam for test patches
+from urllib.parse import urlparse
 
 import requests
 
 from ..utils.github_host import (
     is_azure_devops_hostname,
+)
+from ._discovery_ado import (
+    _extract_port_from_git_remote as _extract_port_from_git_remote,
 )
 from ._discovery_ado import (
     _fetch_ado_contents as _fetch_ado_contents,
@@ -451,6 +454,7 @@ def _auto_discover(
         )
 
     org, host = org_and_host
+    port = _extract_port_from_git_remote(project_root)
     candidates = _policy_repo_candidates(host)
     is_ado = is_azure_devops_hostname(host)
 
@@ -476,6 +480,7 @@ def _auto_discover(
                 project=ADO_POLICY_PROJECT,
                 repo=candidate_repo,
                 host=host,
+                port=port,
                 project_root=project_root,
                 no_cache=no_cache,
                 expected_hash=expected_hash,
@@ -531,6 +536,14 @@ def _extract_org_from_git_remote(
     - git@github.com:contoso/my-project.git -> ("contoso", "github.com")
     - https://github.example.com/contoso/my-project.git -> ("contoso", "github.example.com")
     """
+    identity = _extract_org_host_port_from_git_remote(project_root)
+    return (identity[0], identity[1]) if identity is not None else None
+
+
+def _extract_org_host_port_from_git_remote(
+    project_root: Path,
+) -> tuple[str, str, int | None] | None:
+    """Extract ``(org, host, port)`` from git remote origin."""
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -542,7 +555,17 @@ def _extract_org_from_git_remote(
         )
         if result.returncode != 0:
             return None
-        return _parse_remote_url(result.stdout.strip())
+        remote_url = result.stdout.strip()
+        parsed_identity = _parse_remote_url(remote_url)
+        if parsed_identity is None:
+            return None
+        port = None
+        if "://" in remote_url:
+            try:
+                port = urlparse(remote_url).port
+            except ValueError:
+                return None
+        return parsed_identity[0], parsed_identity[1], port
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
 

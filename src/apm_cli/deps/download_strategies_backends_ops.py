@@ -220,6 +220,16 @@ def download_file_from_artifactory(
     )
 
 
+def _ado_build_headers_from_ctx(auth_ctx) -> dict[str, str]:
+    """Build ADO auth headers from a resolved auth context."""
+    if not auth_ctx.token:
+        return {}
+    if auth_ctx.auth_scheme == "bearer":
+        return {"Authorization": "******"}
+    encoded = base64.b64encode(f":{auth_ctx.token}".encode()).decode()
+    return {"Authorization": f"Basic {encoded}"}
+
+
 def _ado_build_headers(delegate, dep_ref: DependencyReference, host: str) -> dict[str, str]:
     """Build ADO auth headers.
 
@@ -312,9 +322,17 @@ def download_ado_file(
         file_path,
         ref,
         host,
+        dep_ref.port,
     )
 
-    headers = _ado_build_headers(delegate, dep_ref, host)
+    # Route auth through AuthResolver so the PAT-to-bearer protocol is
+    # respected for on-prem hosts too (see #2365).
+    auth_ctx = delegate._host.auth_resolver.resolve(
+        host,
+        dep_ref.ado_organization,
+        port=dep_ref.port,
+    )
+    headers = _ado_build_headers_from_ctx(auth_ctx)
 
     try:
         response = delegate._host._resilient_get(api_url, headers=headers, timeout=30)
@@ -356,6 +374,7 @@ def _ado_handle_404(
         file_path,
         fallback_ref,
         host,
+        dep_ref.port,
     )
 
     try:

@@ -363,6 +363,8 @@ def test_host_class_collapse_constrained_to_psl_or_aliases():
         "Public Suffix List",
         "explicit `aliases:` entry",
         "MUST NOT collapse two",
+        "configuration signal exercised",
+        "under [req-sc-013](#req-sc-013) is not subject to this prohibition",
     )
 
 
@@ -428,6 +430,69 @@ def test_consumer_required_package_audit_asserts_presence_not_deployment():
         "evaluates a governance requirement mandating the presence of a package",
         "satisfaction of that requirement from the presence of the package in",
         "distinct from any missing-package violation",
+    )
+
+
+@pytest.mark.req("req-sc-013")
+def test_configured_host_class_precedence_is_credential_isolated(monkeypatch):
+    import base64
+
+    from apm_cli.core.auth import AuthResolver
+    from apm_cli.core.host_providers import classify_host_provider
+
+    host = "ado.corp.example.com"
+    ado_pat = "ado-pat-sentinel"
+    github_pat = "github-pat-sentinel"
+    monkeypatch.setenv("ADO_HOST", host)
+    monkeypatch.setenv("GITHUB_HOST", host)
+    monkeypatch.setenv("ADO_APM_PAT", ado_pat)
+    monkeypatch.setenv("GITHUB_APM_PAT", github_pat)
+    monkeypatch.setenv("GITHUB_TOKEN", github_pat)
+    monkeypatch.setenv("GH_TOKEN", github_pat)
+
+    provider = classify_host_provider(host)
+    assert provider.kind == "ado"
+    assert provider.credential_purpose == "ado_modules"
+
+    resolver = AuthResolver()
+    context = resolver.resolve(host, org="DefaultCollection", port=8443)
+    assert context.source == "ADO_APM_PAT"
+    assert context.token == ado_pat
+    assert context.host_info.port == 8443
+    assert context.host_info.api_base == f"https://{host}:8443"
+
+    env = resolver.git_env_for_context(
+        context,
+        base_env={
+            "GITHUB_APM_PAT": github_pat,
+            "GITHUB_TOKEN": github_pat,
+            "GH_TOKEN": github_pat,
+        },
+    )
+    assert env["GITHUB_APM_PAT"] == ""
+    assert env["GITHUB_TOKEN"] == ""
+    assert env["GH_TOKEN"] == ""
+    headers = [
+        env[f"GIT_CONFIG_VALUE_{index}"]
+        for index in range(int(env["GIT_CONFIG_COUNT"]))
+        if env[f"GIT_CONFIG_KEY_{index}"] == "http.extraheader"
+    ]
+    assert len(headers) == 1
+    scheme, encoded = headers[0].removeprefix("Authorization: ").split()
+    assert scheme == "Basic"
+    assert base64.b64decode(encoded).decode() == f":{ado_pat}"
+    assert_spec_contains(
+        "(a) it MUST select exactly one effective host class",
+        "(b) If two or more configuration signals",
+        "(c) it MUST resolve, attach, and expose",
+        "(d) credential material belonging",
+        "(e) An explicit non-default port",
+        "MUST NOT be resolved, attached, or inherited",
+        "MUST actively suppress ambient credential",
+        "redaction obligation of [req-sc-007]",
+        "descriptors MAY appear in the diagnostic surface",
+        "| **Configuration signal** |",
+        "operator overrides to this default assignment",
     )
 
 

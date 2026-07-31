@@ -242,7 +242,9 @@ if Path.cwd() != parent_cwd:
 
 def test_bounded_apm_git_environment_contract(tmp_path: Path) -> None:
     remote_control_names = (
+        "ADO_HOST",
         "APM_ALLOW_PROTOCOL_FALLBACK",
+        "APM_ADO_HOSTS",
         "APM_GIT_CREDENTIAL_TIMEOUT",
         "APM_GITLAB_HOSTS",
         "APM_GIT_PROTOCOL",
@@ -276,6 +278,7 @@ def test_bounded_apm_git_environment_contract(tmp_path: Path) -> None:
         "HOME",
         "USERPROFILE",
         "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
         "LOCALAPPDATA",
         "APM_HOME",
@@ -416,6 +419,7 @@ def test_bounded_apm_git_environment_contract(tmp_path: Path) -> None:
         "HOME": str(isolated.home),
         "USERPROFILE": str(isolated.home),
         "XDG_CONFIG_HOME": str(isolated.root / "xdg-config"),
+        "XDG_DATA_HOME": str(isolated.root / "xdg-data"),
         "XDG_CACHE_HOME": str(isolated.root / "xdg-cache"),
         "LOCALAPPDATA": str(isolated.root / "local-app-data"),
         "APM_HOME": str(isolated.config_root),

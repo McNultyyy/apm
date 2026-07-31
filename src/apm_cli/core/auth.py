@@ -545,6 +545,7 @@ class AuthResolver(_AuthSupportMixin):
             auth_ctx is not None
             and auth_ctx.host_info.kind == "ado"
             and auth_ctx.source == "ADO_APM_PAT"
+            and self._supports_ado_bearer(auth_ctx.host_info.host)
         )
 
         def _try_ado_bearer_fallback(exc: Exception) -> T:
@@ -678,10 +679,12 @@ class AuthResolver(_AuthSupportMixin):
     # -- internals ----------------------------------------------------------
 
     def _resolve_ado_token(self, host_info: HostInfo) -> tuple[str | None, str, str]:
-        """Resolve the ADO token chain: ADO_APM_PAT -> AAD bearer -> none."""
+        """Resolve the ADO token chain: ADO_APM_PAT -> AAD bearer (Services only) -> none."""
         pat = os.environ.get("ADO_APM_PAT")
         if pat:
             return pat, "ADO_APM_PAT", "basic"
+        if not self._supports_ado_bearer(host_info.host):
+            return None, "none", "basic"
         # Try AAD bearer via az cli (lazy import to avoid module-load cost on non-ADO paths)
         from apm_cli.core.azure_cli import AzureCliBearerError, get_bearer_provider
 
@@ -759,7 +762,7 @@ class AuthResolver(_AuthSupportMixin):
             if isinstance(dep_ref, str)
             else dep_ref is not None and getattr(dep_ref, "is_azure_devops", lambda: False)()
         )
-        if not is_ado:
+        if not is_ado or not self._supports_ado_bearer(self._dep_ref_host(dep_ref)):
             return BearerFallbackOutcome(primary, False)
         if not is_auth_failure(primary):
             return BearerFallbackOutcome(primary, False)

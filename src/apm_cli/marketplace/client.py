@@ -302,8 +302,12 @@ def _fetch_git(
     from ..cache.paths import get_cache_root
 
     org = source.owner or None
-    auth_ctx = auth_resolver.resolve(host_info.host, org)
-    git_env = auth_ctx.git_env
+    auth_ctx = (
+        auth_resolver.resolve(host_info.host, org, port=source.port)
+        if source.port is not None
+        else auth_resolver.resolve(host_info.host, org)
+    )
+    git_env = auth_resolver.hardened_git_env_for_context(auth_ctx)
 
     cache = GitCache(get_cache_root(), refresh=False)
     try:
@@ -414,6 +418,7 @@ def _fetch_ado(
             project=project,
             repo=repo,
             host=host,
+            port=source.port,
             auth_resolver=auth_resolver,
         )
     except _AdoItemNotFound:
@@ -562,7 +567,7 @@ def _fetch_file(
         # For ADO and generic git, classify the host extracted from the URL so
         # each gets a correctly-typed auth context (ADO PAT/bearer routing).
         host = _host_from_url(source.url)
-        host_info = AuthResolver.classify_host(host) if host else None
+        host_info = AuthResolver.classify_host(host, port=source.port) if host else None
 
     return fetcher(source, file_path, host_info=host_info, auth_resolver=auth_resolver)
 

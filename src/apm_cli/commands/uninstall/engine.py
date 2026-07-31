@@ -8,43 +8,57 @@ from ...core.command_logger import CommandLogger
 from ...deps.lockfile import LockFile
 from ...integration.mcp_integrator import MCPIntegrator
 from ...models.apm_package import DependencyReference
+from ...models.dependency.selection import (
+    DependencySelectionStatus,
+    select_manifest_dependency,
+)
+from ...models.dependency.selection import (
+    parse_dependency_entry as _parse_dependency_entry,
+)
 from ...utils.path_security import PathTraversalError, safe_rmtree
 from ...utils.paths import portable_relpath
-from ._orphan_ops import _dry_run_uninstall as _dry_run_uninstall
-
-
-def _is_marketplace_ref(package: str) -> bool:
-    """Check if *package* is marketplace notation using the public API."""
-    from ...marketplace.resolver import parse_marketplace_ref
-
-    return parse_marketplace_ref(package) is not None
-
-
-def _build_children_index(lockfile):
-    """Build parent_url -> [child_deps] index in a single O(n) pass.
-
-    Returns a dict mapping each ``resolved_by`` URL to the list of
-    dependency objects that claim it as their parent.
-    """
-    children = {}
-    for dep in lockfile.get_package_dependencies():
-        parent = dep.resolved_by
-        if parent:
-            if parent not in children:
-                children[parent] = []
-            children[parent].append(dep)
-    return children
-
-
-def _parse_dependency_entry(dep_entry):
-    """Parse a dependency entry from apm.yml into a DependencyReference."""
-    if isinstance(dep_entry, DependencyReference):
-        return dep_entry
-    if isinstance(dep_entry, str):
-        return DependencyReference.parse(dep_entry)
-    if isinstance(dep_entry, builtins.dict):
-        return DependencyReference.parse_from_dict(dep_entry)
-    raise ValueError(f"Unsupported dependency entry type: {type(dep_entry).__name__}")
+from ._local_refresh import (
+    LocalSlotRefresh as LocalSlotRefresh,
+)
+from ._local_refresh import (
+    _activate_staged_local_refresh as _activate_staged_local_refresh,
+)
+from ._local_refresh import (
+    _build_children_index as _build_children_index,
+)
+from ._local_refresh import (
+    _cleanup_staged_local_refreshes as _cleanup_staged_local_refreshes,
+)
+from ._local_refresh import (
+    _dependency_public_label as _dependency_public_label,
+)
+from ._local_refresh import (
+    _is_marketplace_ref as _is_marketplace_ref,
+)
+from ._local_refresh import (
+    _is_private_local_identity as _is_private_local_identity,
+)
+from ._local_refresh import (
+    _recover_local_refresh_backups as _recover_local_refresh_backups,
+)
+from ._local_refresh import (
+    _reintegration_error_detail as _reintegration_error_detail,
+)
+from ._local_refresh import (
+    _stage_shared_local_survivors as _stage_shared_local_survivors,
+)
+from ._local_refresh import (
+    _surviving_local_refs_at_install_path as _surviving_local_refs_at_install_path,
+)
+from ._orphan_ops import (
+    _cleanup_stale_mcp as _cleanup_stale_mcp,
+)
+from ._orphan_ops import (
+    _dry_run_uninstall as _dry_run_uninstall,
+)
+from ._orphan_ops import (
+    _warn_reachability_incomplete as _warn_reachability_incomplete,
+)
 
 
 def _resolve_marketplace_packages(
@@ -191,6 +205,7 @@ def _validate_uninstall_packages(
     lockfile: "LockFile | None" = None,
     auth_resolver=None,
     dry_run: bool = False,
+    log_matches: bool = True,
 ) -> tuple[list, list]:
     """Validate which packages can be removed and return matched/unmatched lists.
 
@@ -208,6 +223,7 @@ def _validate_uninstall_packages(
             is attempted instead.
         auth_resolver: Optional auth resolver forwarded to the registry call.
         dry_run: When ``True``, skip the network registry call in Stage 2.
+        log_matches: Emit success diagnostics for matched identifiers.
 
     Returns:
         A two-tuple ``(packages_to_remove, packages_not_found)`` where
@@ -254,7 +270,8 @@ def _validate_uninstall_packages(
             else:
                 logger.error(
                     f"Invalid package format: {package}. "
-                    "Use 'owner/repo' or 'plugin-name@marketplace' format."
+                    "Use 'owner/repo', 'plugin-name@marketplace', a local path, "
+                    "or a key copied from 'apm deps list'."
                 )
                 packages_not_found.append(package)
                 continue
@@ -262,57 +279,88 @@ def _validate_uninstall_packages(
             canonical_for_match = package
             display_label = package
 
-        matched_dep = None
-        try:
-            pkg_ref = DependencyReference.parse(canonical_for_match)
-            pkg_identity = pkg_ref.get_identity()
-        except Exception:
-            pkg_identity = canonical_for_match
-
-        for dep_entry in current_deps:
-            try:
-                dep_ref = _parse_dependency_entry(dep_entry)
-                if dep_ref.get_identity() == pkg_identity:
-                    matched_dep = dep_entry
-                    break
-            except (ValueError, TypeError, AttributeError, KeyError):
-                dep_str = dep_entry if isinstance(dep_entry, str) else str(dep_entry)
-                if dep_str == canonical_for_match:
-                    matched_dep = dep_entry
-                    break
-
-        if matched_dep is not None:
-            packages_to_remove.append(matched_dep)
+        selection = select_manifest_dependency(canonical_for_match, current_deps, lockfile)
+        if selection.status is DependencySelectionStatus.MATCHED:
+            matched_dep = selection.manifest_entry
+            if matched_dep not in packages_to_remove:
+                packages_to_remove.append(matched_dep)
+            if not log_matches:
+                continue
             if canonical_for_match != display_label:
                 logger.progress(
                     f"{display_label} - found in apm.yml (as {canonical_for_match})",
                     symbol="check",
                 )
             else:
-                logger.progress(f"{display_label} - found in apm.yml", symbol="check")
+                logger.progress(
+                    f"{_dependency_public_label(matched_dep)} - found in apm.yml",
+                    symbol="check",
+                )
+        elif selection.status is DependencySelectionStatus.AMBIGUOUS:
+            packages_not_found.append(package)
+            if is_local:
+                safe_label = _dependency_public_label(package)
+                logger.error(
+                    f"Local dependency '{safe_label}' is ambiguous: it matches "
+                    f"{selection.match_count} declarations. Use one exact path from "
+                    "apm.yml to uninstall a single dependency."
+                )
+            else:
+                logger.error(
+                    f"Ambiguous dependency '{display_label}': it matches "
+                    f"{selection.match_count} declarations. Use one exact path from apm.yml "
+                    "to uninstall a single dependency."
+                )
         else:
             packages_not_found.append(package)
-            if canonical_for_match != display_label:
-                logger.warning(f"{display_label} ({canonical_for_match}) - not found in apm.yml")
+            if canonical_for_match.startswith("_local/"):
+                logger.error(
+                    f"{display_label} could not be mapped to one declared local dependency. "
+                    "Run 'apm install' to regenerate apm.lock.yaml, or use one exact "
+                    "path from apm.yml."
+                )
+            elif is_local:
+                logger.error(
+                    "The requested local path was not found in apm.yml. "
+                    "Copy a local key from 'apm deps list', or use one exact "
+                    "path already declared in apm.yml."
+                )
+            elif canonical_for_match != display_label:
+                logger.error(
+                    f"{display_label} ({canonical_for_match}) was not found in apm.yml. "
+                    "Run 'apm deps list' and retry with an installed package identifier."
+                )
             else:
-                logger.warning(f"{display_label} - not found in apm.yml")
+                logger.error(
+                    f"{display_label} was not found in apm.yml. "
+                    "Run 'apm deps list' and retry with an installed package identifier."
+                )
 
     return packages_to_remove, packages_not_found
 
 
-def _remove_packages_from_disk(packages_to_remove, apm_modules_dir, logger):
+def _remove_packages_from_disk(
+    packages_to_remove,
+    apm_modules_dir,
+    logger,
+    *,
+    staged_refreshes=None,
+    refreshed_survivor_keys=None,
+):
     """Remove direct packages from apm_modules/ and return removal count."""
     removed = 0
     if not apm_modules_dir.exists():
         return removed
 
     deleted_pkg_paths = []
+    activated_refresh_paths: set[Path] = set()
     for package in packages_to_remove:
+        package_label = _dependency_public_label(package)
         try:
             dep_ref = _parse_dependency_entry(package)
             package_path = dep_ref.get_install_path(apm_modules_dir)
         except PathTraversalError as e:
-            logger.error(f"Refusing to remove {package}: {e}")
+            logger.error(f"Refusing to remove {package_label}: {e}")
             continue
         except (ValueError, TypeError, AttributeError, KeyError):
             package_str = package if isinstance(package, str) else str(package)
@@ -322,19 +370,33 @@ def _remove_packages_from_disk(packages_to_remove, apm_modules_dir, logger):
             else:
                 package_path = apm_modules_dir / package_str
 
+        refresh = (staged_refreshes or {}).get(package_path)
+        if refresh is not None:
+            if package_path in activated_refresh_paths:
+                continue
+            _activate_staged_local_refresh(refresh, apm_modules_dir)
+            activated_refresh_paths.add(package_path)
+            if refreshed_survivor_keys is not None:
+                refreshed_survivor_keys.update(refresh.survivor_keys)
+            logger.progress(
+                f"Refreshed {package_label} in apm_modules/ for "
+                f"{len(refresh.survivor_keys)} surviving declaration(s)"
+            )
+            continue
+
         if package_path.exists():
             try:
                 safe_rmtree(package_path, apm_modules_dir)
-                logger.progress(f"Removed {package} from apm_modules/")
+                logger.progress(f"Removed {package_label} from apm_modules/")
                 logger.verbose_detail(
                     f"    Path: {portable_relpath(package_path, apm_modules_dir)}"
                 )
                 removed += 1
                 deleted_pkg_paths.append(package_path)
             except Exception as e:
-                logger.error(f"Failed to remove {package} from apm_modules/: {e}")
+                logger.error(f"Failed to remove {package_label} from apm_modules/: {e}")
         else:
-            logger.warning(f"Package {package} not found in apm_modules/")
+            logger.warning(f"Package {package_label} not found in apm_modules/")
 
     from ...integration.base_integrator import BaseIntegrator as _BI2
 
@@ -445,6 +507,7 @@ def _sync_integrations_after_uninstall(
     logger: CommandLogger,
     user_scope: bool = False,
     lockfile: LockFile | None = None,
+    modules_dir: Path | None = None,
 ) -> tuple[dict[str, int], dict[str, list[str]]]:
     """Remove deployed files and re-integrate from remaining packages.
 
@@ -483,16 +546,17 @@ def _sync_integrations_after_uninstall(
     _resolved_targets = resolve_targets(
         project_root, user_scope=user_scope, explicit_target=_explicit
     )
+    installed_modules_dir = modules_dir or Path(APM_MODULES_DIR)
     survivor_plan = []
     for dep_ref in surviving_dependency_refs_for_reintegration(
         apm_package,
         project_root,
         lockfile=lockfile,
     ):
-        install_path = dep_ref.get_install_path(project_root / APM_MODULES_DIR)
+        install_path = dep_ref.get_install_path(installed_modules_dir)
         pkg_info = build_installed_package_info(
             dep_ref,
-            project_root / APM_MODULES_DIR,
+            installed_modules_dir,
         )
         if pkg_info is None:
             if install_path.exists():
@@ -691,66 +755,13 @@ def _sync_integrations_after_uninstall(
                 deployed_files.append(_deployed_path_entry(path, project_root, _targets))
                 deployed_files.extend(_skill_bundle_file_entries(path, project_root, _targets))
         except Exception as exc:
-            pkg_id = dep_ref.get_identity() if hasattr(dep_ref, "get_identity") else str(dep_ref)
+            pkg_id = _dependency_public_label(dep_ref)
             logger.warning(
-                f"Best-effort re-integration skipped for {pkg_id}: {exc}. "
+                f"Best-effort re-integration skipped for {pkg_id}. "
                 "Run 'apm install' to rebuild integrated files."
+            )
+            logger.verbose_detail(
+                f"    Re-integration error: {_reintegration_error_detail(dep_ref, exc)}"
             )
 
     return counts, package_deployed_files
-
-
-def _cleanup_stale_mcp(
-    apm_package,
-    lockfile,
-    lockfile_path,
-    old_mcp_servers,
-    modules_dir=None,
-    project_root=None,
-    user_scope: bool = False,
-    scope=None,
-    persist: bool = True,
-):
-    """Remove MCP servers that are no longer needed after uninstall."""
-    if not old_mcp_servers:
-        return
-    from apm_cli.integration.mcp_config_view import CurrentMcpConfigView
-
-    apm_modules_path = modules_dir if modules_dir is not None else Path.cwd() / APM_MODULES_DIR
-    view = CurrentMcpConfigView.derive(
-        apm_package,
-        lockfile,
-        apm_modules_path,
-        trust_transitive_self_defined=True,
-    )
-    new_mcp_servers = MCPIntegrator.get_server_names(view.dependencies)
-    stale_servers = old_mcp_servers - new_mcp_servers
-    if stale_servers:
-        MCPIntegrator.remove_stale(
-            stale_servers,
-            project_root=project_root,
-            user_scope=user_scope,
-            scope=scope,
-        )
-    if persist:
-        MCPIntegrator.update_lockfile(
-            new_mcp_servers,
-            lockfile_path,
-            mcp_configs=dict(view.configs),
-            mcp_config_provenance=dict(view.provenance),
-        )
-        return
-
-    lockfile.mcp_servers = sorted(new_mcp_servers)
-    lockfile.mcp_configs = dict(view.configs)
-    lockfile.mcp_config_provenance = dict(view.provenance)
-    from apm_cli.core.deployment_ledger import DeploymentLedgerCodec
-
-    DeploymentLedgerCodec.replace_mcp_target_servers(
-        lockfile,
-        {
-            runtime: sorted(set(servers).intersection(new_mcp_servers))
-            for runtime, servers in lockfile.mcp_target_servers.items()
-            if set(servers).intersection(new_mcp_servers)
-        },
-    )

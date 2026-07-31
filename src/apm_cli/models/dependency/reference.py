@@ -21,6 +21,8 @@ from pathlib import Path
 from ...cache.url_normalize import SCP_LIKE_RE
 from ...utils.github_host import (
     default_host,
+    is_azure_devops_hostname,
+    is_visualstudio_legacy_hostname,
     validate_ssh_user,
 )
 from ...utils.path_security import (
@@ -239,8 +241,6 @@ class DependencyReference(
 
     def is_azure_devops(self) -> bool:
         """Check if this reference points to Azure DevOps."""
-        from ...utils.github_host import is_azure_devops_hostname
-
         return self.host is not None and is_azure_devops_hostname(self.host)
 
     @classmethod
@@ -750,7 +750,8 @@ class DependencyReference(
             ado_repo = self.ado_repo
             project = urllib.parse.quote(ado_project, safe="")
             repo = urllib.parse.quote(ado_repo, safe="")
-            return f"https://{netloc}/{organization}/{project}/_git/{repo}"
+            org_path = "" if is_visualstudio_legacy_hostname(host) else f"{organization}/"
+            return f"https://{netloc}/{org_path}{project}/_git/{repo}"
         elif self.artifactory_prefix:
             return f"{scheme}://{netloc}/{self.artifactory_prefix}/{self.repo_url}"
         else:

@@ -9,8 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On-prem Azure DevOps Server hosts configured with `ADO_HOST` or
+  `APM_ADO_HOSTS` are no longer misclassified as GitHub Enterprise Server when
+  `GITHUB_HOST` overlaps, keeping ADO credentials isolated end to end.
+  The contract is pinned by `req-sc-013` in
+  `docs/src/content/docs/specs/openapm-v0.1.md`.
+  (by @sergio-sisternes-epam, #2365)
 - Package-declared targets now restrict dependency primitive deployment without expanding project or consumer authorization, preventing Claude-only hooks from leaking into Cursor and repairing stale owned entries on update; the contract is cited in `docs/src/content/docs/specs/openapm-v0.1.md`. By @sergio-sisternes-epam (#2362)
 - Copilot hook packages with JavaScript scripts no longer fail with "hooks: hooks must be an object"; APM keeps generated `package.json` and nested JSON bundle assets out of project `.github/hooks/scripts/` and user `~/.copilot/hooks/scripts/`, where Copilot's recursive hook-loader scan would reject them as descriptors; use `.mjs` for ES module scripts targeting Copilot or VS Code. (#2322)
+- `apm uninstall` now accepts the portable `_local/<name>` key printed by
+  `apm deps list` and rejects missing or ambiguous batches with a nonzero status
+  before APM writes. Reported by @sproott. (#2412, closes #2351)
 - Public `github.com` dependencies now try anonymous HTTPS before resolving
   credentials, so all-public installs no longer open repeated credential or
   Git Credential Manager prompts. Reported by @RuiRomano. (#2406, closes #2400)
@@ -78,8 +87,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit target mappings now preserve `generated_at`, deployment ownership,
   and `mcp_target_servers`, leaving `apm.lock.yaml` byte-identical instead of
   rewriting it. (#2306)
-
+- On-prem Azure DevOps Server hosts configured with `ADO_HOST` or
+  `APM_ADO_HOSTS` are no longer misclassified as GitHub Enterprise Server when
+  `GITHUB_HOST` overlaps, keeping ADO credentials isolated end to end.
+  The contract is pinned by `req-sc-013` in
+  `docs/src/content/docs/specs/openapm-v0.1.md`.
+  (by @sergio-sisternes-epam, #2365)
 - Package-declared targets now restrict dependency primitive deployment without expanding project or consumer authorization, preventing Claude-only hooks from leaking into Cursor and repairing stale owned entries on update; the contract is cited in `docs/src/content/docs/specs/openapm-v0.1.md`. By @sergio-sisternes-epam (#2362)
+- Copilot hooks now normalize session lifecycle aliases to documented `sessionStart` and `agentStop` keys while preserving Claude's `SessionStart` and `Stop` output (reported by @SaulMoro, closes #2337, #2405)
+- `apm install --target intellij` now writes JetBrains Copilot MCP servers to
+  the plugin-read config location, migrates only APM-owned entries from the
+  obsolete data path, and preserves user-authored entries in both files.
+  Reported by @xalvarez. (#2410, closes #2344)
+- JetBrains Copilot on Linux and macOS now sees MCP servers installed by
+  `apm install --target intellij`: APM writes the plugin-read config path,
+  migrates only APM-owned entries from the obsolete data path, and preserves
+  user-authored entries in both files. (closes #2344) (by @xalvarez, #2410)
 - `apm install --dry-run` no longer lists the project's own `includes: auto`
   self-managed files under "Files that would be removed"; the orphan preview
   now excludes the synthesized lockfile self-entry, matching the real install

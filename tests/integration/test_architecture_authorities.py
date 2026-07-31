@@ -14,6 +14,57 @@ from types import ModuleType
 import pytest
 
 
+def test_intellij_mcp_config_path_has_single_owner() -> None:
+    """JetBrains Copilot path selection must stay in its client adapter."""
+    root = Path(__file__).parents[2]
+    owner = (root / "src/apm_cli/adapters/client/intellij.py").read_text(encoding="utf-8")
+    integrator = (root / "src/apm_cli/integration/mcp_integrator.py").read_text(encoding="utf-8")
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
+
+    assert owner.count("def _intellij_config_dir(") == 1
+    assert owner.count("def _legacy_intellij_config_dir(") == 1
+    assert '_xdg_root("XDG_CONFIG_HOME"' in owner
+    assert "_intellij_config_dir" not in integrator
+    assert "JetBrains Copilot MCP paths must come from the IntelliJ adapter" in guard
+
+
+def test_intellij_mcp_config_path_guard_rejects_parallel_decision(tmp_path: Path) -> None:
+    """AC28 must reject a second authored JetBrains config path."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    consumer = sandbox / "src/apm_cli/integration/mcp_integrator.py"
+    consumer.write_text(
+        consumer.read_text(encoding="utf-8")
+        + '\n_PARALLEL_INTELLIJ_PATH = "github-copilot/intellij/mcp.json"\n',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "JetBrains Copilot MCP paths must come from the IntelliJ adapter" in result.stdout
+
+
 def test_self_update_release_selection_has_single_owner() -> None:
     """Installer URL and VERSION must consume one validated release object."""
     root = Path(__file__).parents[2]
@@ -146,6 +197,63 @@ def test_hook_rewrite_scope_has_single_owner() -> None:
     assert consumer_calls == 2
     assert "integrator._deploy_root_for_hook_rewrite(project_root, user_scope)" in kiro
     assert "Hook rewrite scope must route through HookIntegrator" in guard
+
+
+def test_native_hook_event_map_has_single_owner() -> None:
+    """Target-native event names must come from the single _HOOK_EVENT_MAP owner.
+
+    _HOOK_EVENT_MAP was moved to hook_transforms.py (#1078 strangler-fig split).
+    hook_integrator.py re-exports it so kiro_hook_integrator can keep its import
+    path stable.  The guard owner (definition site) is now hook_transforms.py.
+    """
+    root = Path(__file__).parents[2]
+    # The definition lives in the split module (#1078).
+    owner = (root / "src/apm_cli/integration/hook_transforms.py").read_text()
+    kiro = (root / "src/apm_cli/integration/kiro_hook_integrator.py").read_text()
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text()
+
+    assert owner.count("_HOOK_EVENT_MAP:") == 1
+    assert "\n_HOOK_EVENT_MAP =" not in owner
+    assert "from apm_cli.integration.hook_integrator import" in kiro
+    assert "_HOOK_EVENT_MAP," in kiro
+    assert '_KIRO_EVENT_MAP = _HOOK_EVENT_MAP["kiro"]' in kiro
+    assert "Native hook event mapping must have one HookIntegrator owner" in guard
+
+
+def test_native_hook_event_map_guard_rejects_parallel_owner(tmp_path: Path) -> None:
+    """The boundary lint must reject a second native event map."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    duplicate = sandbox / "src/apm_cli/integration/hook_bundle.py"
+    duplicate.write_text(
+        duplicate.read_text(encoding="utf-8") + "\n_HOOK_EVENT_MAP = {}\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Native hook event mapping must have one HookIntegrator owner" in result.stdout
 
 
 def test_hook_rewrite_scope_guard_rejects_parallel_decision(tmp_path: Path) -> None:
@@ -687,6 +795,74 @@ def test_local_bundle_policy_uses_shared_preflight_owner() -> None:
     assert "require_hashes enforcement must route through install/integrity.py" in guard
 
 
+def test_uninstall_selection_has_single_dependency_reference_owner() -> None:
+    """Manifest selection must consume the canonical dependency parser."""
+    root = Path(__file__).parents[2]
+    owner = (root / "src/apm_cli/models/dependency/selection.py").read_text()
+    consumer = (root / "src/apm_cli/commands/uninstall/engine.py").read_text()
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text()
+
+    assert owner.count("def select_manifest_dependency(") == 1
+    assert "dependency = parse_dependency_entry(entry)" in owner
+    assert (
+        consumer.count(
+            "selection = select_manifest_dependency(canonical_for_match, current_deps, lockfile)"
+        )
+        == 1
+    )
+    assert "for dep_entry in current_deps" not in consumer
+    assert "scripts/check_uninstall_selection_owner.py" in guard
+    assert "Uninstall selection must route through dependency/selection.py" in guard
+
+
+def test_uninstall_selection_guard_rejects_parser_bypass(tmp_path: Path) -> None:
+    """The boundary lint rejects uninstall selection outside its owner."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    consumer_path = sandbox / "src/apm_cli/commands/uninstall/engine.py"
+    source = consumer_path.read_text(encoding="utf-8")
+    canonical_call = (
+        "        selection = select_manifest_dependency("
+        "canonical_for_match, current_deps, lockfile)\n"
+    )
+    duplicate_selection = (
+        "        for duplicate_entry in current_deps:\n"
+        "            duplicate_ref = _parse_dependency_entry(duplicate_entry)\n"
+        "            if duplicate_ref.get_identity() == canonical_for_match:\n"
+        "                break\n"
+    )
+    assert source.count(canonical_call) == 1
+    consumer_path.write_text(
+        source.replace(canonical_call, duplicate_selection + canonical_call, 1),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Uninstall selection must route through dependency/selection.py" in result.stdout
+
+
 def test_hook_file_routing_dep_targets_gate_has_static_guard() -> None:
     """Per-file hook routing must compose with dependency target filtering."""
     root = Path(__file__).parents[2]
@@ -1089,6 +1265,134 @@ def test_host_provider_registry_drives_auth_and_backends() -> None:
         assert info.kind == kind
         assert host_backend_factory(kind)(host_info=info).kind == kind
     assert set(samples).issubset(HOST_PROVIDERS)
+
+
+def test_package_identity_casing_uses_host_classification_owner() -> None:
+    """Package casing must not reclassify GITHUB_HOST independently."""
+    root = Path(__file__).parents[2]
+    identity = (root / "src/apm_cli/models/dependency/identity.py").read_text()
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text()
+
+    assert "if is_github_hostname(effective_host):" in identity
+    assert "configured_default_host" not in identity
+    assert "Package identity casing must route through is_github_hostname" in guard
+
+
+def test_package_identity_host_owner_guard_rejects_default_host_shortcut(
+    tmp_path: Path,
+) -> None:
+    """AC20 must reject a parallel GITHUB_HOST casing decision."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    identity_path = sandbox / "src/apm_cli/models/dependency/identity.py"
+    identity_source = identity_path.read_text(encoding="utf-8")
+    identity_path.write_text(
+        identity_source.replace(
+            "if is_github_hostname(effective_host):",
+            "if effective_host.lower() == default_host().lower() "
+            "or is_github_hostname(effective_host):",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Package identity casing must route through is_github_hostname" in result.stdout
+
+
+def test_ado_transport_credentials_route_through_auth_resolver() -> None:
+    """ADO git and REST consumers must use the per-dependency auth context."""
+    root = Path(__file__).parents[2]
+    auth = (root / "src/apm_cli/core/auth.py").read_text()
+    downloader = (root / "src/apm_cli/deps/github_downloader.py").read_text()
+    validation = (root / "src/apm_cli/deps/github_downloader_validation.py").read_text()
+    strategies = (root / "src/apm_cli/deps/download_strategies.py").read_text()
+    pipeline = (root / "src/apm_cli/install/pipeline.py").read_text()
+    ref_reuse = (root / "src/apm_cli/install/helpers/ref_reuse.py").read_text()
+    marketplace = (root / "src/apm_cli/marketplace/client.py").read_text()
+    marketplace_builder = (root / "src/apm_cli/marketplace/builder.py").read_text()
+    marketplace_auth = (root / "src/apm_cli/marketplace/auth_helpers.py").read_text()
+    marketplace_check = (root / "src/apm_cli/commands/marketplace/check.py").read_text()
+    policy = (root / "src/apm_cli/policy/discovery.py").read_text()
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text()
+
+    assert "_clear_platform_token_env(env)" in auth
+    assert '"COPILOT_GITHUB_TOKEN"' in auth
+    assert "self.auth_resolver.git_env_for_context(" in downloader
+    assert "downloader.auth_resolver.git_env_for_context(" in validation
+    assert "probe_env = auth_resolver.git_env_for_context(" in pipeline
+    assert "if is_generic or is_azure_devops_hostname(host):" not in pipeline
+    assert "hardened_git_env_for_context" in ref_reuse
+    assert "hardened_git_env_for_context" in marketplace
+    assert "hardened_git_env_for_context" in marketplace_builder
+    assert 'ctx.token or ctx.host_info.kind == "ado"' in marketplace_auth
+    assert "hardened_git_env_for_context" in marketplace_check
+    assert "auth_resolver.try_with_fallback(" in policy
+    assert "key = (host, dep.port, org)" in pipeline
+    assert "self._host.ado_token" not in strategies
+    assert "ADO transport credentials must route through AuthResolver context" in guard
+
+
+def test_ado_transport_auth_owner_guard_rejects_direct_token_read(
+    tmp_path: Path,
+) -> None:
+    """AC21 must reject a transport consumer bypassing AuthResolver."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    consumer = sandbox / "src/apm_cli/deps/download_strategies.py"
+    consumer.write_text(
+        consumer.read_text(encoding="utf-8")
+        + "\n\ndef _reintroduced_ado_token_read(self):\n"
+        + "    return self._host.ado_token\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "ADO transport credentials must route through AuthResolver context" in result.stdout
 
 
 def test_host_type_hint_cannot_override_recognized_provider() -> None:

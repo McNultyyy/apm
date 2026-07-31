@@ -46,14 +46,15 @@ def _read_survivor_direct_refs(apm_yml_path, packages_to_remove):
         return []
 
     refs = []
-    for dep_entry in data.get("dependencies", {}).get("apm", []) or []:
-        try:
-            ref = _parse_dependency_entry(dep_entry)
-        except (ValueError, TypeError, AttributeError, KeyError):
-            continue
-        if ref.get_identity() in removed_identities:
-            continue
-        refs.append(ref)
+    for section_name in ("dependencies", "devDependencies"):
+        for dep_entry in data.get(section_name, {}).get("apm", []) or []:
+            try:
+                ref = _parse_dependency_entry(dep_entry)
+            except (ValueError, TypeError, AttributeError, KeyError):
+                continue
+            if ref.get_identity() in removed_identities:
+                continue
+            refs.append(ref)
     return refs
 
 
@@ -74,7 +75,12 @@ def _warn_reachability_incomplete(reachability, logger):
         logger.info("Run with --verbose to see which manifest(s) failed.")
     logger.info("Fix or restore the affected manifest(s), then re-run to complete cleanup.")
     for pkg_id, reason in reachability.unverifiable:
-        logger.verbose_detail(f"    {pkg_id}: {reason}")
+        from .engine import _is_private_local_identity
+
+        if _is_private_local_identity(pkg_id):
+            logger.verbose_detail("    local dependency: package manifest could not be verified")
+        else:
+            logger.verbose_detail(f"    {pkg_id}: {reason}")
 
 
 def _compute_actual_orphans(
@@ -153,7 +159,14 @@ def _compute_actual_orphans(
     return candidate_orphans - reachability.reachable, repairs
 
 
-def _dry_run_uninstall(packages_to_remove, apm_modules_dir, logger, apm_yml_path=None):
+def _dry_run_uninstall(
+    packages_to_remove,
+    apm_modules_dir,
+    logger,
+    apm_yml_path=None,
+    *,
+    surviving_dependencies=None,
+):
     """Show what would be removed without making changes.
 
     *apm_yml_path* is the project's manifest, read here BEFORE it is
@@ -164,11 +177,17 @@ def _dry_run_uninstall(packages_to_remove, apm_modules_dir, logger, apm_yml_path
     reachability rescue (see ``_compute_actual_orphans``) is exercised
     for every real ``--dry-run`` invocation.
     """
-    from .engine import _build_children_index, _parse_dependency_entry
+    from .engine import (
+        _build_children_index,
+        _dependency_public_label,
+        _parse_dependency_entry,
+        _surviving_local_refs_at_install_path,
+    )
 
     logger.progress(f"Dry run: Would remove {len(packages_to_remove)} package(s):")
     for pkg in packages_to_remove:
-        logger.progress(f"  - {pkg} from apm.yml")
+        package_label = _dependency_public_label(pkg)
+        logger.progress(f"  - {package_label} from apm.yml")
         try:
             dep_ref = _parse_dependency_entry(pkg)
             package_path = dep_ref.get_install_path(apm_modules_dir)
@@ -176,7 +195,18 @@ def _dry_run_uninstall(packages_to_remove, apm_modules_dir, logger, apm_yml_path
             pkg_str = pkg if isinstance(pkg, str) else str(pkg)
             package_path = apm_modules_dir / pkg_str.split("/")[-1]
         if apm_modules_dir.exists() and package_path.exists():
-            logger.progress(f"  - {pkg} from apm_modules/")
+            shared_survivors = _surviving_local_refs_at_install_path(
+                pkg,
+                surviving_dependencies or [],
+                apm_modules_dir,
+            )
+            if shared_survivors:
+                logger.progress(
+                    f"  - refresh {package_label} in apm_modules/ for "
+                    f"{len(shared_survivors)} surviving declaration(s)"
+                )
+            else:
+                logger.progress(f"  - {package_label} from apm_modules/")
 
     from ...deps.lockfile import LockFile, get_lockfile_path
 
@@ -234,7 +264,8 @@ def _persist_uninstall_state(
     logger,
     pre_mcp_servers,
     modules_dir,
-) -> None:
+    refreshed_survivor_keys=None,
+):
     """Steps 9-10 of the uninstall flow: sync integrations and flush lockfile.
 
     Encapsulates integration cleanup, deployment-state reconciliation, MCP
@@ -242,12 +273,19 @@ def _persist_uninstall_state(
     have been removed from disk and the in-memory lockfile has been mutated
     (Steps 4-8).  All exceptions are surfaced as logged warnings so the
     final summary in the caller is always reached.
+
+    Returns the MCP cleanup error (IntelliJConfigError or PathTraversalError)
+    if one occurred, else None, so the caller can decide the exit code.
     """
     import traceback as _traceback
 
+    import apm_cli.commands.uninstall.cli as _cli_m
+
     from ...core.scope import InstallScope
     from ...models.apm_package import APMPackage
-    from .engine import _cleanup_stale_mcp, _sync_integrations_after_uninstall
+
+    _sync_integrations_after_uninstall = _cli_m._sync_integrations_after_uninstall
+    _cleanup_stale_mcp = _cli_m._cleanup_stale_mcp
 
     # Step 9: Sync integrations and reconcile deployment state.
     cleaned = {
@@ -269,6 +307,7 @@ def _persist_uninstall_state(
             logger,
             user_scope=scope is InstallScope.USER,
             lockfile=lockfile,
+            modules_dir=modules_dir,
         )
     except Exception as _sync_err:
         logger.warning(f"Integration cleanup failed: {type(_sync_err).__name__}: {_sync_err}")
@@ -287,6 +326,7 @@ def _persist_uninstall_state(
                     deploy_root=deploy_root,
                     all_deployed_files=all_deployed_files,
                     surviving_deployed_files=surviving_deployed_files,
+                    fully_refreshed_dependency_keys=refreshed_survivor_keys,
                 )
                 or lockfile_updated
             )
@@ -304,7 +344,12 @@ def _persist_uninstall_state(
             logger.verbose_detail(f"    Removed {count} deployed {label} file(s)")
 
     # Step 10: MCP cleanup and deferred lockfile write.
+    from ...utils.path_security import PathTraversalError
+
+    mcp_cleanup_error = None
     try:
+        from ...adapters.client.intellij import IntelliJConfigError
+
         apm_package = APMPackage.from_apm_yml(manifest_path)
         _cleanup_stale_mcp(
             apm_package,
@@ -317,8 +362,26 @@ def _persist_uninstall_state(
             scope=scope,
             persist=False,
         )
-    except Exception:
-        logger.warning("MCP cleanup during uninstall failed")
+    except (IntelliJConfigError, PathTraversalError) as cleanup_error:
+        mcp_cleanup_error = cleanup_error
+        recovery = ""
+        if isinstance(cleanup_error, PathTraversalError):
+            recovery = (
+                " Fix the MCP config path, then run 'apm install' to reconcile "
+                "the stale entry; the package was already removed from apm.yml."
+            )
+        logger.error(
+            "Uninstall incomplete: package removal completed, but MCP cleanup failed: "
+            f"{cleanup_error}{recovery}"
+        )
+        logger.verbose_detail(_traceback.format_exc().rstrip())
+    except Exception as cleanup_error:
+        logger.warning(
+            f"MCP cleanup during uninstall failed: {type(cleanup_error).__name__}: "
+            f"{cleanup_error}. Package removal completed; run 'apm install' "
+            "to reconcile stale MCP entries."
+        )
+        logger.verbose_detail(_traceback.format_exc().rstrip())
 
     if lockfile and lockfile_updated and lockfile_ready:
         try:
@@ -332,3 +395,63 @@ def _persist_uninstall_state(
             logger.warning(
                 "Failed to update lockfile -- it may be out of sync with uninstalled packages."
             )
+
+    return mcp_cleanup_error
+
+
+def _cleanup_stale_mcp(
+    apm_package,
+    lockfile,
+    lockfile_path,
+    old_mcp_servers,
+    modules_dir=None,
+    project_root=None,
+    user_scope: bool = False,
+    scope=None,
+    persist: bool = True,
+):
+    """Remove MCP servers that are no longer needed after uninstall."""
+    if not old_mcp_servers:
+        return
+    from apm_cli.constants import APM_MODULES_DIR
+    from apm_cli.integration.mcp_config_view import CurrentMcpConfigView
+    from apm_cli.integration.mcp_integrator import MCPIntegrator
+
+    apm_modules_path = modules_dir if modules_dir is not None else Path.cwd() / APM_MODULES_DIR
+    view = CurrentMcpConfigView.derive(
+        apm_package,
+        lockfile,
+        apm_modules_path,
+        trust_transitive_self_defined=True,
+    )
+    new_mcp_servers = MCPIntegrator.get_server_names(view.dependencies)
+    stale_servers = old_mcp_servers - new_mcp_servers
+    if stale_servers:
+        MCPIntegrator.remove_stale(
+            stale_servers,
+            project_root=project_root,
+            user_scope=user_scope,
+            scope=scope,
+        )
+    if persist:
+        MCPIntegrator.update_lockfile(
+            new_mcp_servers,
+            lockfile_path,
+            mcp_configs=dict(view.configs),
+            mcp_config_provenance=dict(view.provenance),
+        )
+        return
+
+    lockfile.mcp_servers = sorted(new_mcp_servers)
+    lockfile.mcp_configs = dict(view.configs)
+    lockfile.mcp_config_provenance = dict(view.provenance)
+    from apm_cli.core.deployment_ledger import DeploymentLedgerCodec
+
+    DeploymentLedgerCodec.replace_mcp_target_servers(
+        lockfile,
+        {
+            runtime: sorted(set(servers).intersection(new_mcp_servers))
+            for runtime, servers in lockfile.mcp_target_servers.items()
+            if set(servers).intersection(new_mcp_servers)
+        },
+    )

@@ -9,15 +9,26 @@ from ...constants import APM_YML_FILENAME
 from ...core.command_logger import CommandLogger
 from ._orphan_ops import _persist_uninstall_state
 from .engine import (
+    _cleanup_staged_local_refreshes,
     _cleanup_transitive_orphans,
+    _dependency_public_label,
     _dry_run_uninstall,
     _parse_dependency_entry,
     _remove_packages_from_disk,
+    _stage_shared_local_survivors,
     _validate_uninstall_packages,
+)
+from .engine import (
+    _cleanup_stale_mcp as _cleanup_stale_mcp,
+)
+from .engine import (
+    _sync_integrations_after_uninstall as _sync_integrations_after_uninstall,
 )
 
 
-def _collect_deployed_files(packages_to_remove, actual_orphans, lockfile):
+def _collect_deployed_files(
+    packages_to_remove, actual_orphans, lockfile, *, refreshed_survivor_keys=None
+):
     """Collect deployed files for removed packages before lockfile mutation."""
     from ...integration.base_integrator import BaseIntegrator
 
@@ -32,7 +43,7 @@ def _collect_deployed_files(packages_to_remove, actual_orphans, lockfile):
     all_deployed_files = builtins.set()
     if lockfile:
         for dep_key, dep in lockfile.dependencies.items():
-            if dep_key in removed_keys:
+            if dep_key in removed_keys or dep_key in (refreshed_survivor_keys or builtins.set()):
                 all_deployed_files.update(dep.deployed_files)
     return BaseIntegrator.normalize_managed_files(all_deployed_files) or builtins.set()
 
@@ -62,9 +73,31 @@ def _update_lockfile_after_remove(lockfile, packages_to_remove, actual_orphans):
     return lockfile_updated
 
 
-@click.command(help="Remove APM packages, their integrated files, and apm.yml entries")
+def _prepare_dependency_sections(data: dict) -> tuple[bool, list, list, list]:
+    """Ensure dependency sections exist and return their mutable list views."""
+    if "dependencies" not in data:
+        data["dependencies"] = {}
+    if "apm" not in data["dependencies"]:
+        data["dependencies"]["apm"] = []
+    had_dev_section = "devDependencies" in data
+    if not had_dev_section:
+        data["devDependencies"] = {}
+    if "apm" not in data["devDependencies"]:
+        data["devDependencies"]["apm"] = []
+    prod_deps = data["dependencies"]["apm"] or []
+    dev_deps = data["devDependencies"]["apm"] or []
+    return had_dev_section, prod_deps, dev_deps, [*prod_deps, *dev_deps]
+
+
+@click.command(
+    help="Remove packages using manifest entries or direct locked keys from 'apm deps list'"
+)
 @click.argument("packages", nargs=-1, required=True)
-@click.option("--dry-run", is_flag=True, help="Show what would be removed without removing")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Preview removal plan (pre-uninstall scripts still run)",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed removal information")
 @click.option(
     "--global",
@@ -101,9 +134,11 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
     manifest_path = get_manifest_path(scope)
     apm_dir = get_apm_dir(scope)
     deploy_root = get_deploy_root(scope)
+    modules_dir = get_modules_dir(scope)
     manifest_display = str(manifest_path) if scope is InstallScope.USER else APM_YML_FILENAME
 
     logger = CommandLogger("uninstall", verbose=verbose, dry_run=dry_run)
+    staged_local_refreshes = {}
     try:
         # Check if apm.yml exists
         if not manifest_path.exists():
@@ -125,17 +160,6 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
 
         logger.start(f"Uninstalling {len(packages)} package(s)...")
 
-        # Fire pre-uninstall lifecycle scripts
-        _fire_uninstall_scripts(
-            "pre-uninstall",
-            packages=packages,
-            scope=scope,
-            manifest_path=manifest_path,
-            logger=logger,
-            verbose=verbose,
-            deploy_root=deploy_root,
-        )
-
         # Read current apm.yml
         from ...utils.yaml_io import dump_yaml_roundtrip, load_yaml_roundtrip
 
@@ -146,24 +170,12 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
             logger.error(f"Failed to read {apm_yml_path}: {e}")
             sys.exit(1)
 
-        if "dependencies" not in data:
-            data["dependencies"] = {}
-        if "apm" not in data["dependencies"]:
-            data["dependencies"]["apm"] = []
         # Track whether devDependencies was synthesised so we don't leave
         # an empty section behind for projects that never used --dev.
-        had_dev_section = "devDependencies" in data
-        if not had_dev_section:
-            data["devDependencies"] = {}
-        if "apm" not in data["devDependencies"]:
-            data["devDependencies"]["apm"] = []
-
-        prod_deps = data["dependencies"]["apm"] or []
-        dev_deps = data["devDependencies"]["apm"] or []
+        had_dev_section, prod_deps, dev_deps, current_deps = _prepare_dependency_sections(data)
         # `apm install --dev <pkg>` writes under devDependencies.apm. Uninstall
         # must scan both sections so dev-installed packages are removable
         # (regression trap for #1549).
-        current_deps = list(prod_deps) + list(dev_deps)
 
         # Load lockfile early: used for marketplace ref resolution in Step 1
         # and reused for MCP state capture and transitive orphan cleanup below.
@@ -180,25 +192,93 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
         packages_to_remove, packages_not_found = _validate_uninstall_packages(
             packages, current_deps, logger, lockfile, auth_resolver=auth_resolver, dry_run=dry_run
         )
+        if packages_not_found:
+            logger.error(
+                f"Uninstall aborted: {len(packages_not_found)} requested package(s) "
+                "could not be selected. Resolve the errors above and retry; "
+                "no changes were made."
+            )
+            sys.exit(1)
         if not packages_to_remove:
-            logger.warning("No packages found in apm.yml to remove")
-            return
+            logger.error("No packages were selected; no changes were made.")
+            sys.exit(1)
+        selected_package_labels = tuple(
+            _dependency_public_label(package) for package in packages_to_remove
+        )
+
+        # Fire scripts only after every requested identifier has selected one
+        # dependency, so failed validation is an atomic no-op.
+        _fire_uninstall_scripts(
+            "pre-uninstall",
+            packages=selected_package_labels,
+            scope=scope,
+            manifest_path=manifest_path,
+            logger=logger,
+            verbose=verbose,
+            deploy_root=deploy_root,
+        )
+
+        # Pre-uninstall scripts may intentionally edit the manifest or lockfile.
+        # Reload both, then revalidate without repeating success diagnostics so
+        # those edits are preserved rather than overwritten by a stale snapshot.
+        try:
+            data = load_yaml_roundtrip(apm_yml_path) or {}
+        except Exception as e:
+            logger.error(f"Failed to re-read {apm_yml_path} after pre-uninstall: {e}")
+            sys.exit(1)
+        had_dev_section, prod_deps, dev_deps, current_deps = _prepare_dependency_sections(data)
+        lockfile = LockFile.read(lockfile_path)
+        packages_to_remove, packages_not_found = _validate_uninstall_packages(
+            packages,
+            current_deps,
+            logger,
+            lockfile,
+            auth_resolver=auth_resolver,
+            dry_run=dry_run,
+            log_matches=False,
+        )
+        if packages_not_found or not packages_to_remove:
+            logger.error(
+                "Uninstall aborted because pre-uninstall scripts changed dependency "
+                "selection. Review apm.yml and retry; no APM writes were made."
+            )
+            sys.exit(1)
+        selected_package_labels = tuple(
+            _dependency_public_label(package) for package in packages_to_remove
+        )
+        surviving_deps = list(current_deps)
+        for package in packages_to_remove:
+            surviving_deps.remove(package)
+        if not dry_run:
+            staged_local_refreshes = _stage_shared_local_survivors(
+                packages_to_remove,
+                surviving_deps,
+                modules_dir,
+                manifest_path.parent,
+                logger,
+            )
 
         # Step 2: Dry run
-        modules_dir = get_modules_dir(scope)
         if dry_run:
-            _dry_run_uninstall(packages_to_remove, modules_dir, logger, apm_yml_path)
+            _dry_run_uninstall(
+                packages_to_remove,
+                modules_dir,
+                logger,
+                apm_yml_path,
+                surviving_dependencies=surviving_deps,
+            )
             return
 
         # Step 3: Remove from apm.yml
         for package in packages_to_remove:
+            package_label = _dependency_public_label(package)
             if package in dev_deps:
                 dev_deps.remove(package)
                 section = "devDependencies.apm"
             elif package in prod_deps:
                 prod_deps.remove(package)
                 section = "dependencies.apm"
-            logger.progress(f"Removed {package} from {section} in apm.yml")
+            logger.progress(f"Removed {package_label} from {section} in apm.yml")
         data["dependencies"]["apm"] = prod_deps
         data["devDependencies"]["apm"] = dev_deps
         # Drop empty devDependencies wrappers so the manifest stays clean
@@ -220,7 +300,14 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
         )
 
         # Step 5: Remove packages from disk
-        removed_from_modules = _remove_packages_from_disk(packages_to_remove, modules_dir, logger)
+        refreshed_survivor_keys = builtins.set()
+        removed_from_modules = _remove_packages_from_disk(
+            packages_to_remove,
+            modules_dir,
+            logger,
+            staged_refreshes=staged_local_refreshes,
+            refreshed_survivor_keys=refreshed_survivor_keys,
+        )
 
         # Step 6: Cleanup transitive orphans
         orphan_removed, actual_orphans = _cleanup_transitive_orphans(
@@ -229,7 +316,12 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
         removed_from_modules += orphan_removed
 
         # Step 7: Collect deployed files for removed packages (before lockfile mutation)
-        all_deployed_files = _collect_deployed_files(packages_to_remove, actual_orphans, lockfile)
+        all_deployed_files = _collect_deployed_files(
+            packages_to_remove,
+            actual_orphans,
+            lockfile,
+            refreshed_survivor_keys=refreshed_survivor_keys,
+        )
 
         # Step 8: Mutate dependency state in memory. Persistence happens once
         # after survivor ownership, hashes, ledger, and MCP state agree.
@@ -239,7 +331,7 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
 
         # Steps 9-10: Sync integrations, reconcile lockfile state, MCP cleanup,
         # and flush the deferred lockfile write.
-        _persist_uninstall_state(
+        mcp_cleanup_error = _persist_uninstall_state(
             manifest_path=manifest_path,
             deploy_root=deploy_root,
             all_deployed_files=all_deployed_files,
@@ -250,31 +342,34 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
             logger=logger,
             pre_mcp_servers=_pre_uninstall_mcp_servers,
             modules_dir=modules_dir,
+            refreshed_survivor_keys=refreshed_survivor_keys,
         )
 
         # Final summary
         summary_lines = [f"Removed {len(packages_to_remove)} package(s) from apm.yml"]
         if removed_from_modules > 0:
             summary_lines.append(f"Removed {removed_from_modules} package(s) from apm_modules/")
-        logger.success("Uninstall complete: " + ", ".join(summary_lines))
-
-        if packages_not_found:
-            logger.warning(f"Note: {len(packages_not_found)} package(s) were not found in apm.yml")
+        if mcp_cleanup_error is None:
+            logger.success("Uninstall complete: " + ", ".join(summary_lines))
 
         # Fire post-uninstall lifecycle scripts
         _fire_uninstall_scripts(
             "post-uninstall",
-            packages=packages_to_remove,
+            packages=selected_package_labels,
             scope=scope,
             manifest_path=manifest_path,
             logger=logger,
             verbose=verbose,
             deploy_root=deploy_root,
         )
+        if mcp_cleanup_error is not None:
+            sys.exit(1)
 
     except Exception as e:
         logger.error(f"Error uninstalling packages: {e}")
         sys.exit(1)
+    finally:
+        _cleanup_staged_local_refreshes(staged_local_refreshes, modules_dir)
 
 
 def _fire_uninstall_scripts(

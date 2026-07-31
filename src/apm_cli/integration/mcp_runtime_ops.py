@@ -95,6 +95,7 @@ def install_for_runtime(
     project_root=None,
     user_scope: bool = False,
     logger=None,
+    replace_existing: bool = False,
 ) -> bool:
     """Install MCP dependencies for a specific runtime.
 
@@ -117,6 +118,7 @@ def install_for_runtime(
                     shared_runtime_vars=shared_runtime_vars,
                     project_root=project_root,
                     user_scope=user_scope,
+                    replace_existing=replace_existing,
                 )
                 if result["failed"]:
                     logger.error(f"  Failed to install {dep}")

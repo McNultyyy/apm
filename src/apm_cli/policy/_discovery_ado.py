@@ -17,7 +17,11 @@ import base64
 from typing import TYPE_CHECKING
 
 from ..cache.url_normalize import SCP_LIKE_RE
-from ..utils.github_host import build_ado_api_url, is_visualstudio_legacy_hostname
+from ..utils.github_host import (
+    build_ado_api_url,
+    is_visualstudio_legacy_hostname,
+    parse_ado_repo_url,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -33,6 +37,7 @@ def _fetch_from_ado_repo(
     repo: str,
     host: str,
     project_root: Path,
+    port: int | None = None,
     no_cache: bool = False,
     expected_hash: str | None = None,
 ) -> PolicyFetchResult:
@@ -43,7 +48,8 @@ def _fetch_from_ado_repo(
     """
     from apm_cli.policy import discovery as _d
 
-    repo_ref = f"{host}/{org}/{project}/{repo}"
+    host_label = f"{host}:{port}" if port is not None else host
+    repo_ref = f"{host_label}/{org}/{project}/{repo}"
     source_label = f"org:{repo_ref}"
     cache_entry: _CacheEntry | None = None
 
@@ -62,7 +68,10 @@ def _fetch_from_ado_repo(
                 warnings=cache_entry.warnings,
             )
 
-    content, error = _d._fetch_ado_contents(org, project, repo, "apm-policy.yml", host=host)
+    fetch_kwargs: dict = {"host": host}
+    if port is not None:
+        fetch_kwargs["port"] = port
+    content, error = _d._fetch_ado_contents(org, project, repo, "apm-policy.yml", **fetch_kwargs)
 
     if error:
         if "404" in error:
@@ -122,37 +131,54 @@ def _fetch_ado_contents(
     file_path: str,
     *,
     host: str = "dev.azure.com",
+    port: int | None = None,
 ) -> tuple[str | None, str | None]:
     """Fetch file contents from Azure DevOps Items API.
 
     Returns ``(content_string, error_string)``. One will be ``None``.
+    Uses ``try_with_fallback`` for PAT-to-bearer protocol support.
     """
     from apm_cli.policy import discovery as _d
 
-    api_url = build_ado_api_url(org, project, repo, file_path, host=host)
-    repo_ref = f"{host}/{org}/{project}/{repo}"
+    api_url = build_ado_api_url(org, project, repo, file_path, host=host, port=port)
+    host_label = f"{host}:{port}" if port is not None else host
+    repo_ref = f"{host_label}/{org}/{project}/{repo}"
 
     # ADO auth is centralized in AuthResolver: ADO_APM_PAT uses Basic auth,
-    # and az CLI AAD tokens use Bearer auth. No GitHub PATs are consulted.
+    # and az CLI AAD tokens use Bearer. try_with_fallback handles PAT-to-bearer.
     from ..core.auth import AuthResolver
 
-    headers: dict[str, str] = {}
     auth_resolver = AuthResolver()
-    auth_ctx = auth_resolver.resolve(host, org=org)
-    if auth_ctx.token:
-        if auth_ctx.auth_scheme == "bearer":
-            headers["Authorization"] = f"Bearer {auth_ctx.token}"
-        else:
-            basic_cred = base64.b64encode(f":{auth_ctx.token}".encode()).decode()
-            headers["Authorization"] = f"Basic {basic_cred}"
+
+    def _headers(token, git_env):
+        if not token:
+            return {}
+        count = int(git_env.get("GIT_CONFIG_COUNT", "0") or "0")
+        for index in range(max(0, count)):
+            value = git_env.get(f"GIT_CONFIG_VALUE_{index}", "")
+            if value.lower().startswith("authorization: bearer "):
+                return {"Authorization": value[len("authorization: ") :].strip()}
+        cred = base64.b64encode(f":{token}".encode()).decode()
+        return {"Authorization": f"Basic {cred}"}
+
+    def _request(token, git_env):
+        response = _d.requests.get(
+            api_url,
+            headers=_headers(token, git_env),
+            timeout=10,
+            allow_redirects=False,
+        )
+        if response.status_code in (401, 403):
+            raise RuntimeError(f"{response.status_code}: unauthorized")
+        return response
 
     try:
-        resp = _d.requests.get(api_url, headers=headers, timeout=10, allow_redirects=False)
+        fallback_kwargs = {"org": org, "path": f"{org}/{project}/{repo}", "unauth_first": False}
+        if port is not None:
+            fallback_kwargs["port"] = port
+        resp = auth_resolver.try_with_fallback(host, _request, **fallback_kwargs)
         if resp.status_code == 404:
             return None, "404: Policy file not found"
-        if resp.status_code in (401, 403):
-            remediation = auth_resolver.build_error_context(host, "fetch org policy", org=org)
-            return None, (f"{resp.status_code}: Access denied to {repo_ref}{remediation}")
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("Location", "<no Location header>")
             return None, (
@@ -166,6 +192,12 @@ def _fetch_ado_contents(
         return None, f"Timeout fetching policy from {repo_ref}"
     except _d.requests.exceptions.ConnectionError:
         return None, f"Connection error fetching policy from {repo_ref}"
+    except RuntimeError as exc:
+        error_kwargs = {"org": org}
+        if port is not None:
+            error_kwargs["port"] = port
+        remediation = auth_resolver.build_error_context(host, "fetch org policy", **error_kwargs)
+        return None, f"{exc}: Access denied to {repo_ref}{remediation}"
     except Exception as e:
         return None, f"Error fetching policy from {repo_ref}: {e}"
 
@@ -313,15 +345,52 @@ def _parse_scheme_remote_url(url: str) -> tuple[str, str] | None:
     """
     from apm_cli.policy import discovery as _d
 
+    from ..utils.github_host import is_azure_devops_hostname
+
     try:
         parsed = _d.urlparse(url)
         host = parsed.hostname or ""
         path_parts = parsed.path.strip("/").removesuffix(".git").rstrip("/").split("/")
         if is_visualstudio_legacy_hostname(host):
             return (host[: -len(".visualstudio.com")], host)
+        if is_azure_devops_hostname(host):
+            ado_coordinates = parse_ado_repo_url(url)
+            if ado_coordinates is None:
+                return None
+            return ado_coordinates[0], host
         if host and path_parts and path_parts[0]:
             return (path_parts[0], host)
+    except ValueError as exc:
+        if "mounted below '/tfs/'" in str(exc):
+            raise
+        return None
     except Exception:
         return None
 
     return None
+
+
+def _extract_port_from_git_remote(project_root) -> int | None:
+    """Return the explicit HTTPS port from the git remote ``origin``, if any.
+
+    Used by the on-premises ADO discovery path to pass non-default ports
+    through to the Items API URL builder and the auth resolver.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=project_root,
+            timeout=5,
+        )
+        if result.returncode != 0 or "://" not in result.stdout:
+            return None
+        from apm_cli.policy import discovery as _d
+
+        return _d.urlparse(result.stdout.strip()).port
+    except (ValueError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None

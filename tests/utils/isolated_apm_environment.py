@@ -201,9 +201,11 @@ _APM_REMOTE_CONTROL_ENV_NAMES = frozenset(
         "APM_ALLOW_PROTOCOL_FALLBACK",
         "APM_GIT_CREDENTIAL_TIMEOUT",
         "APM_GIT_PROTOCOL",
+        "APM_ADO_HOSTS",
         "APM_GITLAB_HOSTS",
         "APM_NO_CACHE",
         "APM_POLICY_DISABLE",
+        "ADO_HOST",
         "APM_TEST_FAIL_LOCK_REPLACE",
         "APM_TEST_LOOPBACK_PORTS",
         "GITHUB_HOST",
@@ -274,6 +276,7 @@ _PINNED_ENVIRONMENT_NAMES = (
     "HOME",
     "USERPROFILE",
     "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "LOCALAPPDATA",
     "APM_HOME",
@@ -382,6 +385,7 @@ class IsolatedApmEnvironment:
         temp_root = root / "tmp"
         guard_root = root / "network_guard"
         xdg_config_root = root / "xdg-config"
+        xdg_data_root = root / "xdg-data"
         xdg_cache_root = root / "xdg-cache"
         local_app_data = root / "local-app-data"
         gh_config_root = root / "gh-config"
@@ -396,6 +400,7 @@ class IsolatedApmEnvironment:
             temp_root,
             guard_root,
             xdg_config_root,
+            xdg_data_root,
             xdg_cache_root,
             local_app_data,
             gh_config_root,
@@ -422,6 +427,7 @@ class IsolatedApmEnvironment:
             "HOME": str(home),
             "USERPROFILE": str(home),
             "XDG_CONFIG_HOME": str(xdg_config_root),
+            "XDG_DATA_HOME": str(xdg_data_root),
             "XDG_CACHE_HOME": str(xdg_cache_root),
             "LOCALAPPDATA": str(local_app_data),
             "APM_HOME": str(config_root),

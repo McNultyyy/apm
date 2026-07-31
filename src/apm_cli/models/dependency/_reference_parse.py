@@ -9,7 +9,7 @@ free of import cycles.
 
 import re
 import urllib.parse
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING
 
 from ...cache.url_normalize import SCP_LIKE_RE
@@ -518,7 +518,7 @@ class _ReferenceParseMixin:
         # --- Local path detection (must run before URL/host parsing) ---
         if cls.is_local_path(dependency_str):
             local = dependency_str.strip()
-            pkg_name = Path(local).name
+            pkg_name = (PureWindowsPath(local) if "\\" in local else Path(local)).name
             if not pkg_name or pkg_name in (".", ".."):
                 raise ValueError(
                     f"Local path '{local}' does not resolve to a named directory. "

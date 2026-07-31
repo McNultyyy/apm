@@ -267,8 +267,8 @@ class DownloadDelegate:
             effective_token: str | None = ""
         elif token is not None:
             effective_token = token
-        elif is_ado:
-            effective_token = self._host.ado_token
+        elif is_ado and dep_ref is not None:
+            effective_token = self._host.auth_resolver.resolve_for_dep(dep_ref).token
         elif backend.is_github_family:
             effective_token = self._host.github_token
         elif backend.kind == "gitlab" and dep_ref is not None:

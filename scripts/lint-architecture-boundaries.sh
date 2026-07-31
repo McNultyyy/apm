@@ -93,6 +93,24 @@ if [ "$hook_scope_owner_count" -ne 1 ] \
     [ -n "$hook_scope_duplicate_hits" ] && echo "$hook_scope_duplicate_hits"
     violations=$((violations + 1))
 fi
+# _HOOK_EVENT_MAP definition was moved to hook_transforms.py (split #1078);
+# hook_integrator.py re-exports it.  The guard owner is now hook_transforms.py.
+hook_event_map_file="src/apm_cli/integration/hook_transforms.py"
+hook_event_map_owner_count=$(grep -Ec \
+    '^_HOOK_EVENT_MAP[[:space:]]*[:=]' "$hook_event_map_file" || true)
+hook_event_map_duplicate_hits=$(
+    grep -REn --include='*.py' \
+        '^_HOOK_EVENT_MAP[[:space:]]*[:=]' \
+        src/apm_cli \
+        | grep -v "^${hook_event_map_file}:" \
+        || true
+)
+if [ "$hook_event_map_owner_count" -ne 1 ] \
+    || [ -n "$hook_event_map_duplicate_hits" ]; then
+    echo "[x] Native hook event mapping must have one HookIntegrator owner"
+    [ -n "$hook_event_map_duplicate_hits" ] && echo "$hook_event_map_duplicate_hits"
+    violations=$((violations + 1))
+fi
 check_pattern \
     "Lockfile supported-version authority belongs in deps/lockfile.py" \
     'SUPPORTED_LOCKFILE_VERSIONS|lockfile_version[[:space:]]+(==|!=|in)' \
@@ -326,6 +344,31 @@ if ! grep -A12 'if source == "local"' src/apm_cli/models/dependency/identity.py 
     | grep -q 'anchored_local_path' \
     || ! grep -q 'declaring_parent' src/apm_cli/deps/lockfile.py; then
     echo "[x] Local identity must use its anchor and persist declaring-parent provenance"
+    violations=$((violations + 1))
+fi
+uninstall_selection_owner="src/apm_cli/models/dependency/selection.py"
+uninstall_selection_consumer="src/apm_cli/commands/uninstall/engine.py"
+uninstall_selection_owner_count=$(grep -Ec \
+    '^def select_manifest_dependency\(' "$uninstall_selection_owner" || true)
+uninstall_selection_consumer_count=$(grep -Ec \
+    '^[[:space:]]*selection = select_manifest_dependency\(' \
+    "$uninstall_selection_consumer" || true)
+uninstall_selection_parallel_hits=$(grep -En \
+    'for dep_entry in current_deps|dep_ref\.get_identity\(\) == pkg_identity' \
+    "$uninstall_selection_consumer" || true)
+uninstall_selection_ast_output=$(python3 scripts/check_uninstall_selection_owner.py 2>&1)
+uninstall_selection_ast_status=$?
+if [ "$uninstall_selection_owner_count" -ne 1 ] \
+    || [ "$uninstall_selection_consumer_count" -ne 1 ] \
+    || ! grep -q 'dependency = parse_dependency_entry(entry)' \
+        "$uninstall_selection_owner" \
+    || [ -n "$uninstall_selection_parallel_hits" ] \
+    || [ "$uninstall_selection_ast_status" -ne 0 ]; then
+    echo "[x] Uninstall selection must route through dependency/selection.py"
+    [ -n "$uninstall_selection_parallel_hits" ] \
+        && echo "$uninstall_selection_parallel_hits"
+    [ "$uninstall_selection_ast_status" -ne 0 ] \
+        && echo "$uninstall_selection_ast_output"
     violations=$((violations + 1))
 fi
 check_pattern \
@@ -1005,6 +1048,53 @@ if ! grep -q 'getattr(module, "pytestmark"' "$taxonomy_plugin" \
     violations=$((violations + 1))
 fi
 
+echo "[*] AC23: host-classification authority"
+identity_owner="src/apm_cli/models/dependency/identity.py"
+if ! grep -q 'if is_github_hostname(effective_host):' "$identity_owner" \
+    || grep -Eq 'effective_host.*==.*default_host|configured_default_host' "$identity_owner"; then
+    echo "[x] Package identity casing must route through is_github_hostname"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC24: ADO transport credential authority"
+ado_transport_direct_hits=$(
+    grep -En '(\._host|host)\.ado_token' \
+        src/apm_cli/deps/download_strategies.py \
+        src/apm_cli/deps/clone_engine.py \
+        src/apm_cli/deps/github_downloader_validation.py \
+        || true
+)
+if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/auth.py \
+    || ! grep -q '"COPILOT_GITHUB_TOKEN"' src/apm_cli/core/auth.py \
+    || ! grep -q 'self.auth_resolver.git_env_for_context(' \
+        src/apm_cli/deps/github_downloader.py \
+    || ! grep -q 'downloader.auth_resolver.git_env_for_context(' \
+        src/apm_cli/deps/github_downloader_validation.py \
+    || ! grep -q 'probe_env = auth_resolver.git_env_for_context(' \
+        src/apm_cli/install/pipeline.py \
+    || grep -q 'if is_generic or is_azure_devops_hostname(host):' \
+        src/apm_cli/install/pipeline.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/install/helpers/ref_reuse.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/marketplace/client.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/marketplace/builder.py \
+    || ! grep -q 'ctx.token or ctx.host_info.kind == "ado"' \
+        src/apm_cli/marketplace/auth_helpers.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/commands/marketplace/check.py \
+    || ! grep -q 'auth_resolver.try_with_fallback(' \
+        src/apm_cli/policy/discovery.py \
+    || ! grep -q 'key = (host, dep.port, org)' \
+        src/apm_cli/install/pipeline.py \
+    || [ -n "$ado_transport_direct_hits" ]; then
+    echo "[x] ADO transport credentials must route through AuthResolver context"
+    [ -n "$ado_transport_direct_hits" ] && echo "$ado_transport_direct_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC25: lifecycle smoke partition authority"
 lifecycle_topology_contract="tests/quality/test_ci_topology.py"
 lifecycle_membership_hits=$(
     grep -En \
@@ -1022,7 +1112,7 @@ if ! grep -q '^def _validated_lifecycle_node_set(' "$lifecycle_topology_contract
     violations=$((violations + 1))
 fi
 
-echo "[*] AC23: self-update release selection authority"
+echo "[*] AC26: self-update release selection authority"
 self_update_owner="src/apm_cli/commands/self_update.py"
 self_update_owner_defs=$(grep -Ec \
     '^class _ResolvedSelfUpdateRelease:|^def _resolve_self_update_release\(' \
@@ -1053,7 +1143,7 @@ if [ "$self_update_owner_defs" -ne 2 ] \
     violations=$((violations + 1))
 fi
 
-echo "[*] AC24: frozen install decision authority"
+echo "[*] AC27: frozen install decision authority"
 frozen_owner="src/apm_cli/install/service.py"
 frozen_adapter="src/apm_cli/commands/install.py"
 # #1078 split: the APM install pipeline that owns the frozen preflight and the
@@ -1103,7 +1193,6 @@ if ! grep -q '^    def enforce_frozen(' "$frozen_owner" \
     [ -n "$frozen_duplicate_hits" ] && echo "$frozen_duplicate_hits"
     violations=$((violations + 1))
 fi
-
 echo "[*] AC25: root vs dependency MCP declaration-scope authority"
 mcp_scope_owner="src/apm_cli/integration/mcp_config_view.py"
 mcp_root_scope_body=$(awk '
@@ -1151,6 +1240,74 @@ if ! grep -q '_REGISTRY_TYPE_ALIASES = {"oci": "docker"}' "$mcp_container_owner"
     || [ "$mcp_image_owner_defs" -ne 1 ] \
     || [ -n "$mcp_container_missing_consumers" ]; then
     echo "[x] MCP container launcher decisions must route through MCPClientAdapter"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC25: host-classification authority"
+identity_owner="src/apm_cli/models/dependency/identity.py"
+if ! grep -q 'if is_github_hostname(effective_host):' "$identity_owner" \
+    || grep -Eq 'effective_host.*==.*default_host|configured_default_host' "$identity_owner"; then
+    echo "[x] Package identity casing must route through is_github_hostname"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC26: ADO transport credential authority"
+ado_transport_direct_hits=$(
+    grep -En '(\._host|host)\.ado_token' \
+        src/apm_cli/deps/download_strategies.py \
+        src/apm_cli/deps/clone_engine.py \
+        src/apm_cli/deps/github_downloader_validation.py \
+        || true
+)
+if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/auth.py \
+    || ! grep -q '"COPILOT_GITHUB_TOKEN"' src/apm_cli/core/auth.py \
+    || ! grep -q 'self.auth_resolver.git_env_for_context(' \
+        src/apm_cli/deps/github_downloader.py \
+    || ! grep -q 'downloader.auth_resolver.git_env_for_context(' \
+        src/apm_cli/deps/github_downloader_validation.py \
+    || ! grep -q 'probe_env = auth_resolver.git_env_for_context(' \
+        src/apm_cli/install/pipeline.py \
+    || grep -q 'if is_generic or is_azure_devops_hostname(host):' \
+        src/apm_cli/install/pipeline.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/install/helpers/ref_reuse.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/marketplace/client.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/marketplace/builder.py \
+    || ! grep -q 'ctx.token or ctx.host_info.kind == "ado"' \
+        src/apm_cli/marketplace/auth_helpers.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/commands/marketplace/check.py \
+    || ! grep -q 'auth_resolver.try_with_fallback(' \
+        src/apm_cli/policy/discovery.py \
+    || ! grep -q 'key = (host, dep.port, org)' \
+        src/apm_cli/install/pipeline.py \
+    || [ -n "$ado_transport_direct_hits" ]; then
+    echo "[x] ADO transport credentials must route through AuthResolver context"
+    [ -n "$ado_transport_direct_hits" ] && echo "$ado_transport_direct_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC28: JetBrains Copilot MCP config-path authority"
+intellij_path_owner="src/apm_cli/adapters/client/intellij.py"
+intellij_path_owner_count=$(grep -Ec '^def _intellij_config_dir\(' "$intellij_path_owner" || true)
+intellij_legacy_owner_count=$(
+    grep -Ec '^def _legacy_intellij_config_dir\(' "$intellij_path_owner" || true
+)
+intellij_path_duplicate_hits=$(
+    grep -rEn --include='*.py' \
+        'github-copilot.{0,80}intellij|intellij.{0,80}github-copilot' \
+        src/apm_cli \
+        | grep -v "^${intellij_path_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if [ "$intellij_path_owner_count" -ne 1 ] \
+    || [ "$intellij_legacy_owner_count" -ne 1 ] \
+    || [ -n "$intellij_path_duplicate_hits" ]; then
+    echo "[x] JetBrains Copilot MCP paths must come from the IntelliJ adapter"
+    [ -n "$intellij_path_duplicate_hits" ] && echo "$intellij_path_duplicate_hits"
     violations=$((violations + 1))
 fi
 

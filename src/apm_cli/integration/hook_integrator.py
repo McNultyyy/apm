@@ -47,7 +47,6 @@ from .hook_native_formats import (  # noqa: F401
 )
 from .hook_transforms import (
     _APM_HOOKS_SIDECAR,
-    _HOOK_EVENT_MAP,
     _MERGE_HOOK_TARGETS,
     _emit_hook_event_diagnostics,
     _MergeHookConfig,
@@ -60,6 +59,10 @@ from .hook_transforms import (
 # The ``X as X`` form marks them as intentional public re-exports (PEP 484).
 # ---------------------------------------------------------------------------
 from .hook_transforms import _HOOK_EVENT_EXPECTED_CASING as _HOOK_EVENT_EXPECTED_CASING
+
+# _HOOK_EVENT_MAP now lives in hook_transforms (split #1078); re-exported here
+# so kiro_hook_integrator and tests can keep importing from this module.
+from .hook_transforms import _HOOK_EVENT_MAP as _HOOK_EVENT_MAP
 from .hook_transforms import (
     _build_display_payload as _build_display_payload_impl,
 )
