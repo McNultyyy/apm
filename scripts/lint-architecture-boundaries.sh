@@ -358,6 +358,27 @@ if ! echo "$run_replay_body" | grep -q 'integrate_package_primitives(' \
     echo "[x] Audit replay must preserve locked skill subset intent"
     violations=$((violations + 1))
 fi
+# #1078 strangler-fig split: _audit_ci_gate moved from commands/audit.py to
+# commands/_audit_ops.py (audit.py re-exports it and is now a facade). The
+# routing intent this rule guards -- the CI gate hydrates via
+# prepare_ci_audit_replay and never calls run_replay directly -- is unchanged.
+audit_ci_gate_body=$(awk '
+    /^def _audit_ci_gate\(/ {flag=1}
+    flag && /^def / && !/^def _audit_ci_gate\(/ {exit}
+    flag {print}
+' src/apm_cli/commands/_audit_ops.py)
+config_consistency_body=$(awk '
+    /^def _check_config_consistency\(/ {flag=1}
+    flag && /^def / && !/^def _check_config_consistency\(/ {exit}
+    flag {print}
+' src/apm_cli/policy/ci_checks.py)
+if ! grep -q '^def prepare_ci_audit_replay(' src/apm_cli/install/audit_replay.py \
+    || ! printf '%s\n' "$audit_ci_gate_body" | grep -q 'prepare_ci_audit_replay' \
+    || printf '%s\n' "$audit_ci_gate_body" | grep -q 'run_replay(' \
+    || ! printf '%s\n' "$config_consistency_body" | grep -q 'prepared_replay\.modules_root'; then
+    echo "[x] CI audit scratch materialization must route through install/audit_replay.py"
+    violations=$((violations + 1))
+fi
 local_bundle_marker_hits=$(
     grep -rEn --include='*.py' \
         "_LOCAL_BUNDLE_OWNER|active_owner.*[\"']local-bundle[\"']|[\"']local-bundle[\"'].*active_owner|owners.*[\"']local-bundle[\"']" \
@@ -366,10 +387,12 @@ local_bundle_marker_hits=$(
         | grep -v 'architecture-authority-exempt:' \
         || true
 )
+# #1078 strangler-fig split: the diff engine (and its local-bundle exemption)
+# moved from install/drift.py to install/_drift_diff.py; drift.py re-exports it.
 if ! grep -q 'DeploymentLedgerCodec.record_local_bundle_files' \
     src/apm_cli/install/local_bundle_handler.py \
     || ! grep -q 'DeploymentLedgerCodec.local_bundle_paths' \
-    src/apm_cli/install/drift.py \
+    src/apm_cli/install/_drift_diff.py \
     || [ -n "$local_bundle_marker_hits" ]; then
     echo "[x] Local-bundle replay provenance must route through DeploymentLedgerCodec"
     [ -n "$local_bundle_marker_hits" ] && echo "$local_bundle_marker_hits"

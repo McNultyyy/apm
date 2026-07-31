@@ -279,7 +279,9 @@ def test_local_bundle_replay_provenance_has_single_owner() -> None:
     """Bundle persistence and drift exclusion must consume the deployment ledger."""
     root = Path(__file__).parents[2]
     handler = (root / "src/apm_cli/install/local_bundle_handler.py").read_text()
-    drift = (root / "src/apm_cli/install/drift.py").read_text()
+    # #1078 strangler-fig split: the diff engine moved to _drift_diff.py;
+    # drift.py re-exports it, so the single-owner claim is unchanged.
+    drift = (root / "src/apm_cli/install/_drift_diff.py").read_text()
     guard = (root / "scripts/lint-architecture-boundaries.sh").read_text()
 
     assert "DeploymentLedgerCodec.record_local_bundle_files" in handler
@@ -774,6 +776,27 @@ def test_claude_skill_lock_metadata_has_one_canonical_owner() -> None:
     assert "Cached Claude Skill is invalid" in sources
     assert "build_claude_skill_package" not in sources
     assert "Cached/frozen Claude Skill lock metadata must route through validation.py" in guard
+
+
+def test_ci_audit_scratch_materialization_has_one_canonical_owner() -> None:
+    """Cold-cache CI audit replay must route through install/drift.py."""
+    root = Path(__file__).parents[2]
+    replay = (root / "src/apm_cli/install/audit_replay.py").read_text(encoding="utf-8")
+    # #1078 strangler-fig split: _audit_ci_gate moved to commands/_audit_ops.py;
+    # commands/audit.py is now a facade re-exporting it.
+    audit = (root / "src/apm_cli/commands/_audit_ops.py").read_text(encoding="utf-8")
+    ci_checks = (root / "src/apm_cli/policy/ci_checks.py").read_text(encoding="utf-8")
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
+    architecture_doc = (root / ".github/instructions/architecture.instructions.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "def prepare_ci_audit_replay(" in replay
+    assert "prepare_ci_audit_replay(" in audit
+    assert "prepared_replay.modules_root" in ci_checks
+    assert "CI audit scratch materialization must route through install/audit_replay.py" in guard
+    assert "CI audit scratch materialization" in architecture_doc
+    assert "src/apm_cli/install/audit_replay.py" in architecture_doc
 
 
 def test_skill_subset_ast_checker_is_wired_into_the_boundary_guard() -> None:

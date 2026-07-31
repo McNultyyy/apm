@@ -47,7 +47,28 @@ def _audit_ci_gate(
 
     fail_fast = not no_fail_fast
 
-    ci_result = run_baseline_checks(cfg.project_root, fail_fast=fail_fast, ci_mode=True)
+    prepared_replay = None
+    prepared_replay_error = None
+    if (cfg.project_root / "apm.yml").exists() and not (cfg.project_root / "apm_modules").exists():
+        from ..deps.lockfile import get_lockfile_path
+        from ..install.audit_replay import CiAuditReplayError, prepare_ci_audit_replay
+
+        if get_lockfile_path(cfg.project_root).exists():
+            try:
+                prepared_replay = prepare_ci_audit_replay(
+                    cfg.project_root,
+                    verbose=cfg.verbose,
+                )
+            except CiAuditReplayError as exc:
+                prepared_replay_error = str(exc)
+
+    ci_result = run_baseline_checks(
+        cfg.project_root,
+        fail_fast=fail_fast,
+        ci_mode=True,
+        prepared_replay=prepared_replay,
+        prepared_replay_error=prepared_replay_error,
+    )
 
     from ..policy.discovery import discover_policy_with_chain
     from ..policy.project_config import read_project_fetch_failure_default
@@ -136,12 +157,24 @@ def _audit_ci_gate(
         if lockfile_path.exists():
             lockfile = LockFile.read(lockfile_path)
             if lockfile is not None:
-                drift_check, drift_findings = _check_drift(
-                    cfg.project_root,
-                    lockfile,
-                    cache_only=True,
-                    verbose=cfg.verbose,
-                )
+                if prepared_replay_error is not None:
+                    from ..policy.models import CheckResult
+
+                    drift_check = CheckResult(
+                        name="drift",
+                        passed=False,
+                        message=f"drift replay failed: {prepared_replay_error}",
+                        details=[prepared_replay_error],
+                    )
+                    drift_findings = []
+                else:
+                    drift_check, drift_findings = _check_drift(
+                        cfg.project_root,
+                        lockfile,
+                        cache_only=prepared_replay is None,
+                        verbose=cfg.verbose,
+                        prepared_replay=prepared_replay,
+                    )
                 ci_result.checks.append(drift_check)
     elif no_drift and cfg.output_format == "text":
         click.echo(
