@@ -1,6 +1,6 @@
 lockfile_version: '1'
-generated_at: '2026-07-25T15:27:48.044464+00:00'
-apm_version: 0.26.0
+generated_at: '2026-07-16T10:55:54.310339+00:00'
+apm_version: 0.25.0
 dependencies:
 - repo_url: _local/apm-issue-autopilot
   name: apm-issue-autopilot
@@ -128,6 +128,15 @@ dependencies:
   depth: 2
   resolved_by: _local/apm-issue-autopilot
   package_type: hybrid
+  deployed_files:
+  - .agents/skills/apm-triage-panel
+  - .agents/skills/apm-triage-panel/SKILL.md
+  - .agents/skills/apm-triage-panel/apm.yml
+  - .agents/skills/apm-triage-panel/assets/triage-template.md
+  deployed_file_hashes:
+    .agents/skills/apm-triage-panel/SKILL.md: sha256:2ef70329aefd0cbec1302aad3975f6caa0a27654d58005bba622ef1021267d1e
+    .agents/skills/apm-triage-panel/apm.yml: sha256:e8b7946f433abdc8342241483963bac2895182916ea66f5aa39497d00c7930a4
+    .agents/skills/apm-triage-panel/assets/triage-template.md: sha256:69a027959eaec5335668e087c86babd814ba20cf21662ed524cf285b178e21d1
   source: local
   local_path: ../apm-triage-panel
   declaring_parent: ./packages/apm-issue-autopilot
@@ -139,6 +148,51 @@ dependencies:
   depth: 2
   resolved_by: _local/apm-issue-autopilot
   package_type: hybrid
+  deployed_files:
+  - .agents/skills/pr-description-skill
+  - .agents/skills/pr-description-skill/SKILL.md
+  - .agents/skills/pr-description-skill/apm.yml
+  - .agents/skills/pr-description-skill/assets/mermaid-conventions.md
+  - .agents/skills/pr-description-skill/assets/pr-body-template.md
+  - .agents/skills/pr-description-skill/assets/scenario-evidence-rubric.md
+  - .agents/skills/pr-description-skill/assets/section-rubric.md
+  - .agents/skills/pr-description-skill/evals/.gitignore
+  - .agents/skills/pr-description-skill/evals/README.md
+  - .agents/skills/pr-description-skill/evals/content/auth-refactor.json
+  - .agents/skills/pr-description-skill/evals/content/dep-bump.json
+  - .agents/skills/pr-description-skill/evals/content/docs-only.json
+  - .agents/skills/pr-description-skill/evals/evals.json
+  - .agents/skills/pr-description-skill/evals/fixtures/auth-refactor__with_skill.md
+  - .agents/skills/pr-description-skill/evals/fixtures/auth-refactor__without_skill.md
+  - .agents/skills/pr-description-skill/evals/fixtures/dep-bump__with_skill.md
+  - .agents/skills/pr-description-skill/evals/fixtures/dep-bump__without_skill.md
+  - .agents/skills/pr-description-skill/evals/fixtures/docs-only__with_skill.md
+  - .agents/skills/pr-description-skill/evals/fixtures/docs-only__without_skill.md
+  - .agents/skills/pr-description-skill/evals/results/.gitkeep
+  - .agents/skills/pr-description-skill/evals/triggers.json
+  - .agents/skills/pr-description-skill/scripts/run_evals.py
+  deployed_file_hashes:
+    .agents/skills/pr-description-skill/SKILL.md: sha256:d07254e9d0b95ea52d1a81d3262ca42da8c4c51d801eac4f11b6bc454cfb01a0
+    .agents/skills/pr-description-skill/apm.yml: sha256:ee9bb48581e62279708a9a12dc57174c9f5f7d347a384e4ca6b99c050c63879d
+    .agents/skills/pr-description-skill/assets/mermaid-conventions.md: sha256:3d9c7adf95d40db00833ec087d699a7d04b3d799e9b9d07271cf2ae7d51524ca
+    .agents/skills/pr-description-skill/assets/pr-body-template.md: sha256:aaeb885fbfa87364724f575eb150c9c39dc3cb60ab0459972e76185df9c98f97
+    .agents/skills/pr-description-skill/assets/scenario-evidence-rubric.md: sha256:bbb386b6f48974bbb78a380fd4674ed7a3a81810a6c2136e30c80158153596ae
+    .agents/skills/pr-description-skill/assets/section-rubric.md: sha256:f07fbbc5c741c4fd30f32edec985d8301d20e3deebb1761dd92b04da51c5e42d
+    .agents/skills/pr-description-skill/evals/.gitignore: sha256:dc810cf3561d22d2d47b89fd0697de46aff0068819b3514577842cb2a2a1c332
+    .agents/skills/pr-description-skill/evals/README.md: sha256:92b4529515917d25cbf5e597d1d46751e602dd4eb80be20a97ac81597f410cd0
+    .agents/skills/pr-description-skill/evals/content/auth-refactor.json: sha256:86791ada2f4983fde709237eaae9ef9c5a0f87a28f14e8b0f26b4b7e5b0e73c9
+    .agents/skills/pr-description-skill/evals/content/dep-bump.json: sha256:5136278ecf83a6c3a618176810ef62634cc988527dcdb8bd343ae83278f9e1d7
+    .agents/skills/pr-description-skill/evals/content/docs-only.json: sha256:78a6f98f939b1b8e0efa1b67a57a4b9008ddffd3b4f02fbde4f9843c4f29b39a
+    .agents/skills/pr-description-skill/evals/evals.json: sha256:1d137370f60955469a089a7ef085371aa14bbb74a80675957f4d6e0a694252cc
+    .agents/skills/pr-description-skill/evals/fixtures/auth-refactor__with_skill.md: sha256:b5ebacb04c4ace19e0d634e9b9104ef70b72330afb9f29ac0de07a03f1e78628
+    .agents/skills/pr-description-skill/evals/fixtures/auth-refactor__without_skill.md: sha256:81c42403d4f1406ba2689106bb6e1cdf0a74f1921681f6e096cefac0c46efd46
+    .agents/skills/pr-description-skill/evals/fixtures/dep-bump__with_skill.md: sha256:60df233958541ed42b94c1751a3d2d99324ec83f263fa0becc3abcb4a682ee91
+    .agents/skills/pr-description-skill/evals/fixtures/dep-bump__without_skill.md: sha256:1410a89d81b6745d14242181197d2d05ec5aba5078f1ad3ae702e3341a3fc798
+    .agents/skills/pr-description-skill/evals/fixtures/docs-only__with_skill.md: sha256:e4ca53c7dc8c8a65f4945e2e4e4cc878b433c5662d13c5b613d957d6d505029c
+    .agents/skills/pr-description-skill/evals/fixtures/docs-only__without_skill.md: sha256:7e790d6711b8a33702c6bf0f7486e1928c58c60b4dad0a998c570a07d6a05fec
+    .agents/skills/pr-description-skill/evals/results/.gitkeep: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    .agents/skills/pr-description-skill/evals/triggers.json: sha256:6762c7f071195491700cc59ce5329ff185b0493682c93efdcf01db8fb522bbe4
+    .agents/skills/pr-description-skill/scripts/run_evals.py: sha256:a1792f8cb95b4fb37a4133af079908e2a3b5643c1a81d97e4dcda399bac069a2
   source: local
   local_path: ../pr-description-skill
   declaring_parent: ./packages/apm-issue-autopilot
@@ -150,6 +204,31 @@ dependencies:
   depth: 2
   resolved_by: _local/apm-issue-autopilot
   package_type: hybrid
+  deployed_files:
+  - .agents/skills/shepherd-driver
+  - .agents/skills/shepherd-driver/SKILL.md
+  - .agents/skills/shepherd-driver/apm.yml
+  - .agents/skills/shepherd-driver/assets/ci-recovery-checklist.md
+  - .agents/skills/shepherd-driver/assets/completion-schema.json
+  - .agents/skills/shepherd-driver/assets/conflict-resolution-prompt.md
+  - .agents/skills/shepherd-driver/assets/copilot-classification-prompt.md
+  - .agents/skills/shepherd-driver/assets/fold-vs-defer-rubric.md
+  - .agents/skills/shepherd-driver/assets/pr-comment-templates.md
+  - .agents/skills/shepherd-driver/assets/shepherd-driver-prompt.md
+  - .agents/skills/shepherd-driver/references/mergeability-gate.md
+  - .agents/skills/shepherd-driver/scripts/owner_touch_gate.py
+  deployed_file_hashes:
+    .agents/skills/shepherd-driver/SKILL.md: sha256:71773e1ad047d7f12e9d4f416606e961a35dc7dc1cc92cb02ce4c10d1a33e32d
+    .agents/skills/shepherd-driver/apm.yml: sha256:d53355a3862fee76c099f99eeb49ed6fd9ce1c24d648451ce9a2efdced9fda4b
+    .agents/skills/shepherd-driver/assets/ci-recovery-checklist.md: sha256:21801867a8459d9713e45efe68e612c4d22a2cb577c23eceab55cd855bbd23ef
+    .agents/skills/shepherd-driver/assets/completion-schema.json: sha256:11dd97df9308cd868ddb3c7c7c398f59f3b07d571d790d2a1ec8537f2feba4ca
+    .agents/skills/shepherd-driver/assets/conflict-resolution-prompt.md: sha256:453237e56043e4008c37c5a89d9da5e77a1fa46b028ea172321dcc39a737c679
+    .agents/skills/shepherd-driver/assets/copilot-classification-prompt.md: sha256:71c0ad6c5d2c422dcc7fc0c44e13d8b3b049b37c04418ade7daf9722fe115c1f
+    .agents/skills/shepherd-driver/assets/fold-vs-defer-rubric.md: sha256:50ece018b83c70508ca3fc4b3d267e39df2de4497938ce4aa56d3b49c594f75f
+    .agents/skills/shepherd-driver/assets/pr-comment-templates.md: sha256:24fe0ec64286c7b39037a5e93acfa607a43dbb4763d653f3955a1c4d65d68882
+    .agents/skills/shepherd-driver/assets/shepherd-driver-prompt.md: sha256:48f5f9276f92984480dba4f0d54ecc5b612b6c72f313fd5222962dffd75ed0ed
+    .agents/skills/shepherd-driver/references/mergeability-gate.md: sha256:90bf5cd838d1025dd0fa223a0843be926cd509c85c91ef683cc9bfc98b5e8785
+    .agents/skills/shepherd-driver/scripts/owner_touch_gate.py: sha256:f78a10e6a972046d212720372a1bf6971fd8cbadd0eb78c06c1a48f333fcd5b5
   source: local
   local_path: ../shepherd-driver
   declaring_parent: ./packages/apm-issue-autopilot
@@ -161,6 +240,33 @@ dependencies:
   depth: 3
   resolved_by: _local/shepherd-driver
   package_type: hybrid
+  deployed_files:
+  - .agents/skills/apm-review-panel
+  - .agents/skills/apm-review-panel/SKILL.md
+  - .agents/skills/apm-review-panel/apm.yml
+  - .agents/skills/apm-review-panel/assets/ceo-return-schema.json
+  - .agents/skills/apm-review-panel/assets/panelist-return-schema.json
+  - .agents/skills/apm-review-panel/assets/recommendation-template.md
+  - .agents/skills/apm-review-panel/evals/README.md
+  - .agents/skills/apm-review-panel/evals/fixtures/01-ship-now-pr1084-shape.json
+  - .agents/skills/apm-review-panel/evals/fixtures/01-ship-now-pr1084-shape.rendered.md
+  - .agents/skills/apm-review-panel/evals/fixtures/02-needs-rework-shape.json
+  - .agents/skills/apm-review-panel/evals/fixtures/02-needs-rework-shape.rendered.md
+  - .agents/skills/apm-review-panel/evals/render_eval.py
+  - .agents/skills/apm-review-panel/evals/trigger-evals.json
+  deployed_file_hashes:
+    .agents/skills/apm-review-panel/SKILL.md: sha256:c9fee6c311b23b6ea72b06a424c8ba21c5d88bcc833e65259b7e0212aa73abbb
+    .agents/skills/apm-review-panel/apm.yml: sha256:80c403c4d3c59a91bb27b85650e21a466e9cd0cbc28e92bf0f3e53c6ea71cb2c
+    .agents/skills/apm-review-panel/assets/ceo-return-schema.json: sha256:d8707211968efb0471d083f880d5353d66a0eda84635e803a930f60c91837468
+    .agents/skills/apm-review-panel/assets/panelist-return-schema.json: sha256:e3cf2ae17e93dd934f2659ed77d2640ea9601fbe8698f63ba800edf046691f99
+    .agents/skills/apm-review-panel/assets/recommendation-template.md: sha256:ed973263897671ea04c980cb54c76b33aaa9bb7d1b5b24082df89b388d4329b8
+    .agents/skills/apm-review-panel/evals/README.md: sha256:40e7abb1fa15403a71505797e23dde8433f31ca70546657886c3f9760974bfb8
+    .agents/skills/apm-review-panel/evals/fixtures/01-ship-now-pr1084-shape.json: sha256:108fc261680f17bdade3e2bdf8e64fc908d16a37ec9c29c53169b394530bdd67
+    .agents/skills/apm-review-panel/evals/fixtures/01-ship-now-pr1084-shape.rendered.md: sha256:ca1fdd3cd24e0fd8ec15b37690c597921ebf1c872270166edb2727d54ee155d8
+    .agents/skills/apm-review-panel/evals/fixtures/02-needs-rework-shape.json: sha256:faa41c6c83c4a7955447bcb8fc0ad5a3b8afb4235db257462f649ba0a901913e
+    .agents/skills/apm-review-panel/evals/fixtures/02-needs-rework-shape.rendered.md: sha256:b69cd113a428b61d8bbb9381a85261b3ee3acd3f101c08d06419e26aab03bba8
+    .agents/skills/apm-review-panel/evals/render_eval.py: sha256:690baf6267775077ad011b98839eda1001e207bbae78a7a8454c4d39bb8a2864
+    .agents/skills/apm-review-panel/evals/trigger-evals.json: sha256:c715ba52cd2131f294c1cf685a10995a08e4ee6971f97cf5d36e09df28d3af91
   source: local
   local_path: ../apm-review-panel
   declaring_parent: local:packages/shepherd-driver
@@ -430,6 +536,123 @@ deployments:
   content_hash: sha256:8f4580cb2bdb88e7e570e4feb60cbf244d7fbe3e8217a8eadfd9dff2c763b615
 - kind: project-relative
   target: agents
+  value: .agents/skills/apm-review-panel
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: null
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:c9fee6c311b23b6ea72b06a424c8ba21c5d88bcc833e65259b7e0212aa73abbb
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/apm.yml
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:80c403c4d3c59a91bb27b85650e21a466e9cd0cbc28e92bf0f3e53c6ea71cb2c
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/assets/ceo-return-schema.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:d8707211968efb0471d083f880d5353d66a0eda84635e803a930f60c91837468
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/assets/panelist-return-schema.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:e3cf2ae17e93dd934f2659ed77d2640ea9601fbe8698f63ba800edf046691f99
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/assets/recommendation-template.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:ed973263897671ea04c980cb54c76b33aaa9bb7d1b5b24082df89b388d4329b8
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/evals/README.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:40e7abb1fa15403a71505797e23dde8433f31ca70546657886c3f9760974bfb8
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/evals/fixtures/01-ship-now-pr1084-shape.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:108fc261680f17bdade3e2bdf8e64fc908d16a37ec9c29c53169b394530bdd67
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/evals/fixtures/01-ship-now-pr1084-shape.rendered.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:ca1fdd3cd24e0fd8ec15b37690c597921ebf1c872270166edb2727d54ee155d8
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/evals/fixtures/02-needs-rework-shape.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:faa41c6c83c4a7955447bcb8fc0ad5a3b8afb4235db257462f649ba0a901913e
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/evals/fixtures/02-needs-rework-shape.rendered.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:b69cd113a428b61d8bbb9381a85261b3ee3acd3f101c08d06419e26aab03bba8
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/evals/render_eval.py
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:690baf6267775077ad011b98839eda1001e207bbae78a7a8454c4d39bb8a2864
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-review-panel/evals/trigger-evals.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-review-panel
+  active_owner: local:packages/apm-review-panel
+  content_hash: sha256:c715ba52cd2131f294c1cf685a10995a08e4ee6971f97cf5d36e09df28d3af91
+- kind: project-relative
+  target: agents
   value: .agents/skills/apm-spec-guardian
   runtime: null
   scope: project
@@ -500,6 +723,42 @@ deployments:
   - .
   active_owner: .
   content_hash: sha256:6c7fbc821fef930ab76764c7b33d55bd181f31cdd406cff5ce7cf14d1071c2ef
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-triage-panel
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-triage-panel
+  active_owner: local:packages/apm-triage-panel
+  content_hash: null
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-triage-panel/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-triage-panel
+  active_owner: local:packages/apm-triage-panel
+  content_hash: sha256:2ef70329aefd0cbec1302aad3975f6caa0a27654d58005bba622ef1021267d1e
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-triage-panel/apm.yml
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-triage-panel
+  active_owner: local:packages/apm-triage-panel
+  content_hash: sha256:e8b7946f433abdc8342241483963bac2895182916ea66f5aa39497d00c7930a4
+- kind: project-relative
+  target: agents
+  value: .agents/skills/apm-triage-panel/assets/triage-template.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/apm-triage-panel
+  active_owner: local:packages/apm-triage-panel
+  content_hash: sha256:69a027959eaec5335668e087c86babd814ba20cf21662ed524cf285b178e21d1
 - kind: project-relative
   target: agents
   value: .agents/skills/auth
@@ -1969,6 +2228,204 @@ deployments:
   content_hash: sha256:90b5d0369032de850f2255910f4cf5caafb7d60f07bda8a2146d394bfa459918
 - kind: project-relative
   target: agents
+  value: .agents/skills/pr-description-skill
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: null
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:d07254e9d0b95ea52d1a81d3262ca42da8c4c51d801eac4f11b6bc454cfb01a0
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/apm.yml
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:ee9bb48581e62279708a9a12dc57174c9f5f7d347a384e4ca6b99c050c63879d
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/assets/mermaid-conventions.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:3d9c7adf95d40db00833ec087d699a7d04b3d799e9b9d07271cf2ae7d51524ca
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/assets/pr-body-template.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:aaeb885fbfa87364724f575eb150c9c39dc3cb60ab0459972e76185df9c98f97
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/assets/scenario-evidence-rubric.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:bbb386b6f48974bbb78a380fd4674ed7a3a81810a6c2136e30c80158153596ae
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/assets/section-rubric.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:f07fbbc5c741c4fd30f32edec985d8301d20e3deebb1761dd92b04da51c5e42d
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/.gitignore
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:dc810cf3561d22d2d47b89fd0697de46aff0068819b3514577842cb2a2a1c332
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/README.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:92b4529515917d25cbf5e597d1d46751e602dd4eb80be20a97ac81597f410cd0
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/content/auth-refactor.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:86791ada2f4983fde709237eaae9ef9c5a0f87a28f14e8b0f26b4b7e5b0e73c9
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/content/dep-bump.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:5136278ecf83a6c3a618176810ef62634cc988527dcdb8bd343ae83278f9e1d7
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/content/docs-only.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:78a6f98f939b1b8e0efa1b67a57a4b9008ddffd3b4f02fbde4f9843c4f29b39a
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/evals.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:1d137370f60955469a089a7ef085371aa14bbb74a80675957f4d6e0a694252cc
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/fixtures/auth-refactor__with_skill.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:b5ebacb04c4ace19e0d634e9b9104ef70b72330afb9f29ac0de07a03f1e78628
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/fixtures/auth-refactor__without_skill.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:81c42403d4f1406ba2689106bb6e1cdf0a74f1921681f6e096cefac0c46efd46
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/fixtures/dep-bump__with_skill.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:60df233958541ed42b94c1751a3d2d99324ec83f263fa0becc3abcb4a682ee91
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/fixtures/dep-bump__without_skill.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:1410a89d81b6745d14242181197d2d05ec5aba5078f1ad3ae702e3341a3fc798
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/fixtures/docs-only__with_skill.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:e4ca53c7dc8c8a65f4945e2e4e4cc878b433c5662d13c5b613d957d6d505029c
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/fixtures/docs-only__without_skill.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:7e790d6711b8a33702c6bf0f7486e1928c58c60b4dad0a998c570a07d6a05fec
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/results/.gitkeep
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/evals/triggers.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:6762c7f071195491700cc59ce5329ff185b0493682c93efdcf01db8fb522bbe4
+- kind: project-relative
+  target: agents
+  value: .agents/skills/pr-description-skill/scripts/run_evals.py
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/pr-description-skill
+  active_owner: local:packages/pr-description-skill
+  content_hash: sha256:a1792f8cb95b4fb37a4133af079908e2a3b5643c1a81d97e4dcda399bac069a2
+- kind: project-relative
+  target: agents
   value: .agents/skills/python-architecture
   runtime: null
   scope: project
@@ -1985,6 +2442,114 @@ deployments:
   - .
   active_owner: .
   content_hash: sha256:f06e50b8c40d7e5a732a5405a603efd80da58de2b6f6b293f0f6b58f28eefe7b
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: null
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:71773e1ad047d7f12e9d4f416606e961a35dc7dc1cc92cb02ce4c10d1a33e32d
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/apm.yml
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:d53355a3862fee76c099f99eeb49ed6fd9ce1c24d648451ce9a2efdced9fda4b
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/assets/ci-recovery-checklist.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:21801867a8459d9713e45efe68e612c4d22a2cb577c23eceab55cd855bbd23ef
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/assets/completion-schema.json
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:11dd97df9308cd868ddb3c7c7c398f59f3b07d571d790d2a1ec8537f2feba4ca
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/assets/conflict-resolution-prompt.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:453237e56043e4008c37c5a89d9da5e77a1fa46b028ea172321dcc39a737c679
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/assets/copilot-classification-prompt.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:71c0ad6c5d2c422dcc7fc0c44e13d8b3b049b37c04418ade7daf9722fe115c1f
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/assets/fold-vs-defer-rubric.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:50ece018b83c70508ca3fc4b3d267e39df2de4497938ce4aa56d3b49c594f75f
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/assets/pr-comment-templates.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:24fe0ec64286c7b39037a5e93acfa607a43dbb4763d653f3955a1c4d65d68882
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/assets/shepherd-driver-prompt.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:48f5f9276f92984480dba4f0d54ecc5b612b6c72f313fd5222962dffd75ed0ed
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/references/mergeability-gate.md
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:90bf5cd838d1025dd0fa223a0843be926cd509c85c91ef683cc9bfc98b5e8785
+- kind: project-relative
+  target: agents
+  value: .agents/skills/shepherd-driver/scripts/owner_touch_gate.py
+  runtime: null
+  scope: project
+  owners:
+  - local:packages/shepherd-driver
+  active_owner: local:packages/shepherd-driver
+  content_hash: sha256:f78a10e6a972046d212720372a1bf6971fd8cbadd0eb78c06c1a48f333fcd5b5
 - kind: project-relative
   target: agents
   value: .agents/skills/supply-chain-security
