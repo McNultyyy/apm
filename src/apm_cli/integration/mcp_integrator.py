@@ -13,6 +13,7 @@ import builtins
 import copy
 import logging
 import re
+import shutil as shutil  # re-export: `mcp_integrator.shutil.which` patch seam for mcp_vscode
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
