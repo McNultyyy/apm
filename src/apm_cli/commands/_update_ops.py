@@ -107,6 +107,11 @@ def _run_mcp_lsp_integration(
         old_mcp_configs = dict(existing_lock.mcp_configs)
         old_mcp_provenance = dict(existing_lock.mcp_config_provenance)
         old_mcp_target_servers = dict(existing_lock.mcp_target_servers)
+    trusted_transitive_configs = {
+        name: (old_mcp_provenance[name], config)
+        for name, config in old_mcp_configs.items()
+        if name in old_mcp_provenance and config.get("registry") is False
+    }
 
     apm_modules_path = get_modules_dir(scope)
     user_scope = scope is InstallScope.USER
@@ -121,6 +126,7 @@ def _run_mcp_lsp_integration(
             old_mcp_configs=old_mcp_configs,
             old_mcp_provenance=old_mcp_provenance,
             old_mcp_target_servers=old_mcp_target_servers,
+            trusted_transitive_configs=trusted_transitive_configs,
             project_root=project_root,
             user_scope=user_scope,
             should_install=True,

@@ -180,6 +180,63 @@ def test_hook_rewrite_scope_guard_rejects_parallel_decision(tmp_path: Path) -> N
     assert "Hook rewrite scope must route through HookIntegrator" in result.stdout
 
 
+def test_mcp_dependency_scope_has_single_owner() -> None:
+    """Root and dependency MCP declarations must route through one view."""
+    root = Path(__file__).parents[2]
+    owner = (root / "src/apm_cli/integration/mcp_config_view.py").read_text()
+    owner_table = (root / ".apm/instructions/architecture.instructions.md").read_text()
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text()
+
+    assert owner.count("root.get_all_mcp_dependencies()") == 1
+    assert owner.count("package.get_mcp_dependencies()") == 2
+    assert "package.get_all_mcp_dependencies()" not in owner
+    assert "| Root vs dependency MCP declaration scope |" in owner_table
+    assert "Transitive MCP dependency scope must use production-only collection" in guard
+
+
+def test_mcp_dependency_scope_guard_rejects_all_dependency_collection(
+    tmp_path: Path,
+) -> None:
+    """The boundary lint must reject restoring dev MCP propagation."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    owner_path = sandbox / "src/apm_cli/integration/mcp_config_view.py"
+    owner_source = owner_path.read_text(encoding="utf-8")
+    owner_path.write_text(
+        owner_source.replace(
+            "for mcp_dependency in package.get_mcp_dependencies():",
+            "for mcp_dependency in package.get_all_mcp_dependencies():",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Transitive MCP dependency scope must use production-only collection" in result.stdout
+
+
 def test_policy_resolution_failure_outcomes_have_single_owner() -> None:
     """Approval fallback outcomes must come from policy outcome routing."""
     from apm_cli.policy.outcome_routing import POLICY_RESOLUTION_FAILURE_OUTCOMES
@@ -219,6 +276,69 @@ def test_object_git_dependency_fields_have_single_owner() -> None:
     assert "reject_unknown_fields" not in fixture
     assert "_GIT_DEPENDENCY_FIELDS" not in fixture
     assert "Object-form Git dependency fields must come from the product parser" in guard
+
+
+def test_git_ref_freshness_policy_has_single_owner() -> None:
+    """Lock seeding and resolver tiers must consume one freshness policy."""
+    root = Path(__file__).parents[2]
+    owner = (root / "src/apm_cli/deps/tiered_ref_resolver.py").read_text()
+    resolve = (root / "src/apm_cli/install/phases/resolve.py").read_text()
+    seed = (root / "src/apm_cli/install/helpers/ref_seed.py").read_text()
+    outdated = (root / "src/apm_cli/commands/outdated.py").read_text()
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text()
+
+    assert owner.count("class RefFreshnessPolicy(Enum):") == 1
+    assert owner.count("def ref_freshness_policy_for_install(") == 1
+    assert owner.count("if freshness_policy.allows_bare_cache:") == 1
+    assert "ctx.update_refs or ctx.refresh" not in resolve
+    assert "ctx.update_refs or ctx.refresh" not in seed
+    assert resolve.count("ref_freshness_policy_for_install(ctx)") == 1
+    assert "def _requires_remote_ref_resolution(" in resolve
+    assert "update_refs = _requires_remote_ref_resolution(ctx)" in resolve
+    assert seed.count("ref_freshness_policy_for_install(ctx)") == 1
+    assert "freshness_policy=RefFreshnessPolicy.CURRENT_REMOTE" in outdated
+    assert "Git ref freshness must route through RefFreshnessPolicy" in guard
+
+
+def test_git_ref_freshness_guard_rejects_parallel_decision(tmp_path: Path) -> None:
+    """The boundary lint rejects a second update/refresh freshness gate."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    seed_path = sandbox / "src/apm_cli/install/helpers/ref_seed.py"
+    source = seed_path.read_text(encoding="utf-8")
+    seed_path.write_text(
+        source.replace(
+            "if not freshness_policy.allows_lock_seed:",
+            "if ctx.update_refs or ctx.refresh:",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Git ref freshness must route through RefFreshnessPolicy" in result.stdout
 
 
 @pytest.mark.lifecycle_smoke

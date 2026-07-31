@@ -22,7 +22,7 @@ from ..deps.lockfile import LockFile, get_lockfile_path
 from ..policy._help_text import POLICY_SOURCE_FORMS_HELP
 from ..security.content_scanner import ContentScanner, ScanFinding
 from ..security.file_scanner import (
-    scan_lockfile_packages,  # noqa: F401 -- re-exported for test patching
+    scan_project_files,  # noqa: F401 -- re-exported for test patching
 )
 from ..utils.console import (
     STATUS_SYMBOLS,

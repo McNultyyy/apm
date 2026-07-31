@@ -1,6 +1,6 @@
 """Audit command heavy-lifting extracted to keep audit.py under 800 lines.
 
-All patched globals (ContentScanner, get_lockfile_path, scan_lockfile_packages,
+All patched globals (ContentScanner, get_lockfile_path, scan_project_files,
 _has_actionable_findings, _render_summary, _render_findings_table, _preview_strip,
 _apply_strip, _resolve_external_options, _run_external_scanners, _scan_single_file)
 are accessed through the original ``audit`` module at call-time so that test
@@ -357,7 +357,7 @@ def _scan_lockfile_packages_or_exit(
         if package:
             logger.progress(f"Scanning package: {package}")
         else:
-            logger.start("Scanning all installed packages...")
+            logger.start("Scanning installed packages and deployed files...")
 
     from ..deps.lockfile import LockfileFormatError
 
@@ -368,10 +368,11 @@ def _scan_lockfile_packages_or_exit(
             if lockfile is not None
             else ()
         )
-        findings_by_file, files_scanned = _a.scan_lockfile_packages(
+        findings_by_file, files_scanned = _a.scan_project_files(
             project_root,
             package_filter=package,
             lockfile=lockfile,
+            include_deployed_trees=package is None,
         )
     except LockfileFormatError as exc:
         logger.error(f"Cannot audit invalid apm.lock.yaml: {exc}")
@@ -383,7 +384,7 @@ def _scan_lockfile_packages_or_exit(
                 f"Package '{package}' not found in apm.lock.yaml or has no deployed files"
             )
         else:
-            logger.progress("No deployed files found in apm.lock.yaml")
+            logger.progress("No deployed files found")
         sys.exit(0)
     return findings_by_file, files_scanned, owner_violations
 

@@ -34,7 +34,8 @@ Flags
   ``apm install -g``).
 * ``[PACKAGES]...`` -- positional names to refresh only those
   dependencies; omit to refresh everything.
-* ``--force`` -- overwrite locally-authored files on collision.
+* ``--force`` -- overwrite locally-authored files and deploy despite
+  critical security findings; does not bypass upstream ref resolution.
 * ``--parallel-downloads`` -- max concurrent package downloads
   (0 disables parallelism).
 * ``--target``/``-t`` -- agent harness(es) to deploy to; comma-separated
@@ -234,7 +235,10 @@ def _annotate_lockfile_revision_tags(project_root: Path, updates: list[RevisionP
     "--force",
     is_flag=True,
     default=False,
-    help="Overwrite locally-authored files on collision",
+    help=(
+        "Overwrite locally-authored files and deploy despite critical security "
+        "findings; does not bypass upstream ref resolution"
+    ),
 )
 @click.option(
     "--parallel-downloads",
@@ -663,32 +667,33 @@ def _finalize_dep_update(
             verbose=verbose,
         )
 
-    if not plan_state.proceeded:
-        return
-
-    if revision_pin_updates:
+    if plan_state.proceeded and revision_pin_updates:
         try:
             _annotate_lockfile_revision_tags(Path.cwd(), revision_pin_updates)
         except Exception as e:
             _rich_error(f"Failed to record revision-pin tags in apm.lock.yaml: {e}")
             sys.exit(1)
 
-    try:
-        _run_mcp_lsp_integration(
-            scope=scope,
-            project_root=lifecycle.mcp_lsp_project_root,
-            existing_lock=lifecycle.existing_lock,
-            lock_path=lifecycle.lock_path,
-            target=target,
-            diagnostics=getattr(result, "diagnostics", None),
-            logger=logger,
-            verbose=verbose,
-        )
-    except Exception as e:
-        _rich_error(f"Error reconciling MCP/LSP servers: {e}")
-        if not verbose:
-            _rich_info("Run with --verbose for detailed diagnostics.")
-        sys.exit(1)
+    if plan_state.proceeded or reconcile_noop:
+        try:
+            _run_mcp_lsp_integration(
+                scope=scope,
+                project_root=lifecycle.mcp_lsp_project_root,
+                existing_lock=lifecycle.existing_lock,
+                lock_path=lifecycle.lock_path,
+                target=target,
+                diagnostics=getattr(result, "diagnostics", None),
+                logger=logger,
+                verbose=verbose,
+            )
+        except Exception as e:
+            _rich_error(f"Error reconciling MCP/LSP servers: {e}")
+            if not verbose:
+                _rich_info("Run with --verbose for detailed diagnostics.")
+            sys.exit(1)
+
+    if not plan_state.proceeded:
+        return
 
     # Report the number of dependencies that actually changed (per the
     # plan), not the total tree re-materialized (result.installed_count).

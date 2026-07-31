@@ -260,6 +260,35 @@ if ! grep -q '^def should_force_ref_recheck(' "$ref_recheck_owner" \
     echo "[x] Existing-path ref rechecks must use drift.py::should_force_ref_recheck"
     violations=$((violations + 1))
 fi
+ref_freshness_owner="src/apm_cli/deps/tiered_ref_resolver.py"
+ref_freshness_consumers=(
+    src/apm_cli/install/phases/resolve.py
+    src/apm_cli/install/helpers/ref_seed.py
+    src/apm_cli/commands/outdated.py
+)
+ref_freshness_duplicate_hits=$(
+    grep -rEn --include='*.py' \
+        'ctx\.update_refs[[:space:]]+or[[:space:]]+ctx\.refresh|def [[:alnum:]_]*ref_freshness|class [[:alnum:]_]*RefFreshness' \
+        src/apm_cli \
+        | grep -v "^${ref_freshness_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if ! grep -q '^class RefFreshnessPolicy(Enum):' "$ref_freshness_owner" \
+    || ! grep -q '^def ref_freshness_policy_for_install(' "$ref_freshness_owner" \
+    || ! grep -q '^    if freshness_policy\.allows_bare_cache:' \
+        "$ref_freshness_owner" \
+    || ! grep -q 'ref_freshness_policy_for_install(ctx)' "${ref_freshness_consumers[0]}" \
+    || ! grep -q 'ref_freshness_policy_for_install(ctx)' "${ref_freshness_consumers[1]}" \
+    || ! grep -q 'freshness_policy=RefFreshnessPolicy.CURRENT_REMOTE' \
+        "${ref_freshness_consumers[2]}" \
+    || grep -rEq --include='*.py' --exclude='tiered_ref_resolver.py' \
+        'L2BareRevParse' src/apm_cli \
+    || [ -n "$ref_freshness_duplicate_hits" ]; then
+    echo "[x] Git ref freshness must route through RefFreshnessPolicy"
+    [ -n "$ref_freshness_duplicate_hits" ] && echo "$ref_freshness_duplicate_hits"
+    violations=$((violations + 1))
+fi
 cleanup_claim_owner="src/apm_cli/install/phases/cleanup.py"
 cleanup_claim_output=$(python3 scripts/check_cleanup_claim_owner.py "$cleanup_claim_owner" 2>&1)
 cleanup_claim_status=$?
@@ -1051,6 +1080,35 @@ if ! grep -q '^    def enforce_frozen(' "$frozen_owner" \
     || [ -n "$frozen_duplicate_hits" ]; then
     echo "[x] Frozen install decisions must route through InstallService before mutation"
     [ -n "$frozen_duplicate_hits" ] && echo "$frozen_duplicate_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC25: root vs dependency MCP declaration-scope authority"
+mcp_scope_owner="src/apm_cli/integration/mcp_config_view.py"
+mcp_root_scope_body=$(awk '
+    /^    def derive\(/ {flag=1}
+    flag && /^    def / && !/^    def derive\(/ {exit}
+    flag {print}
+' "$mcp_scope_owner")
+mcp_locked_scope_body=$(awk '
+    /^def _collect_locked_dependencies\(/ {flag=1}
+    flag && /^def / && !/^def _collect_locked_dependencies\(/ {exit}
+    flag {print}
+' "$mcp_scope_owner")
+mcp_unlocked_scope_body=$(awk '
+    /^def _collect_unlocked_compat\(/ {flag=1}
+    flag && /^def / && !/^def _collect_unlocked_compat\(/ {exit}
+    flag {print}
+' "$mcp_scope_owner")
+if [ "$(printf '%s\n' "$mcp_root_scope_body" \
+        | grep -c 'root\.get_all_mcp_dependencies()')" -ne 1 ] \
+    || printf '%s\n%s\n' "$mcp_locked_scope_body" "$mcp_unlocked_scope_body" \
+        | grep -q 'get_all_mcp_dependencies()' \
+    || [ "$(printf '%s\n' "$mcp_locked_scope_body" \
+        | grep -c 'package\.get_mcp_dependencies()')" -ne 1 ] \
+    || [ "$(printf '%s\n' "$mcp_unlocked_scope_body" \
+        | grep -c 'package\.get_mcp_dependencies()')" -ne 1 ]; then
+    echo "[x] Transitive MCP dependency scope must use production-only collection"
     violations=$((violations + 1))
 fi
 

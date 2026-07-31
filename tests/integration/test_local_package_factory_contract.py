@@ -171,6 +171,56 @@ def _assert_malformed_manifest_guards(
     assert malformed_apm.manifest_path.read_bytes() == malformed_apm_bytes
 
 
+def test_create_authors_production_and_development_mcp_blocks(tmp_path: Path) -> None:
+    """Fixture packages preserve the package-authoring MCP scope boundary."""
+    package = LocalPackageFactory(tmp_path / "packages").create(
+        "mcp-package",
+        mcp_dependencies=(
+            {
+                "name": "prod-server",
+                "registry": False,
+                "transport": "stdio",
+                "command": "prod-command",
+            },
+        ),
+        dev_mcp_dependencies=(
+            {
+                "name": "dev-server",
+                "registry": False,
+                "transport": "stdio",
+                "command": "dev-command",
+            },
+        ),
+    )
+
+    assert load_yaml(package.manifest_path) == {
+        "name": "mcp-package",
+        "version": "0.1.0",
+        "description": "Hermetic test package mcp-package",
+        "author": "APM Test",
+        "dependencies": {
+            "mcp": [
+                {
+                    "name": "prod-server",
+                    "registry": False,
+                    "transport": "stdio",
+                    "command": "prod-command",
+                }
+            ]
+        },
+        "devDependencies": {
+            "mcp": [
+                {
+                    "name": "dev-server",
+                    "registry": False,
+                    "transport": "stdio",
+                    "command": "dev-command",
+                }
+            ]
+        },
+    }
+
+
 def test_relative_dependency_uses_portable_manifest_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
