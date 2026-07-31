@@ -503,3 +503,118 @@ def _gitlab_auth_error_msg(
     else:
         error_msg += "Please verify your token can read this project (required API scope)."
     return error_msg
+
+
+def download_gitlab_file_git_first_impl(
+    delegate,
+    dep_ref: DependencyReference,
+    file_path: str,
+    ref: str = "main",
+    verbose_callback=None,
+) -> bytes:
+    """Download a GitLab file: git-transport-first, REST API as fallback.
+
+    Relocated body of ``DownloadDelegate.download_gitlab_file`` (Stage-2
+    800-line ceiling, issue #1078). Names that tests patch on
+    ``apm_cli.deps.download_strategies`` are reached through the ``_ds``
+    alias so the patch still applies.
+    """
+    from apm_cli.deps import download_strategies as _ds
+
+    host = dep_ref.host or _ds.default_host()
+    host_info = delegate._host.auth_resolver.classify_host(
+        host,
+        port=dep_ref.port,
+        host_type=dep_ref.host_type,
+    )
+    project_path = dep_ref.repo_url
+    if not project_path:
+        raise RuntimeError("Missing repository path for GitLab file download")
+
+    # -- Primary: git sparse/partial checkout (works even when API is 410) --
+    try:
+        content = delegate._download_gitlab_file_via_git(dep_ref, file_path, ref)
+        if verbose_callback:
+            verbose_callback(
+                f"Fetched file via git transport: {host}/{dep_ref.repo_url}/{file_path}"
+            )
+        return content
+    except (_ds.PathTraversalError, _ds.GitFileTransportSecurityError):
+        # A traversal / symlink-escape attempt must hard-fail. It must
+        # NOT be silently retried over the REST transport -- letting a
+        # rejected path fall through would hand an attacker a second
+        # transport to probe. Propagate the security failure unchanged.
+        raise
+    except (_ds.GitFileTransportError, RuntimeError, OSError) as exc:
+        fallback_target = f"{host}/{dep_ref.repo_url}"
+        _ds._debug(
+            f"git transport unavailable for {fallback_target}; "
+            f"falling back to GitLab REST API ({type(exc).__name__})"
+        )
+    # -- Fallback: GitLab REST v4 API (requires GITLAB_APM_PAT / GITLAB_TOKEN) --
+    org = project_path.split("/")[0]
+    file_ctx = delegate._host.auth_resolver.resolve(
+        host,
+        org,
+        port=dep_ref.port,
+        host_type=dep_ref.host_type,
+    )
+    token = file_ctx.token
+    headers = _ds.AuthResolver.gitlab_rest_headers(token)
+
+    api_base = host_info.api_base.rstrip("/")
+    enc_proj = _ds.quote(project_path, safe="")
+    enc_file = _ds.quote(file_path, safe="")
+
+    def _raw_url(r: str) -> str:
+        return (
+            f"{api_base}/projects/{enc_proj}/repository/files/{enc_file}/raw"
+            f"?ref={_ds.quote(r, safe='')}"
+        )
+
+    api_url = _raw_url(ref)
+
+    try:
+        response = delegate._host._resilient_get(api_url, headers=headers, timeout=30)
+        response.raise_for_status()
+        if verbose_callback:
+            verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
+        return response.content
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            if ref not in ("main", "master"):
+                raise RuntimeError(
+                    f"File not found: {file_path} at ref '{ref}' in {dep_ref.repo_url}"
+                ) from e
+            fallback_ref = "master" if ref == "main" else "main"
+            fallback_url = _raw_url(fallback_ref)
+            try:
+                response = delegate._host._resilient_get(fallback_url, headers=headers, timeout=30)
+                response.raise_for_status()
+                if verbose_callback:
+                    verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
+                return response.content
+            except requests.exceptions.HTTPError as fallback_err:
+                raise RuntimeError(
+                    f"File not found: {file_path} in {dep_ref.repo_url} "
+                    f"(tried refs: {ref}, {fallback_ref})"
+                ) from fallback_err
+        if e.response is not None and e.response.status_code in (401, 403):
+            error_msg = (
+                f"Authentication failed for GitLab {dep_ref.repo_url} "
+                f"(file: {file_path}, ref: {ref}). "
+            )
+            if not token:
+                error_msg += delegate._host.auth_resolver.build_error_context(
+                    host, "download", org=org, port=dep_ref.port
+                )
+            else:
+                error_msg += "Please verify your token can read this project (required API scope)."
+            raise RuntimeError(error_msg) from e
+        if e.response is not None:
+            raise RuntimeError(
+                f"Failed to download {file_path}: HTTP {e.response.status_code}"
+            ) from e
+        raise
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Network error downloading {file_path}: {e}") from e

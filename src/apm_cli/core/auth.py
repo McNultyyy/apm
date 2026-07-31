@@ -37,7 +37,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
-from apm_cli.core._auth_support import _AuthSupportMixin, _org_to_env_suffix
+from apm_cli.core._auth_support import (
+    _AuthSupportMixin,
+)
+from apm_cli.core._auth_support import (
+    # Re-exported: the token chain moved to _auth_support for the Stage-2
+    # 800-line ceiling, but tests import this name from apm_cli.core.auth.
+    _org_to_env_suffix as _org_to_env_suffix,
+)
 from apm_cli.core.token_manager import GitHubTokenManager
 from apm_cli.utils.github_host import default_host, is_azure_devops_hostname, is_gitlab_hostname
 
@@ -185,13 +192,15 @@ class AuthCacheKey(NamedTuple):
     port: int | None
     host_type: str  # Empty string represents an absent or canonical host_type.
     org: str
+    path: str  # Empty unless credential resolution is repository-scoped.
 
 
 class AuthResolver(_AuthSupportMixin):
     """Single source of truth for auth resolution.
 
     Every APM operation that touches a remote host MUST use this class.
-    Resolution is per-(host, org) pair, thread-safe, cached per-process.
+    Resolution is per-(host, port, host_type, org, optional path), thread-safe,
+    and cached per-process.
     """
 
     def __init__(
@@ -231,6 +240,26 @@ class AuthResolver(_AuthSupportMixin):
         with self._lock:
             self._cache.clear()
 
+    def has_cached_resolution(
+        self,
+        host: str,
+        org: str | None = None,
+        *,
+        port: int | None = None,
+        host_type: str | None = None,
+        path: str | None = None,
+    ) -> bool:
+        """Return whether credential resolution already ran for this scope."""
+        key = AuthCacheKey(
+            host.lower() if host else host,
+            port,
+            self._cache_host_type(host, host_type),
+            org.lower() if org else "",
+            path or "",
+        )
+        with self._lock:
+            return key in self._cache
+
     # -- core resolution ----------------------------------------------------
 
     @staticmethod
@@ -248,8 +277,9 @@ class AuthResolver(_AuthSupportMixin):
         *,
         port: int | None = None,
         host_type: str | None = None,
+        path: str | None = None,
     ) -> AuthContext:
-        """Resolve auth for *(host, port, org)*.  Cached & thread-safe.
+        """Resolve auth for a host/org and optional repository path.
 
         ``port`` discriminates the cache key so that the same hostname on
         different ports (e.g. Bitbucket Datacenter with SSH on 7999 and a
@@ -262,6 +292,7 @@ class AuthResolver(_AuthSupportMixin):
             port,
             self._cache_host_type(host, host_type),
             org.lower() if org else "",
+            path or "",
         )
         with self._lock:
             cached = self._cache.get(key)
@@ -270,12 +301,19 @@ class AuthResolver(_AuthSupportMixin):
 
             # Hold lock during entire credential resolution to prevent duplicate
             # credential-helper popups when parallel downloads resolve the same
-            # (host, port, org) concurrently.  The first caller fills the cache;
+            # (host, port, org, path) concurrently. The first caller fills the cache;
             # all subsequent callers for the same key become O(1) cache hits.
             # Bounded by APM_GIT_CREDENTIAL_TIMEOUT (default 60s). No deadlock
             # risk: single lock, never nested.
             host_info = self.classify_host(host, port=port, host_type=host_type)
-            token, source, scheme = self._resolve_token(host_info, org)
+            if path is None:
+                token, source, scheme = self._resolve_token(host_info, org)
+            else:
+                token, source, scheme = self._resolve_token(
+                    host_info,
+                    org,
+                    path=path,
+                )
             token_type = self.detect_token_type(token) if token else "unknown"
             git_env = self._build_git_env(token, scheme=scheme, host_kind=host_info.kind)
 
@@ -309,6 +347,45 @@ class AuthResolver(_AuthSupportMixin):
             host_type=dep_ref.host_type,
         )
 
+    def uses_public_github_anonymous_first(
+        self,
+        host: str,
+        *,
+        port: int | None = None,
+        host_type: str | None = None,
+    ) -> bool:
+        """Return whether HTTPS repository access must start anonymously.
+
+        This exact-host decision is owned here so validation, ref resolution,
+        cache fetches, and clone execution cannot drift into separate host
+        checks. GitHub Enterprise, ADO, GitLab, and generic hosts retain their
+        existing authentication order.
+        """
+        return (
+            self.classify_host(
+                host,
+                port=port,
+                host_type=host_type,
+            ).kind
+            == "github"
+        )
+
+    @classmethod
+    def build_public_github_anonymous_git_env(cls) -> dict[str, str]:
+        """Build a credential-free Git env for public github.com attempts."""
+        env = cls._build_git_env(None, host_kind="github")
+        for name in tuple(env):
+            if name in {"GH_TOKEN", "GITHUB_APM_PAT", "GITHUB_TOKEN"} or name.startswith(
+                "GITHUB_APM_PAT_"
+            ):
+                env.pop(name, None)
+        from ..deps.git_auth_env import GitAuthEnvBuilder
+
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_CONFIG_GLOBAL"] = GitAuthEnvBuilder.isolated_global_config_path()
+        cls._append_git_config(env, "credential.helper", "")
+        return env
+
     # -- fallback strategy --------------------------------------------------
 
     def try_with_fallback(
@@ -319,6 +396,7 @@ class AuthResolver(_AuthSupportMixin):
         org: str | None = None,
         port: int | None = None,
         path: str | None = None,
+        host_type: str | None = None,
         unauth_first: bool = False,
         verbose_callback: Callable[[str], None] | None = None,
     ) -> T:
@@ -337,6 +415,12 @@ class AuthResolver(_AuthSupportMixin):
             ``git credential fill`` request so helpers configured with
             ``credential.useHttpPath = true`` can disambiguate per-URL
             (notably Git Credential Manager for multi-account users).
+            Primary auth-first resolution stays host-scoped; the path is
+            applied when public github.com anonymous-first fallback proves
+            credentials may be required.
+        host_type:
+            Optional manifest provider hint. Forwarded through classification
+            and credential resolution so the inner owner matches its caller.
         unauth_first:
             If *True*, try unauthenticated first (saves rate limits, EMU-safe).
         verbose_callback:
@@ -347,26 +431,63 @@ class AuthResolver(_AuthSupportMixin):
         retries with ``gh auth token`` and then ``git credential fill``
         before giving up.
         """
-        auth_ctx = self.resolve(host, org, port=port)
-        host_info = auth_ctx.host_info
-        git_env = auth_ctx.git_env
-        unauth_env = self._build_git_env(None, host_kind=host_info.kind)
+        host_info = self.classify_host(
+            host,
+            port=port,
+            host_type=host_type,
+        )
+        lazy_public_github = unauth_first and self.uses_public_github_anonymous_first(
+            host,
+            port=port,
+            host_type=host_type,
+        )
+        auth_ctx: AuthContext | None = None
+        if not lazy_public_github:
+            auth_ctx = self.resolve(
+                host,
+                org,
+                port=port,
+                host_type=host_type,
+            )
+            host_info = auth_ctx.host_info
+        unauth_env = (
+            self.build_public_github_anonymous_git_env()
+            if lazy_public_github
+            else self._build_git_env(None, host_kind=host_info.kind)
+        )
+
+        def _auth_context() -> AuthContext:
+            nonlocal auth_ctx
+            if auth_ctx is None:
+                auth_ctx = self.resolve(
+                    host,
+                    org,
+                    port=port,
+                    host_type=host_type,
+                    path=path if lazy_public_github else None,
+                )
+            return auth_ctx
 
         def _log(msg: str) -> None:
             if verbose_callback:
                 verbose_callback(msg)
 
-        def _run_auth_only(fallback: Callable[[Exception], T]) -> T:
+        def _run_auth_only(
+            fallback: Callable[[Exception, AuthContext], T],
+        ) -> T:
             """Auth-only strategy shared by ghe_cloud and ado hosts.
 
             Attempt *operation* with the resolved token; on any failure
             delegate to *fallback* (credential chain for ghe_cloud, AAD
             bearer for ado). Collapses what used to be two near-identical
-            try/except branches in the outer dispatch.
+            try/except branches in the outer dispatch. The context is
+            resolved lazily here so the public-GitHub anonymous-first path
+            never triggers credential resolution it does not need.
             """
+            ctx = _auth_context()
             _log(f"Auth-only attempt for {host_info.kind} host {host_info.display_name}")
             try:
-                return operation(auth_ctx.token, git_env)
+                return operation(ctx.token, ctx.git_env)
             except Exception as exc:
                 # operation is caller-provided; broad catch required -- cannot narrow
                 # without restricting the caller API.  Use %r so the type is visible.
@@ -376,9 +497,9 @@ class AuthResolver(_AuthSupportMixin):
                     host_info.display_name,
                     exc,
                 )
-                return fallback(exc)
+                return fallback(exc, ctx)
 
-        def _try_credential_fallback(exc: Exception) -> T:
+        def _try_credential_fallback(exc: Exception, ctx: AuthContext) -> T:
             """Retry the operation when the originally-resolved token fails.
 
             Walks the secondary chain in order: gh CLI (GitHub-like hosts;
@@ -389,13 +510,13 @@ class AuthResolver(_AuthSupportMixin):
             ``git-credential-fill``, ``none``) skip retry to avoid
             double-invocation.
             """
-            if auth_ctx.source in ("gh-auth-token", "git-credential-fill", "none"):
+            if ctx.source in ("gh-auth-token", "git-credential-fill", "none"):
                 raise exc
             # ADO uses ADO_APM_PAT + AAD bearer fallback; credential fill is out of scope.
             if host_info.kind == "ado":
                 raise exc
             _log(
-                f"Token from {auth_ctx.source} failed for {host_info.display_name}; "
+                f"Token from {ctx.source} failed for {host_info.display_name}; "
                 "trying secondary credential sources"
             )
             _log(f"trying gh auth token for {host_info.display_name}")
@@ -420,8 +541,10 @@ class AuthResolver(_AuthSupportMixin):
             raise exc
 
         # ADO bearer fallback machinery (PAT was tried first; bearer is the safety net)
-        ado_bearer_fallback_available = (
-            auth_ctx.host_info.kind == "ado" and auth_ctx.source == "ADO_APM_PAT"
+        ado_bearer_fallback_available = bool(
+            auth_ctx is not None
+            and auth_ctx.host_info.kind == "ado"
+            and auth_ctx.source == "ADO_APM_PAT"
         )
 
         def _try_ado_bearer_fallback(exc: Exception) -> T:
@@ -468,14 +591,18 @@ class AuthResolver(_AuthSupportMixin):
 
         # ghe_cloud (never public) and ado (PAT then AAD bearer) share the
         # auth-only shape; a single dispatch picks the host-kind fallback.
+        # ``_try_ado_bearer_fallback`` ignores the context argument; the
+        # uniform ``(exc, ctx)`` shape is what lets one dispatch serve both.
         if host_info.kind in ("ghe_cloud", "ado"):
-            fallback = (
-                _try_ado_bearer_fallback if host_info.kind == "ado" else _try_credential_fallback
+            fallback: Callable[[Exception, AuthContext], T] = (
+                (lambda exc, _ctx: _try_ado_bearer_fallback(exc))
+                if host_info.kind == "ado"
+                else _try_credential_fallback
             )
             return _run_auth_only(fallback)
 
-        if unauth_first:
-            # Validation path: save rate limits, EMU-safe
+        def _run_unauth_first() -> T:
+            """Validation path: try anonymously first, then fall back to auth."""
             try:
                 _log(f"Trying unauthenticated access to {host_info.display_name}")
                 return operation(None, unauth_env)
@@ -487,10 +614,17 @@ class AuthResolver(_AuthSupportMixin):
                     host_info.display_name,
                     exc,
                 )
-                if auth_ctx.token:
-                    _log(f"Unauthenticated failed, retrying with token (source: {auth_ctx.source})")
+                if (
+                    lazy_public_github
+                    and path is not None
+                    and not self.is_public_github_auth_failure(exc)
+                ):
+                    raise
+                ctx = _auth_context()
+                if ctx.token:
+                    _log(f"Unauthenticated failed, retrying with token (source: {ctx.source})")
                     try:
-                        return operation(auth_ctx.token, git_env)
+                        return operation(ctx.token, ctx.git_env)
                     except Exception as retry_exc:
                         # operation is caller-provided; broad catch required.
                         logger.debug(
@@ -498,16 +632,23 @@ class AuthResolver(_AuthSupportMixin):
                             host_info.display_name,
                             retry_exc,
                         )
-                        return _try_credential_fallback(retry_exc)
+                        return _try_credential_fallback(retry_exc, ctx)
                 raise
-        # Download path: auth-first for higher rate limits
-        elif auth_ctx.token:
+
+        def _run_auth_preferred() -> T:
+            """Download path: auth-first for higher rate limits."""
+            ctx = _auth_context()
+            if not ctx.token:
+                _log(
+                    f"No token available, trying unauthenticated access to {host_info.display_name}"
+                )
+                return operation(None, unauth_env)
             try:
                 _log(
                     f"Trying authenticated access to {host_info.display_name} "
-                    f"(source: {auth_ctx.source})"
+                    f"(source: {ctx.source})"
                 )
-                return operation(auth_ctx.token, git_env)
+                return operation(ctx.token, ctx.git_env)
             except Exception as exc:
                 # operation is caller-provided; broad catch required -- cannot narrow
                 # without restricting the caller API.  Use %r so the type is visible.
@@ -527,81 +668,14 @@ class AuthResolver(_AuthSupportMixin):
                             host_info.display_name,
                             unauth_exc,
                         )
-                # Both the unauth retry failure and the no-public-repos case
-                # converge on the secondary credential chain.
-                return _try_credential_fallback(exc)
-        else:
-            _log(f"No token available, trying unauthenticated access to {host_info.display_name}")
-            return operation(None, unauth_env)
+                        return _try_credential_fallback(exc, ctx)
+                return _try_credential_fallback(exc, ctx)
+
+        if unauth_first:
+            return _run_unauth_first()
+        return _run_auth_preferred()
 
     # -- internals ----------------------------------------------------------
-
-    def _resolve_token(self, host_info: HostInfo, org: str | None) -> tuple[str | None, str, str]:
-        """Walk the token resolution chain.  Returns (token, source, scheme).
-
-        Resolution order (GitHub-class: ``github``, ``ghe_cloud``, ``ghes``):
-        1. Per-org ``GITHUB_APM_PAT_{ORG}`` when *org* is set
-        2. ``GITHUB_APM_PAT`` -> ``GITHUB_TOKEN`` -> ``GH_TOKEN``
-        3. ``gh auth token --hostname <host>`` (gh CLI active account)
-        4. Host-specific git credential helper
-
-        Resolution order (``gitlab``): ``GITLAB_APM_PAT`` → ``GITLAB_TOKEN`` →
-        credential helper. GitHub env vars are not consulted.
-
-        Resolution order (``generic``): credential helper only (no GitHub or
-        GitLab platform env vars).
-
-        Resolution order (ADO): ``ADO_APM_PAT`` → AAD bearer → ``none``.
-
-        All token-bearing requests use HTTPS.
-        """
-        if host_info.kind == "ado":
-            return self._resolve_ado_token(host_info)
-
-        # ADO uses ADO_APM_PAT (single var) + AAD bearer fallback;
-        # per-org vars and credential fill are out of scope.
-
-        # 1. Per-org GitHub PAT (GitHub-class hosts only — not GitLab / generic / ADO)
-        if org and host_info.kind in ("github", "ghe_cloud", "ghes"):
-            env_name = f"GITHUB_APM_PAT_{_org_to_env_suffix(org)}"
-            token = os.environ.get(env_name)
-            if token:
-                return token, env_name, "basic"
-
-        # 2. Global env vars by host class
-        purpose = self._purpose_for_host(host_info)
-        token = self._token_manager.get_token_for_purpose(purpose)
-        if token:
-            source = self._identify_env_source(purpose)
-            return token, source, "basic"
-
-        if not self._allow_external_fallback:
-            return None, "none", "basic"
-
-        # 3. gh CLI active account (eligibility gated inside the call;
-        #    unsupported hosts return None instantly without a subprocess)
-        gh_token = self._token_manager.resolve_credential_from_gh_cli(host_info.host)
-        if gh_token:
-            return gh_token, "gh-auth-token", "basic"
-
-        # 4. Git credential helper (not for ADO)
-        if host_info.kind not in ("ado",):
-            # Note: path= is intentionally omitted here. _resolve_token is the
-            # primary credential-resolution leg invoked once per host; it has
-            # no per-call repository context. The fallback leg in
-            # _try_credential_fallback re-invokes resolve_credential_from_git
-            # WITH path= when the primary credential is rejected, so GCM
-            # multi-account users still get per-URL disambiguation -- they
-            # just pay one extra round-trip on the first miss. Adding path=
-            # here would require threading repo context through every
-            # resolve() call site, which is disproportionate to the benefit.
-            credential = self._token_manager.resolve_credential_from_git(
-                host_info.host, port=host_info.port
-            )
-            if credential:
-                return credential, "git-credential-fill", "basic"
-
-        return None, "none", "basic"
 
     def _resolve_ado_token(self, host_info: HostInfo) -> tuple[str | None, str, str]:
         """Resolve the ADO token chain: ADO_APM_PAT -> AAD bearer -> none."""

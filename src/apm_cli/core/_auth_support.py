@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,8 @@ class _AuthSupportMixin:
         context. Callers MUST only set this when the bearer attempt
         actually ran (see :class:`BearerFallbackOutcome.bearer_attempted`).
         """
-        auth_ctx = self.resolve(host, org, port=port)
+        path = dep_url if self.uses_public_github_anonymous_first(host, port=port) is True else None
+        auth_ctx = self.resolve(host, org, port=port, path=path)
         host_info = auth_ctx.host_info
         display = host_info.display_name
 
@@ -335,6 +337,155 @@ class _AuthSupportMixin:
 
     # -- internals ----------------------------------------------------------
 
+    # -- public-github anonymous-first policy + token chain ------------------
+    # Relocated from ``core/auth.py`` for the Stage-2 800-line ceiling
+    # (issue #1078). Boundary-free: no bearer-provider symbol, no ADO
+    # ls-remote. ``_resolve_ado_token`` stays in ``core/auth.py``.
+
+    @staticmethod
+    def is_public_github_auth_failure(exc: BaseException) -> bool:
+        """Return whether an anonymous github.com failure may require auth.
+
+        HTTP 401, 403, and 404 are deliberately eligible because GitHub hides
+        private repositories behind 404. Git and libcurl equivalents are
+        matched narrowly. Connectivity, TLS, timeout, and throttle failures
+        are not auth signals and must surface without credential resolution.
+        """
+        from ..deps.github_rate_limit import GitHubThrottleError
+
+        if isinstance(exc, GitHubThrottleError):
+            return False
+        response = getattr(exc, "response", None)
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code in {401, 403, 404}
+
+        parts = [str(exc)]
+        for name in ("stderr", "stdout"):
+            value = getattr(exc, name, None)
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            if value:
+                parts.append(str(value))
+        text = " ".join(parts).lower()
+        if any(
+            signal in text
+            for signal in (
+                "rate limit",
+                "throttle",
+                "too many requests",
+                "could not resolve host",
+                "connection refused",
+                "connection timed out",
+                "network is unreachable",
+                "certificate verify failed",
+                "certificate_verify_failed",
+                "ssl certificate problem",
+                "tls verification failed",
+            )
+        ):
+            return False
+        if any(
+            signal in text
+            for signal in (
+                "authentication failed",
+                "authorization failed",
+                "unauthorized",
+                "could not read username",
+                "invalid username or password",
+                "repository not found",
+                "terminal prompts disabled",
+                "unable to get password from user",
+            )
+        ):
+            return True
+        return (
+            re.search(
+                r"(?:http(?: error)?|returned error:|status(?: code)?[=: ]+)"
+                r"\s*(?:401|403|404)\b",
+                text,
+            )
+            is not None
+        )
+
+    def _resolve_token(
+        self,
+        host_info,  # HostInfo; untyped to keep this module free of a core.auth import
+        org: str | None,
+        *,
+        path: str | None = None,
+    ) -> tuple[str | None, str, str]:
+        """Walk the token resolution chain.  Returns (token, source, scheme).
+
+        Resolution order (GitHub-class: ``github``, ``ghe_cloud``, ``ghes``):
+        1. Per-org ``GITHUB_APM_PAT_{ORG}`` when *org* is set
+        2. ``GITHUB_APM_PAT`` -> ``GITHUB_TOKEN`` -> ``GH_TOKEN``
+        3. ``gh auth token --hostname <host>`` (gh CLI active account)
+        4. Host-specific git credential helper
+
+        Resolution order (``gitlab``): ``GITLAB_APM_PAT`` → ``GITLAB_TOKEN`` →
+        credential helper. GitHub env vars are not consulted.
+
+        Resolution order (``generic``): credential helper only (no GitHub or
+        GitLab platform env vars).
+
+        Resolution order (ADO): ``ADO_APM_PAT`` → AAD bearer → ``none``.
+
+        All token-bearing requests use HTTPS.
+        """
+        if host_info.kind == "ado":
+            return self._resolve_ado_token(host_info)
+
+        # ADO uses ADO_APM_PAT (single var) + AAD bearer fallback;
+        # per-org vars and credential fill are out of scope.
+
+        # 1. Per-org GitHub PAT (GitHub-class hosts only — not GitLab / generic / ADO)
+        if org and host_info.kind in ("github", "ghe_cloud", "ghes"):
+            env_name = f"GITHUB_APM_PAT_{_org_to_env_suffix(org)}"
+            token = os.environ.get(env_name)
+            if token:
+                return token, env_name, "basic"
+
+        # 2. Global env vars by host class
+        purpose = self._purpose_for_host(host_info)
+        token = self._token_manager.get_token_for_purpose(purpose)
+        if token:
+            source = self._identify_env_source(purpose)
+            return token, source, "basic"
+
+        if not self._allow_external_fallback:
+            return None, "none", "basic"
+
+        # 3. gh CLI active account (eligibility gated inside the call;
+        #    unsupported hosts return None instantly without a subprocess)
+        gh_token = self._token_manager.resolve_credential_from_gh_cli(host_info.host)
+        if gh_token:
+            return gh_token, "gh-auth-token", "basic"
+
+        # 4. Git credential helper (not for ADO)
+        if host_info.kind not in ("ado",):
+            # Most primary resolution calls remain host-scoped. The public
+            # github.com anonymous-first fallback supplies path= after a
+            # private-repo-shaped failure so GCM can choose the correct
+            # account without an unscoped prompt.
+            if path is None:
+                credential = self._token_manager.resolve_credential_from_git(
+                    host_info.host,
+                    port=host_info.port,
+                )
+            else:
+                credential = self._token_manager.resolve_credential_from_git(
+                    host_info.host,
+                    port=host_info.port,
+                    path=path,
+                )
+            if credential:
+                return credential, "git-credential-fill", "basic"
+
+        return None, "none", "basic"
+
     @staticmethod
     def _purpose_for_host(host_info) -> str:
         from apm_cli.core.host_providers import HOST_PROVIDERS
@@ -347,6 +498,17 @@ class _AuthSupportMixin:
             if os.environ.get(var):
                 return var
         return "env"
+
+    @staticmethod
+    def _append_git_config(env: dict[str, str], key: str, value: str) -> None:
+        """Append one process-scoped Git config entry without clobbering peers."""
+        try:
+            count = max(0, int(env.get("GIT_CONFIG_COUNT", "0") or "0"))
+        except ValueError:
+            count = 0
+        env["GIT_CONFIG_COUNT"] = str(count + 1)
+        env[f"GIT_CONFIG_KEY_{count}"] = key
+        env[f"GIT_CONFIG_VALUE_{count}"] = value
 
     @staticmethod
     def _build_git_env(
@@ -395,7 +557,7 @@ class _AuthSupportMixin:
             key = env.pop(f"GIT_CONFIG_KEY_{index}", "")
             value = env.pop(f"GIT_CONFIG_VALUE_{index}", "")
             normalized = key.lower()
-            if "extraheader" in normalized or "authorization" in value.lower():
+            if "extraheader" in normalized or value.strip().lower().startswith("authorization:"):
                 continue
             if key:
                 retained.append((key, value))

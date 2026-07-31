@@ -36,12 +36,19 @@ from ..utils.github_host import (
     default_host,
     is_github_hostname,
 )
-from ..utils.path_security import PathTraversalError
+
+# Re-exported (double-name so ruff keeps them): the GitLab git-first body moved
+# to download_strategies_backends_ops for the Stage-2 800-line ceiling and
+# reaches these through the ``_ds`` facade alias, which also preserves the
+# ``apm_cli.deps.download_strategies.<name>`` monkeypatch seam.
+from ..utils.path_security import PathTraversalError as PathTraversalError
 from .git_file_transport import (
     GitFileFetchResult,
-    GitFileTransportError,
-    GitFileTransportSecurityError,
     GitSparseFileTransport,
+)
+from .git_file_transport import GitFileTransportError as GitFileTransportError
+from .git_file_transport import (
+    GitFileTransportSecurityError as GitFileTransportSecurityError,
 )
 from .github_rate_limit import GitHubThrottleError, github_throttle_error
 from .host_backends import backend_for
@@ -362,6 +369,9 @@ class DownloadDelegate:
     def try_raw_download(self, owner: str, repo: str, ref: str, file_path: str) -> bytes | None:
         """Attempt to fetch a file via raw.githubusercontent.com (CDN).
 
+        This pre-auth helper must remain token-free: it runs before
+        ``AuthResolver`` has established that credentials may be required.
+
         Returns the raw bytes on success, or ``None`` if the file was not found
         (HTTP 404) or the request failed for any reason.  This is intentionally
         best-effort: callers fall back to the Contents API when ``None`` is
@@ -462,109 +472,23 @@ class DownloadDelegate:
         ``repository/files/.../raw`` endpoint is tried with the GITLAB_APM_PAT
         / GITLAB_TOKEN credential, mirroring the ADO_APM_PAT pattern.
         """
-        host = dep_ref.host or default_host()
-        host_info = self._host.auth_resolver.classify_host(
-            host,
-            port=dep_ref.port,
-            host_type=dep_ref.host_type,
+        from .download_strategies_backends_ops import download_gitlab_file_git_first_impl
+
+        return download_gitlab_file_git_first_impl(self, dep_ref, file_path, ref, verbose_callback)
+
+    def _download_public_github_file_anonymous_first(
+        self,
+        dep_ref: DependencyReference,
+        file_path: str,
+        ref: str,
+        verbose_callback=None,
+    ) -> bytes:
+        """Fetch one github.com file anonymously, resolving auth only on 4xx."""
+        from .download_strategies_ops import _download_public_github_file_anonymous_first_impl
+
+        return _download_public_github_file_anonymous_first_impl(
+            self, dep_ref, file_path, ref, verbose_callback
         )
-        project_path = dep_ref.repo_url
-        if not project_path:
-            raise RuntimeError("Missing repository path for GitLab file download")
-
-        # -- Primary: git sparse/partial checkout (works even when API is 410) --
-        try:
-            content = self._download_gitlab_file_via_git(dep_ref, file_path, ref)
-            if verbose_callback:
-                verbose_callback(
-                    f"Fetched file via git transport: {host}/{dep_ref.repo_url}/{file_path}"
-                )
-            return content
-        except (PathTraversalError, GitFileTransportSecurityError):
-            # A traversal / symlink-escape attempt must hard-fail. It must
-            # NOT be silently retried over the REST transport -- letting a
-            # rejected path fall through would hand an attacker a second
-            # transport to probe. Propagate the security failure unchanged.
-            raise
-        except (GitFileTransportError, RuntimeError, OSError) as exc:
-            fallback_target = f"{host}/{dep_ref.repo_url}"
-            _debug(
-                f"git transport unavailable for {fallback_target}; "
-                f"falling back to GitLab REST API ({type(exc).__name__})"
-            )
-        # -- Fallback: GitLab REST v4 API (requires GITLAB_APM_PAT / GITLAB_TOKEN) --
-        org = project_path.split("/")[0]
-        file_ctx = self._host.auth_resolver.resolve(
-            host,
-            org,
-            port=dep_ref.port,
-            host_type=dep_ref.host_type,
-        )
-        token = file_ctx.token
-        headers = AuthResolver.gitlab_rest_headers(token)
-
-        api_base = host_info.api_base.rstrip("/")
-        enc_proj = quote(project_path, safe="")
-        enc_file = quote(file_path, safe="")
-
-        def _raw_url(r: str) -> str:
-            return (
-                f"{api_base}/projects/{enc_proj}/repository/files/{enc_file}/raw"
-                f"?ref={quote(r, safe='')}"
-            )
-
-        api_url = _raw_url(ref)
-
-        try:
-            response = self._host._resilient_get(api_url, headers=headers, timeout=30)
-            response.raise_for_status()
-            if verbose_callback:
-                verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
-            return response.content
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                if ref not in ("main", "master"):
-                    raise RuntimeError(
-                        f"File not found: {file_path} at ref '{ref}' in {dep_ref.repo_url}"
-                    ) from e
-                fallback_ref = "master" if ref == "main" else "main"
-                fallback_url = _raw_url(fallback_ref)
-                try:
-                    response = self._host._resilient_get(fallback_url, headers=headers, timeout=30)
-                    response.raise_for_status()
-                    if verbose_callback:
-                        verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
-                    return response.content
-                except requests.exceptions.HTTPError as fallback_err:
-                    raise RuntimeError(
-                        f"File not found: {file_path} in {dep_ref.repo_url} "
-                        f"(tried refs: {ref}, {fallback_ref})"
-                    ) from fallback_err
-            if e.response is not None and e.response.status_code in (401, 403):
-                error_msg = (
-                    f"Authentication failed for GitLab {dep_ref.repo_url} "
-                    f"(file: {file_path}, ref: {ref}). "
-                )
-                if not token:
-                    error_msg += self._host.auth_resolver.build_error_context(
-                        host, "download", org=org, port=dep_ref.port
-                    )
-                else:
-                    error_msg += (
-                        "Please verify your token can read this project (required API scope)."
-                    )
-                raise RuntimeError(error_msg) from e
-            if e.response is not None:
-                raise RuntimeError(
-                    f"Failed to download {file_path}: HTTP {e.response.status_code}"
-                ) from e
-            raise
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Network error downloading {file_path}: {e}") from e
-
-    # ------------------------------------------------------------------
-    # GitHub file download
-    # ------------------------------------------------------------------
 
     def download_github_file(
         self,

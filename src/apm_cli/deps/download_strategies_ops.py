@@ -13,6 +13,131 @@ import requests
 from ..models.apm_package import DependencyReference
 
 
+def _download_public_github_file_anonymous_first_impl(
+    delegate,
+    dep_ref: DependencyReference,
+    file_path: str,
+    ref: str,
+    verbose_callback=None,
+) -> bytes:
+    """Fetch one github.com file anonymously, resolving auth only on 4xx."""
+    from apm_cli.deps import download_strategies as _ds
+
+    host = dep_ref.host or _ds.default_host()
+    owner, repo = dep_ref.repo_url.split("/", 1)
+    refs = [ref]
+    if ref in ("main", "master"):
+        refs.append("master" if ref == "main" else "main")
+
+    for candidate_ref in refs:
+        content = delegate.try_raw_download(owner, repo, candidate_ref, file_path)
+        if content is not None:
+            if verbose_callback:
+                verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
+            return content
+
+    def _contents_request(
+        token: str | None,
+        _git_env: dict[str, str],
+    ) -> bytes:
+        headers: dict[str, str] = {
+            "Accept": "application/vnd.github.v3.raw",
+        }
+        if token:
+            headers["Authorization"] = f"token {token}"
+        last_response = None
+        for candidate_ref in refs:
+            api_url = delegate._build_contents_api_urls(
+                host,
+                owner,
+                repo,
+                file_path,
+                candidate_ref,
+                is_github_host=True,
+            )[0]
+            response = delegate._host._resilient_get(
+                api_url,
+                headers=headers,
+                timeout=30,
+                retry_throttles=False,
+            )
+            if response.status_code == 200:
+                if verbose_callback:
+                    verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
+                return delegate._extract_contents_api_payload(
+                    response,
+                    is_github_host=True,
+                )
+            throttle = _ds.github_throttle_error(response, host)
+            if throttle is not None:
+                raise throttle
+            last_response = response
+            if response.status_code != 404:
+                response.raise_for_status()
+        if last_response is not None:
+            last_response.raise_for_status()
+        raise RuntimeError(f"No GitHub Contents API response for {file_path}")
+
+    try:
+        return delegate._host.auth_resolver.try_with_fallback(
+            host,
+            _contents_request,
+            org=owner,
+            port=dep_ref.port,
+            path=dep_ref.repo_url,
+            host_type=dep_ref.host_type,
+            unauth_first=True,
+            verbose_callback=verbose_callback,
+        )
+    except _ds.GitHubThrottleError:
+        raise
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        if status in (401, 403):
+            raise RuntimeError(
+                f"Authentication failed for {dep_ref.repo_url} "
+                f"(file: {file_path}, ref: {ref}). "
+                "The repository may be private or the resolved credential "
+                "may lack access."
+            ) from exc
+        if status == 404:
+            raise RuntimeError(
+                delegate._build_unsupported_or_missing_error(
+                    host,
+                    dep_ref.repo_url,
+                    file_path,
+                    ref,
+                    delegate._build_contents_api_urls(
+                        host,
+                        owner,
+                        repo,
+                        file_path,
+                        ref,
+                        is_github_host=True,
+                    ),
+                    is_github_host=True,
+                    fallback_ref=refs[-1] if len(refs) > 1 else None,
+                )
+            ) from exc
+        raise RuntimeError(
+            delegate._build_download_http_error(
+                host,
+                file_path,
+                status,
+                "Contents API",
+            )
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            delegate._build_download_network_error(
+                host,
+                file_path,
+                "Contents API",
+                exc,
+            )
+        ) from exc
+
+
 def download_github_file(
     delegate,
     dep_ref: DependencyReference,
@@ -39,6 +164,21 @@ def download_github_file(
     from apm_cli.deps import download_strategies as _ds
 
     host = dep_ref.host or _ds.default_host()
+
+    if (
+        delegate._host.auth_resolver.uses_public_github_anonymous_first(
+            host,
+            port=dep_ref.port,
+            host_type=dep_ref.host_type,
+        )
+        is True
+    ):
+        return delegate._download_public_github_file_anonymous_first(
+            dep_ref,
+            file_path,
+            ref,
+            verbose_callback,
+        )
 
     # Parse owner/repo from repo_url
     owner, repo = dep_ref.repo_url.split("/", 1)
@@ -352,6 +492,52 @@ def _download_github_file_via_git_impl(
     from apm_cli.utils.github_host import set_authorization_header_git_env
 
     key = delegate._git_file_transport_key(dep_ref, ref)
+    host = dep_ref.host or _ds.default_host()
+    if (
+        delegate._host.auth_resolver.uses_public_github_anonymous_first(
+            host,
+            port=dep_ref.port,
+            host_type=dep_ref.host_type,
+        )
+        is True
+    ):
+
+        def _fetch(token: str | None, git_env: dict[str, str]):
+            attempt_env = dict(git_env)
+            if token:
+                set_authorization_header_git_env(attempt_env, "Bearer", token)
+                attempt_env.pop("GIT_TOKEN", None)
+
+            def _anon_repo_url(repo_ref: str, *, dep_ref: "DependencyReference") -> str:
+                return delegate.build_repo_url(
+                    repo_ref,
+                    dep_ref=dep_ref,
+                    token="",
+                    auth_scheme="basic",
+                )
+
+            transport_factory = delegate._git_file_transport_factory or _ds.GitSparseFileTransport
+            transport = transport_factory(
+                dep_ref,
+                ref,
+                build_repo_url_fn=_anon_repo_url,
+                git_env=attempt_env,
+            )
+            try:
+                return transport.fetch_file_with_commit(file_path)
+            finally:
+                transport.close()
+
+        return delegate._host.auth_resolver.try_with_fallback(
+            host,
+            _fetch,
+            org=dep_ref.repo_url.split("/", 1)[0],
+            port=dep_ref.port,
+            path=dep_ref.repo_url,
+            host_type=dep_ref.host_type,
+            unauth_first=True,
+        )
+
     auth_ctx = delegate._host.auth_resolver.resolve_for_dep(dep_ref)
     if auth_ctx.token:
         # AuthResolver owns credential resolution. Convert its resolved

@@ -340,8 +340,24 @@ class GitHubPackageDownloader:
         )
 
     def _cache_git_env(self, dep_ref: DependencyReference) -> dict[str, str]:
-        """Return the subprocess environment for persistent Git cache operations."""
+        """Return the subprocess environment for persistent Git cache operations.
+
+        Plaintext HTTP repositories must not inherit ambient credential helpers:
+        GitCache performs network fetches as well as local checkout operations, so
+        it needs the same credential-suppression fence as direct HTTP transport.
+        """
         from .git_auth_env import GitAuthEnvBuilder
+
+        if (
+            self.auth_resolver.uses_public_github_anonymous_first(
+                dep_ref.host or default_host(),
+                port=dep_ref.port,
+                host_type=dep_ref.host_type,
+            )
+            is True
+            and not dep_ref.is_insecure
+        ):
+            return self.auth_resolver.build_public_github_anonymous_git_env()
 
         git_env = GitAuthEnvBuilder.subprocess_env_dict(self.git_env)
         if dep_ref.is_insecure:

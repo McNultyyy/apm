@@ -167,6 +167,92 @@ def _virtual_description(file_content: bytes, filename: str) -> str:
     return description
 
 
+def _sparse_checkout_public_github_anonymous_first(
+    downloader,
+    dep_ref: DependencyReference,
+    temp_clone_path: Path,
+    subdir_path: str,
+    ref: str | None,
+) -> bool:
+    """Sparse-checkout github.com anonymously, resolving auth only on failure."""
+    from apm_cli.deps import github_downloader as _gh
+
+    anonymous_url = downloader._build_repo_url(
+        dep_ref.repo_url,
+        use_ssh=False,
+        dep_ref=dep_ref,
+        token="",
+    )
+    setup_env = downloader.auth_resolver.build_public_github_anonymous_git_env()
+    setup_cmds = [
+        ["git", "init"],
+        ["git", "remote", "add", "origin", anonymous_url],
+        ["git", "sparse-checkout", "init", "--cone"],
+        ["git", "sparse-checkout", "set", subdir_path],
+    ]
+    for cmd in setup_cmds:
+        result = _gh.subprocess.run(
+            cmd,
+            cwd=str(temp_clone_path),
+            env=setup_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=120,
+        )
+        if result.returncode != 0:
+            return False
+
+    def _run_or_raise(cmd: list[str], git_env: dict[str, str]) -> None:
+        result = _gh.subprocess.run(
+            cmd,
+            cwd=str(temp_clone_path),
+            env=git_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise _gh.subprocess.CalledProcessError(
+                result.returncode,
+                result.args,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+
+    def _fetch(token: str | None, git_env: dict[str, str]) -> None:
+        if token is not None:
+            authenticated_url = downloader._build_repo_url(
+                dep_ref.repo_url,
+                use_ssh=False,
+                dep_ref=dep_ref,
+                token=token or "",
+            )
+            _run_or_raise(["git", "remote", "set-url", "origin", authenticated_url], git_env)
+        _run_or_raise(["git", "fetch", "origin", ref or "HEAD", "--depth=1"], git_env)
+
+    downloader.auth_resolver.try_with_fallback(
+        dep_ref.host or _gh.default_host(),
+        _fetch,
+        org=dep_ref.repo_url.split("/", 1)[0],
+        port=dep_ref.port,
+        path=dep_ref.repo_url,
+        host_type=dep_ref.host_type,
+        unauth_first=True,
+    )
+    checkout_result = _gh.subprocess.run(
+        ["git", "checkout", "FETCH_HEAD"],
+        cwd=str(temp_clone_path),
+        env=setup_env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+    )
+    return checkout_result.returncode == 0
+
+
 def try_sparse_checkout(
     downloader,
     dep_ref: DependencyReference,
@@ -182,6 +268,19 @@ def try_sparse_checkout(
 
     try:
         temp_clone_path.mkdir(parents=True, exist_ok=True)
+
+        if (
+            not dep_ref.is_insecure
+            and downloader.auth_resolver.uses_public_github_anonymous_first(
+                dep_ref.host or _gh.default_host(),
+                port=dep_ref.port,
+                host_type=dep_ref.host_type,
+            )
+            is True
+        ):
+            return _sparse_checkout_public_github_anonymous_first(
+                downloader, dep_ref, temp_clone_path, subdir_path, ref
+            )
 
         # Resolve per-dependency auth via AuthResolver.
         dep_auth_ctx = downloader._resolve_dep_auth_ctx(dep_ref)
