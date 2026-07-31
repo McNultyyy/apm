@@ -9,17 +9,28 @@ The existing adapters (client/, package_manager/) and registry operations
 (registry/operations.py) are *used* by this class, not modified.
 """
 
+from __future__ import annotations
+
 import builtins
-import copy
 import logging
 import re
 import shutil as shutil  # re-export: `mcp_integrator.shutil.which` patch seam for mcp_vscode
 import warnings
-from datetime import datetime, timezone
+from datetime import datetime as datetime  # re-export: RULE B seam for mcp_lockfile_state
+from datetime import timezone as timezone  # re-export: RULE B seam for mcp_lockfile_state
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from apm_cli.core.null_logger import NullCommandLogger
-from apm_cli.deps.lockfile import LockFile, get_lockfile_path
+from apm_cli.deps.lockfile import (  # re-export: RULE B patch seam for mcp_lockfile_state
+    LockFile as LockFile,
+)
+from apm_cli.deps.lockfile import (
+    get_lockfile_path as get_lockfile_path,
+)
+from apm_cli.deps.lockfile import (
+    installed_apm_version as installed_apm_version,
+)
 from apm_cli.integration.mcp_config_clean import (
     _clean_claude_config as _clean_claude_config,
 )
@@ -44,6 +55,12 @@ from apm_cli.utils.console import (
     _get_console,  # noqa: F401 -- re-exported; mcp_integrator_install imports this via lazy import
     _rich_success,
 )
+from apm_cli.utils.console import (
+    _rich_warning as _rich_warning,  # re-export: RULE B seam for mcp_lockfile_state
+)
+
+if TYPE_CHECKING:
+    from apm_cli.core.command_logger import CommandLogger
 
 _log = logging.getLogger(__name__)
 
@@ -584,50 +601,19 @@ class MCPIntegrator:
         mcp_configs: builtins.dict | None = None,
         mcp_target_servers: builtins.dict | None = None,
         mcp_config_provenance: builtins.dict | None = None,
+        logger: CommandLogger | None = None,
     ) -> None:
         """Update the lockfile with the current set of APM-managed MCP server names."""
-        if lock_path is None:
-            lock_path = get_lockfile_path(Path.cwd())
-        if not lock_path.exists():
-            return
-        try:
-            existing_lockfile = LockFile.read(lock_path)
-            if existing_lockfile is None:
-                return
-            lockfile = copy.deepcopy(existing_lockfile)
-            lockfile.mcp_servers = sorted(mcp_server_names)
-            if mcp_configs is not None:
-                lockfile.mcp_configs = mcp_configs
-            if mcp_target_servers is not None:
-                from apm_cli.core.deployment_ledger import DeploymentLedgerCodec
+        from apm_cli.integration.mcp_lockfile_state import write_mcp_state
 
-                DeploymentLedgerCodec.replace_mcp_target_servers(
-                    lockfile,
-                    {
-                        target: sorted(servers)
-                        for target, servers in sorted(mcp_target_servers.items())
-                        if servers
-                    },
-                )
-            if mcp_config_provenance is not None:
-                lockfile.mcp_config_provenance = mcp_config_provenance
-            if lockfile.mcp_config_provenance:
-                lockfile.mcp_config_provenance = {
-                    name: pkg
-                    for name, pkg in lockfile.mcp_config_provenance.items()
-                    if name in lockfile.mcp_configs
-                }
-            if lockfile.is_semantically_equivalent(existing_lockfile):
-                _log.debug("MCP lockfile unchanged -- skipping write")
-                return
-            lockfile.generated_at = datetime.now(timezone.utc).isoformat()
-            lockfile.save(lock_path)
-        except Exception:
-            _log.debug(
-                "Failed to update MCP servers in lockfile at %s",
-                lock_path,
-                exc_info=True,
-            )
+        write_mcp_state(
+            mcp_server_names,
+            lock_path,
+            mcp_configs=mcp_configs,
+            mcp_target_servers=mcp_target_servers,
+            mcp_config_provenance=mcp_config_provenance,
+            logger=logger,
+        )
 
     # ------------------------------------------------------------------
     # Runtime detection

@@ -46,6 +46,16 @@ logger = logging.getLogger(__name__)
 _SELF_KEY = "."
 
 
+def installed_apm_version() -> str:
+    """Return the running APM distribution version for lockfile metadata."""
+    try:
+        from importlib.metadata import version
+
+        return version("apm-cli")
+    except Exception:
+        return "unknown"
+
+
 @dataclass
 class LockedDependency:
     """A resolved dependency with exact commit/version information."""
@@ -576,15 +586,7 @@ class LockFile:
         """
         from .installed_package import InstalledPackage
 
-        # Get APM version
-        try:
-            from importlib.metadata import version
-
-            apm_version = version("apm-cli")
-        except Exception:
-            apm_version = "unknown"
-
-        lock = cls(apm_version=apm_version)
+        lock = cls(apm_version=installed_apm_version())
 
         for entry in installed_packages:
             registry_resolution = None

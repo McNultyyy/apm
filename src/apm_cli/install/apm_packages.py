@@ -29,6 +29,7 @@ def _install_apm_packages(ctx, outcome):
     # RULE B: late import so @patch("apm_cli.commands.install.<x>") intercepts
     # calls to APMPackage, LockFile, _install_apm_dependencies, _maybe_rollback_manifest,
     # _rich_*, _check_insecure_dependencies, migrate_lockfile_if_needed,
+    # _frozen_install_tip,
     # get_lockfile_path, _project_has_root_primitives, APM_DEPS_AVAILABLE.
     import apm_cli.commands.install as _m
 
@@ -67,6 +68,19 @@ def _install_apm_packages(ctx, outcome):
 
     all_apm_deps = builtins.list(apm_deps) + builtins.list(dev_apm_deps)
     _m._check_insecure_dependencies(all_apm_deps, ctx.allow_insecure, logger)
+
+    if ctx.frozen is True:
+        from apm_cli.install.request import InstallRequest
+        from apm_cli.install.service import InstallService
+
+        InstallService.enforce_frozen(
+            InstallRequest(
+                apm_package=apm_package,
+                frozen=True,
+                scope=ctx.scope,
+                trust_transitive_mcp=ctx.trust_transitive_mcp,
+            )
+        )
 
     # Determine what to install based on install mode
     should_install_apm = ctx.install_mode != InstallMode.MCP
@@ -176,6 +190,7 @@ def _install_apm_packages(ctx, outcome):
                 no_policy=ctx.no_policy,
                 audit_override=ctx.audit_override,
                 legacy_skill_paths=ctx.legacy_skill_paths,
+                trust_transitive_mcp=ctx.trust_transitive_mcp,
                 frozen=ctx.frozen,
                 plan_callback=ctx.plan_callback,
                 skill_subset=ctx.skill_subset,
@@ -214,7 +229,7 @@ def _install_apm_packages(ctx, outcome):
             logger.error(str(e))
             for reason in e.reasons:
                 logger.error_detail(reason)
-            logger.info("Tip: run 'apm outdated' to see what changed, then 'apm update'.")
+            logger.info(_m._frozen_install_tip(e))
             raise InstallFailureAlreadyRendered(str(e)) from e
         except InstallFailureAlreadyRendered:
             raise
@@ -357,6 +372,7 @@ def _install_apm_dependencies(  # noqa: PLR0913
     skill_subset=None,
     skill_subset_from_cli: bool = False,
     legacy_skill_paths: bool = False,
+    trust_transitive_mcp: bool = False,
     frozen: bool = False,
     plan_callback=None,
     refresh: bool = False,
@@ -401,6 +417,7 @@ def _install_apm_dependencies(  # noqa: PLR0913
         skill_subset=skill_subset,
         skill_subset_from_cli=skill_subset_from_cli,
         legacy_skill_paths=legacy_skill_paths,
+        trust_transitive_mcp=trust_transitive_mcp,
         frozen=frozen,
         plan_callback=plan_callback,
         refresh=refresh,

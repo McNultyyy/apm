@@ -118,6 +118,7 @@ from ..utils.console import (  # noqa: F401
 from ._helpers import _get_invocation_argv, _split_argv_at_double_dash  # noqa: F401 -- patched by tests
 from ._install_ops import (
     _create_transaction,
+    _frozen_install_tip,
     _make_fail_result,
     _normalize_skill_subset,
     _resolve_audit_override,
@@ -197,7 +198,12 @@ except ImportError as e:
 @click.option(
     "--frozen",
     is_flag=True,
-    help="Refuse to install when apm.lock.yaml is missing or out of sync with apm.yml (CI-safe; mutually exclusive with --update). Structural presence check only; use 'apm audit' for on-disk integrity.",
+    help=(
+        "Refuse to install when apm.lock.yaml is missing or out of sync with "
+        "apm.yml, including MCP config state (CI-safe; mutually exclusive with "
+        "--update, --mcp, and positional packages). Use 'apm audit' for on-disk "
+        "integrity."
+    ),
 )
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed installation information")
 @click.option(
@@ -491,6 +497,15 @@ def install(  # noqa: PLR0913
     _command_result = None
     logger = None
     transaction = None
+    from ..install.service import InstallService
+
+    try:
+        if mcp_name is not None:
+            InstallService.reject_frozen_mutation(frozen, "--mcp")
+        elif packages:
+            InstallService.reject_frozen_mutation(frozen, "positional packages")
+    except FrozenInstallError as exc:
+        raise click.ClickException(str(exc)) from exc
     if frozen and update:
         raise click.UsageError(
             "--frozen and --update are mutually exclusive. "
@@ -502,6 +517,11 @@ def install(  # noqa: PLR0913
     from ..install.root_redirect import install_root_redirect
 
     audit_override = _resolve_audit_override(no_audit, audit_mode)
+
+    try:
+        InstallService.reject_missing_frozen_root(frozen, root)
+    except FrozenInstallError as exc:
+        raise click.ClickException(str(exc)) from exc
     _root_redirect = install_root_redirect(root, dry_run=dry_run)
     _root_redirect.__enter__()
     try:
@@ -597,7 +617,6 @@ def install(  # noqa: PLR0913
             update=update,
             any_transport_flag=use_ssh or use_https or allow_protocol_fallback,
         )
-
         # Normalize --skill: '*' means all (same as absent). Reject with --mcp.
         _skill_subset = _normalize_skill_subset(skill_names, mcp_name)
 
@@ -726,7 +745,7 @@ def install(  # noqa: PLR0913
         logger.error(str(e))
         for reason in e.reasons:
             logger.error_detail(reason)
-        logger.info("Tip: run 'apm outdated' to see what changed, then 'apm update'.")
+        logger.info(_frozen_install_tip(e))
         _command_result = _make_fail_result(e, transaction)
     except DirectDependencyError as e:
         logger.error(str(e))
