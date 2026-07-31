@@ -225,7 +225,7 @@ def _ado_build_headers_from_ctx(auth_ctx) -> dict[str, str]:
     if not auth_ctx.token:
         return {}
     if auth_ctx.auth_scheme == "bearer":
-        return {"Authorization": "******"}
+        return {"Authorization": f"Bearer {auth_ctx.token}"}
     encoded = base64.b64encode(f":{auth_ctx.token}".encode()).decode()
     return {"Authorization": f"Basic {encoded}"}
 
@@ -257,6 +257,60 @@ def _ado_build_headers(delegate, dep_ref: DependencyReference, host: str) -> dic
     return headers
 
 
+def _ado_bearer_headers(token: str) -> dict[str, str]:
+    """Return the Authorization header for an AAD bearer token."""
+    return {"Authorization": f"Bearer {token}"}
+
+
+class _AdoRequester:
+    """Issue ADO REST GETs, retrying a rejected PAT with an AAD bearer token.
+
+    Mirrors main's #2365 protocol: when the resolved credential came from
+    ``ADO_APM_PAT`` and the server rejects it with 401/403, AuthResolver's
+    canonical PAT-to-bearer fallback is exercised before the failure surfaces.
+    """
+
+    def __init__(self, delegate, dep_ref: DependencyReference, auth_ctx) -> None:
+        self._delegate = delegate
+        self._dep_ref = dep_ref
+        self._auth_ctx = auth_ctx
+        self.headers = _ado_build_headers_from_ctx(auth_ctx)
+        self.bearer_attempted = False
+
+    def get(self, url: str):
+        """Return the response for ``url``, applying the bearer fallback."""
+
+        def _primary_op():
+            return self._delegate._host._resilient_get(url, headers=self.headers, timeout=30)
+
+        if self._auth_ctx.source != "ADO_APM_PAT":
+            return _primary_op()
+
+        def _bearer_op(bearer: str):
+            return self._delegate._host._resilient_get(
+                url,
+                headers=_ado_bearer_headers(bearer),
+                timeout=30,
+            )
+
+        outcome = self._delegate._host.auth_resolver.execute_with_bearer_fallback(
+            self._dep_ref,
+            _primary_op,
+            _bearer_op,
+            lambda response: response.status_code in (401, 403),
+        )
+        self.bearer_attempted = self.bearer_attempted or outcome.bearer_attempted
+        return outcome.outcome
+
+
+def _ado_require_ok(response, file_path: str) -> None:
+    """Reject non-200 success statuses that would yield partial content."""
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Unexpected HTTP {response.status_code} downloading {file_path} from Azure DevOps"
+        )
+
+
 def _ado_check_html_signin(delegate, response, dep_ref: DependencyReference, host: str) -> None:
     """Fail-closed when ADO returns an interactive sign-in HTML page.
 
@@ -268,7 +322,7 @@ def _ado_check_html_signin(delegate, response, dep_ref: DependencyReference, hos
     Content-Type is lowercased before comparison per RFC 7230
     case-insensitivity.
     """
-    if response.status_code != 200:
+    if not 200 <= response.status_code < 300:
         return
     content_type = response.headers.get("Content-Type", "").lower()
     if "text/html" in content_type:
@@ -332,18 +386,21 @@ def download_ado_file(
         dep_ref.ado_organization,
         port=dep_ref.port,
     )
-    headers = _ado_build_headers_from_ctx(auth_ctx)
+    requester = _AdoRequester(delegate, dep_ref, auth_ctx)
 
     try:
-        response = delegate._host._resilient_get(api_url, headers=headers, timeout=30)
+        response = requester.get(api_url)
         _ado_check_html_signin(delegate, response, dep_ref, host)
         response.raise_for_status()
+        _ado_require_ok(response, file_path)
         return response.content
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            return _ado_handle_404(delegate, e, dep_ref, file_path, ref, host, headers)
+            return _ado_handle_404(delegate, e, dep_ref, file_path, ref, host, requester)
         if e.response.status_code in (401, 403):
-            raise RuntimeError(_ado_auth_error_msg(delegate, dep_ref, host)) from e
+            raise RuntimeError(
+                _ado_auth_error_msg(delegate, dep_ref, host, requester.bearer_attempted)
+            ) from e
         raise RuntimeError(f"Failed to download {file_path}: HTTP {e.response.status_code}") from e
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Network error downloading {file_path}: {e}") from e
@@ -356,7 +413,7 @@ def _ado_handle_404(
     file_path: str,
     ref: str,
     host: str,
-    headers: dict[str, str],
+    requester: "_AdoRequester",
 ) -> bytes:
     """Retry the other default branch when an ADO file 404s."""
     from apm_cli.deps import download_strategies as _ds
@@ -378,9 +435,10 @@ def _ado_handle_404(
     )
 
     try:
-        response = delegate._host._resilient_get(fallback_url, headers=headers, timeout=30)
+        response = requester.get(fallback_url)
         _ado_check_html_signin(delegate, response, dep_ref, host)
         response.raise_for_status()
+        _ado_require_ok(response, file_path)
         return response.content
     except requests.exceptions.HTTPError as fallback_err:
         raise RuntimeError(
@@ -388,19 +446,22 @@ def _ado_handle_404(
         ) from fallback_err
 
 
-def _ado_auth_error_msg(delegate, dep_ref: DependencyReference, host: str) -> str:
+def _ado_auth_error_msg(
+    delegate,
+    dep_ref: DependencyReference,
+    host: str,
+    bearer_attempted: bool = False,
+) -> str:
     """Build the auth-failure message for an ADO 401/403."""
     error_msg = f"Authentication failed for Azure DevOps {dep_ref.repo_url}. "
-    if not delegate._host.ado_token:
-        error_msg += delegate._host.auth_resolver.build_error_context(
-            host,
-            "download",
-            org=dep_ref.ado_organization if dep_ref else None,
-            port=dep_ref.port if dep_ref else None,
-            dep_url=dep_ref.repo_url if dep_ref else None,
-        )
-    else:
-        error_msg += "Please check your Azure DevOps PAT permissions."
+    error_msg += delegate._host.auth_resolver.build_error_context(
+        host,
+        "download",
+        org=dep_ref.ado_organization if dep_ref else None,
+        port=dep_ref.port if dep_ref else None,
+        dep_url=dep_ref.repo_url if dep_ref else None,
+        bearer_also_failed=bearer_attempted,
+    )
     return error_msg
 
 

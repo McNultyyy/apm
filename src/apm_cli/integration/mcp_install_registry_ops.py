@@ -12,7 +12,7 @@ import builtins
 from typing import Any
 
 from apm_cli.install.errors import InstallFailureAlreadyRendered
-from apm_cli.integration._shared import _RegistryDepGroup
+from apm_cli.integration._shared import _STRICT_CONFIG_FAILURE_RUNTIMES, _RegistryDepGroup
 from apm_cli.utils.console import STATUS_SYMBOLS
 
 
@@ -55,6 +55,7 @@ def _install_registry_group(
     group_deps = group.deps
 
     configured_count = 0
+    failed_installations: list[str] = []
 
     # Early validation: check all servers exist in registry (fail-fast).
     # F4 (#1116): emit a single batch heartbeat so users see the
@@ -157,7 +158,8 @@ def _install_registry_group(
                         f"{dep}: {action_text.lower()} for {', '.join(target_runtimes)}..."
                     )
 
-                any_ok = False
+                successful_runtimes: list[str] = []
+                failed_runtimes: list[str] = []
                 for rt in target_runtimes:
                     if verbose:
                         logger.verbose_detail(f"Configuring {rt}...")
@@ -170,30 +172,56 @@ def _install_registry_group(
                         project_root=project_root,
                         user_scope=user_scope,
                         logger=logger,
+                        replace_existing=is_update,
                     ):
-                        any_ok = True
+                        successful_runtimes.append(rt)
                         _record_managed_server(managed_target_servers, rt, dep)
+                    else:
+                        failed_runtimes.append(rt)
 
-                if any_ok:
+                if successful_runtimes:
                     if console:
                         label = "updated" if is_update else "configured"
                         console.print(
                             f"|  [green]{STATUS_SYMBOLS['check']}[/green]  {dep} -> "
-                            f"{', '.join([rt.title() for rt in target_runtimes])}"
+                            f"{', '.join([rt.title() for rt in successful_runtimes])}"
                             f" [dim]({label})[/dim]"
                         )
                     configured_count += 1
                     if is_update:
                         successful_updates.add(dep)
-                elif console:
-                    console.print(
-                        f"|  [red]{STATUS_SYMBOLS['cross']}[/red]  {dep}  "
-                        "-- failed for all runtimes"
+                if failed_runtimes:
+                    _report_failed_runtimes(
+                        dep,
+                        failed_runtimes,
+                        failed_installations,
+                        console=console,
+                        logger=logger,
                     )
-                else:
-                    logger.error(f"{dep} -- failed for all runtimes")
 
+    _raise_strict_config_failures(failed_installations, console=console, logger=logger)
     return configured_count
+
+
+def _report_failed_runtimes(
+    dep_name: str,
+    failed_runtimes: list[str],
+    failed_installations: list[str],
+    *,
+    console,
+    logger,
+) -> None:
+    """Record strict failures and render the per-dep failure line."""
+    strict_failures = sorted(set(failed_runtimes) & _STRICT_CONFIG_FAILURE_RUNTIMES)
+    if strict_failures:
+        failed_installations.append(f"{dep_name} ({', '.join(strict_failures)})")
+    if console:
+        console.print(
+            f"|  [red]{STATUS_SYMBOLS['cross']}[/red]  {dep_name}  "
+            f"-- failed for {', '.join(sorted(failed_runtimes))}"
+        )
+    else:
+        logger.error(f"{dep_name} -- failed for {', '.join(sorted(failed_runtimes))}")
 
 
 def _raise_strict_config_failures(

@@ -413,10 +413,11 @@ def _cleanup_stale_mcp(
     """Remove MCP servers that are no longer needed after uninstall."""
     if not old_mcp_servers:
         return
+    import apm_cli.commands.uninstall.engine as _engine_m
     from apm_cli.constants import APM_MODULES_DIR
     from apm_cli.integration.mcp_config_view import CurrentMcpConfigView
-    from apm_cli.integration.mcp_integrator import MCPIntegrator
 
+    MCPIntegrator = _engine_m.MCPIntegrator
     apm_modules_path = modules_dir if modules_dir is not None else Path.cwd() / APM_MODULES_DIR
     view = CurrentMcpConfigView.derive(
         apm_package,

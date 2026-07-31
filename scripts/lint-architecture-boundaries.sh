@@ -1064,14 +1064,17 @@ ado_transport_direct_hits=$(
         src/apm_cli/deps/github_downloader_validation.py \
         || true
 )
-if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/auth.py \
-    || ! grep -q '"COPILOT_GITHUB_TOKEN"' src/apm_cli/core/auth.py \
+# #1078: core/auth.py was split; the platform-token scrub and the harness
+# token-name table now live in core/_auth_support.py. Same single owner, new
+# file. The invariant (one scrub, one table) is unchanged.
+if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/_auth_support.py \
+    || ! grep -q '"COPILOT_GITHUB_TOKEN"' src/apm_cli/core/_auth_support.py \
     || ! grep -q 'self.auth_resolver.git_env_for_context(' \
         src/apm_cli/deps/github_downloader.py \
     || ! grep -q 'downloader.auth_resolver.git_env_for_context(' \
         src/apm_cli/deps/github_downloader_validation.py \
     || ! grep -q 'probe_env = auth_resolver.git_env_for_context(' \
-        src/apm_cli/install/pipeline.py \
+        src/apm_cli/install/pipeline_preflight.py \
     || grep -q 'if is_generic or is_azure_devops_hostname(host):' \
         src/apm_cli/install/pipeline.py \
     || ! grep -q 'hardened_git_env_for_context' \
@@ -1085,9 +1088,9 @@ if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/auth.py \
     || ! grep -q 'hardened_git_env_for_context' \
         src/apm_cli/commands/marketplace/check.py \
     || ! grep -q 'auth_resolver.try_with_fallback(' \
-        src/apm_cli/policy/discovery.py \
+        src/apm_cli/policy/_discovery_ado.py \
     || ! grep -q 'key = (host, dep.port, org)' \
-        src/apm_cli/install/pipeline.py \
+        src/apm_cli/install/pipeline_preflight.py \
     || [ -n "$ado_transport_direct_hits" ]; then
     echo "[x] ADO transport credentials must route through AuthResolver context"
     [ -n "$ado_transport_direct_hits" ] && echo "$ado_transport_direct_hits"
@@ -1259,14 +1262,17 @@ ado_transport_direct_hits=$(
         src/apm_cli/deps/github_downloader_validation.py \
         || true
 )
-if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/auth.py \
-    || ! grep -q '"COPILOT_GITHUB_TOKEN"' src/apm_cli/core/auth.py \
+# #1078: core/auth.py was split; the platform-token scrub and the harness
+# token-name table now live in core/_auth_support.py. Same single owner, new
+# file. The invariant (one scrub, one table) is unchanged.
+if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/_auth_support.py \
+    || ! grep -q '"COPILOT_GITHUB_TOKEN"' src/apm_cli/core/_auth_support.py \
     || ! grep -q 'self.auth_resolver.git_env_for_context(' \
         src/apm_cli/deps/github_downloader.py \
     || ! grep -q 'downloader.auth_resolver.git_env_for_context(' \
         src/apm_cli/deps/github_downloader_validation.py \
     || ! grep -q 'probe_env = auth_resolver.git_env_for_context(' \
-        src/apm_cli/install/pipeline.py \
+        src/apm_cli/install/pipeline_preflight.py \
     || grep -q 'if is_generic or is_azure_devops_hostname(host):' \
         src/apm_cli/install/pipeline.py \
     || ! grep -q 'hardened_git_env_for_context' \
@@ -1280,9 +1286,9 @@ if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/auth.py \
     || ! grep -q 'hardened_git_env_for_context' \
         src/apm_cli/commands/marketplace/check.py \
     || ! grep -q 'auth_resolver.try_with_fallback(' \
-        src/apm_cli/policy/discovery.py \
+        src/apm_cli/policy/_discovery_ado.py \
     || ! grep -q 'key = (host, dep.port, org)' \
-        src/apm_cli/install/pipeline.py \
+        src/apm_cli/install/pipeline_preflight.py \
     || [ -n "$ado_transport_direct_hits" ]; then
     echo "[x] ADO transport credentials must route through AuthResolver context"
     [ -n "$ado_transport_direct_hits" ] && echo "$ado_transport_direct_hits"

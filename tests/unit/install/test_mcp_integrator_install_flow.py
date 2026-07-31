@@ -143,6 +143,7 @@ def test_self_defined_partial_runtime_failure_is_explicit() -> None:
 
 def test_registry_group_partial_runtime_failure_is_explicit() -> None:
     """Registry installs enforce the same strict IntelliJ failure contract."""
+    from apm_cli.integration._shared import _RegistryDepGroup
     from apm_cli.integration.mcp_integrator import MCPIntegrator
     from apm_cli.integration.mcp_integrator_install import _install_registry_group
 
@@ -165,9 +166,11 @@ def test_registry_group_partial_runtime_failure_is_explicit() -> None:
     ):
         _install_registry_group(
             operations=operations,
-            group_dep_names=["managed-server"],
-            group_dep_map={},
-            group_deps=["managed-server"],
+            group=_RegistryDepGroup(
+                deps=["managed-server"],
+                names=["managed-server"],
+                dep_map={},
+            ),
             target_runtimes=["claude", "intellij"],
             stored_mcp_configs={},
             servers_to_update=set(),

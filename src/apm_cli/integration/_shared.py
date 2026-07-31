@@ -12,6 +12,11 @@ from pathlib import Path
 from apm_cli.deps.lockfile import LockFile
 from apm_cli.runtime.utils import find_runtime_binary
 
+# IntelliJ owns a fail-closed atomic user-config contract. Other adapters retain
+# their existing best-effort behavior when a composed target set includes an
+# unavailable optional runtime.
+_STRICT_CONFIG_FAILURE_RUNTIMES = frozenset({"intellij"})
+
 
 @dataclass(frozen=True)
 class _RegistryDepGroup:

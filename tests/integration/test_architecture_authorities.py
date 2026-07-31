@@ -1325,17 +1325,20 @@ def test_package_identity_host_owner_guard_rejects_default_host_shortcut(
 def test_ado_transport_credentials_route_through_auth_resolver() -> None:
     """ADO git and REST consumers must use the per-dependency auth context."""
     root = Path(__file__).parents[2]
-    auth = (root / "src/apm_cli/core/auth.py").read_text()
+    # #1078 relocations: each of these anchors moved into the sibling module
+    # that now owns it after the strangler-fig split. The single-owner
+    # invariants are unchanged -- only the file holding them moved.
+    auth = (root / "src/apm_cli/core/_auth_support.py").read_text()
     downloader = (root / "src/apm_cli/deps/github_downloader.py").read_text()
     validation = (root / "src/apm_cli/deps/github_downloader_validation.py").read_text()
     strategies = (root / "src/apm_cli/deps/download_strategies.py").read_text()
-    pipeline = (root / "src/apm_cli/install/pipeline.py").read_text()
+    pipeline = (root / "src/apm_cli/install/pipeline_preflight.py").read_text()
     ref_reuse = (root / "src/apm_cli/install/helpers/ref_reuse.py").read_text()
     marketplace = (root / "src/apm_cli/marketplace/client.py").read_text()
     marketplace_builder = (root / "src/apm_cli/marketplace/builder.py").read_text()
     marketplace_auth = (root / "src/apm_cli/marketplace/auth_helpers.py").read_text()
     marketplace_check = (root / "src/apm_cli/commands/marketplace/check.py").read_text()
-    policy = (root / "src/apm_cli/policy/discovery.py").read_text()
+    policy = (root / "src/apm_cli/policy/_discovery_ado.py").read_text()
     guard = (root / "scripts/lint-architecture-boundaries.sh").read_text()
 
     assert "_clear_platform_token_env(env)" in auth

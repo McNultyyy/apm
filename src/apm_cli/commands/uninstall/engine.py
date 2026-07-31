@@ -6,7 +6,7 @@ from pathlib import Path
 from ...constants import APM_MODULES_DIR
 from ...core.command_logger import CommandLogger
 from ...deps.lockfile import LockFile
-from ...integration.mcp_integrator import MCPIntegrator
+from ...integration.mcp_integrator import MCPIntegrator as MCPIntegrator
 from ...models.apm_package import DependencyReference
 from ...models.dependency.selection import (
     DependencySelectionStatus,

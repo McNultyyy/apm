@@ -17,6 +17,7 @@ from ...utils.github_host import (
     default_host,
     is_azure_devops_hostname,
     maybe_raise_bare_fqdn_github_gitlab_conflict,
+    reject_unsupported_ado_server_base_path,
     unsupported_host_error,
 )
 from ...utils.path_security import validate_path_segments
@@ -538,6 +539,7 @@ class _ReferenceParseMixin:
             )
 
         cls._reject_shorthand_alias(dependency_str)
+        reject_unsupported_ado_server_base_path(dependency_str)
 
         maybe_raise_bare_fqdn_github_gitlab_conflict(dependency_str)
 

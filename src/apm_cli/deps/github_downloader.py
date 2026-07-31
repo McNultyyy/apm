@@ -51,6 +51,7 @@ from .git_remote_ops import (
     semver_sort_key,
     sort_remote_refs,
 )
+from .github_downloader_artifactory_compat import ArtifactoryCompatMixin
 from .github_rate_limit import GitHubThrottleError as GitHubThrottleError
 from .transport_selection import (
     ProtocolPreference,
@@ -180,7 +181,7 @@ class GitProgressReporter(RemoteProgress):
             return "Cloning"
 
 
-class GitHubPackageDownloader:
+class GitHubPackageDownloader(ArtifactoryCompatMixin):
     """Downloads and validates APM packages from GitHub repositories."""
 
     def __init__(
@@ -225,52 +226,6 @@ class GitHubPackageDownloader:
         return self._registry_config_cache
 
     # --- Artifactory VCS archive download support ---
-
-    def _get_artifactory_headers(self) -> dict[str, str]:
-        """Backward-compat stub -- delegates to download strategies."""
-        return self._strategies.get_artifactory_headers()
-
-    def _download_artifactory_archive(
-        self,
-        host: str,
-        prefix: str,
-        owner: str,
-        repo: str,
-        ref: str,
-        target_path: Path,
-        scheme: str = "https",
-    ) -> None:
-        """Backward-compat stub -- delegates to download strategies."""
-        return self._strategies.download_artifactory_archive(
-            host,
-            prefix,
-            owner,
-            repo,
-            ref,
-            target_path,
-            scheme=scheme,
-        )
-
-    def _download_file_from_artifactory(
-        self,
-        host: str,
-        prefix: str,
-        owner: str,
-        repo: str,
-        file_path: str,
-        ref: str,
-        scheme: str = "https",
-    ) -> bytes:
-        """Backward-compat stub -- delegates to download strategies."""
-        return self._strategies.download_file_from_artifactory(
-            host,
-            prefix,
-            owner,
-            repo,
-            file_path,
-            ref,
-            scheme=scheme,
-        )
 
     @staticmethod
     def _is_artifactory_only() -> bool:
@@ -359,7 +314,16 @@ class GitHubPackageDownloader:
         ):
             return self.auth_resolver.build_public_github_anonymous_git_env()
 
-        git_env = GitAuthEnvBuilder.subprocess_env_dict(self.git_env)
+        auth_ctx = self._resolve_dep_auth_ctx(dep_ref)
+        base_env = (
+            self.auth_resolver.git_env_for_context(
+                auth_ctx,
+                base_env=self.git_env,
+            )
+            if auth_ctx is not None
+            else self.git_env
+        )
+        git_env = GitAuthEnvBuilder.subprocess_env_dict(base_env)
         if dep_ref.is_insecure:
             git_env = GitAuthEnvBuilder.noninteractive_env(
                 git_env,

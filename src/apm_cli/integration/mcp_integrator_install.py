@@ -21,6 +21,9 @@ from apm_cli.core.apm_yml import (
 )
 from apm_cli.core.null_logger import NullCommandLogger
 from apm_cli.core.target_catalog import accepted_target_values
+from apm_cli.integration._shared import (
+    _STRICT_CONFIG_FAILURE_RUNTIMES as _STRICT_CONFIG_FAILURE_RUNTIMES,
+)
 from apm_cli.integration._shared import _hermes_runtime_opted_in as _hermes_opted_in_impl
 from apm_cli.integration._shared import _RegistryDepGroup, _runtime_opted_in
 from apm_cli.integration.mcp_install_registry_ops import (
@@ -45,11 +48,6 @@ _DIR_GATED_RUNTIMES: dict[str, str] = {
     "windsurf": ".windsurf",
     "kiro": ".kiro",
 }
-
-# IntelliJ owns a fail-closed atomic user-config contract. Other adapters retain
-# their existing best-effort behavior when a composed target set includes an
-# unavailable optional runtime.
-_STRICT_CONFIG_FAILURE_RUNTIMES = frozenset({"intellij"})
 
 
 def _hermes_runtime_opted_in() -> bool:
