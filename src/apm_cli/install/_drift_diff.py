@@ -84,15 +84,31 @@ def _walk_managed(root: Path, governed_roots: set[str]) -> dict[str, Path]:
     return out
 
 
-def _collect_tracked_files(lockfile: LockFile) -> dict[str, str]:
-    """Return ``{deployed_path: package_name}`` aggregating all sources."""
-    tracked: dict[str, str] = {}
-    for key, dep in lockfile.dependencies.items():
-        for path in dep.deployed_files or []:
-            tracked.setdefault(path, key)
-    for path in lockfile.local_deployed_files or []:
-        tracked.setdefault(path, ".")
-    return tracked
+def _claimed_prefixes(
+    tracked: dict[str, str],
+    hashed_files: set[str],
+    project_files: dict[str, Path],
+) -> tuple[str, ...]:
+    """Return ``dir/`` prefixes for the tracked entries that name directories.
+
+    A manifest entry may name a directory rather than each file beneath it
+    (``scan_lockfile_packages`` and ``_check_deployed_files_present`` both
+    accept that shape), so a file is claimed when a tracked *directory*
+    covers it.
+
+    Entries with a recorded hash are files even if the current project path was
+    replaced by a directory. Entries present in *project_files* are also files,
+    which preserves the same rule for legacy hashless lockfiles. A file claim
+    must never act as a prefix: otherwise replacing tracked ``a.md`` with an
+    ``a.md/`` directory would let every descendant dodge the membership check.
+    """
+    return tuple(
+        normalized + "/"
+        for path in tracked
+        if (normalized := path.rstrip("/"))
+        and normalized not in hashed_files
+        and normalized not in project_files
+    )
 
 
 def _inline_diff_for(scratch_path: Path, project_path: Path) -> str:
@@ -136,16 +152,30 @@ def diff_scratch_against_project(
 ) -> list[DriftFinding]:
     """Compare the replay scratch tree against the project tree.
 
-    Three kinds of findings are emitted:
+    Four kinds of findings are emitted:
 
     * ``modified``     -- file exists in both, normalized content differs.
     * ``unintegrated`` -- file exists in scratch but not in project, and the
       path is part of the committed working tree when git tracking is known.
     * ``orphaned``     -- file exists in project + tracked in lockfile
       ``deployed_files`` but no longer in scratch.
+    * ``unrecorded``   -- the replay deploys the file and the project has it,
+      but no lockfile entry claims it: the committed manifest under-records.
 
-    Untracked extra files in governed directories are intentionally
-    ignored to avoid false positives from user-authored content.
+    ``unrecorded`` is the mirror image of ``orphaned``. Both are membership
+    findings, and between them they make manifest membership symmetric:
+    ``orphaned`` catches a claim with nothing behind it, ``unrecorded``
+    catches a deployed file with no claim in front of it. The latter matters
+    because manifest membership defines the scope of every downstream
+    lockfile-driven gate -- ``content-integrity`` hashes and Unicode-scans
+    exactly the recorded set, so a file missing from it is exempt from those
+    checks for as long as it stays missing (issue #2379).
+
+    Untracked extra files in governed directories that the replay does NOT
+    produce are still ignored -- those are user-authored content, and APM
+    deploying the file is what makes a missing claim a defect. Hook merge
+    targets are exempt for the same reason in reverse: APM writes into them
+    but shares them with the user, so it never claims them.
     """
     scratch_root = scratch_root.resolve()
     project_root = project_root.resolve()
@@ -153,6 +183,17 @@ def diff_scratch_against_project(
     scratch_files = _d()._walk_managed(scratch_root, governed)
     project_files = _d()._walk_managed(project_root, governed)
     tracked = _d()._collect_tracked_files(lockfile)
+    claimed_prefixes = _claimed_prefixes(
+        tracked,
+        _d()._collect_hashed_files(lockfile),
+        project_files,
+    )
+    # Hook merge targets (.claude/settings.json, .cursor/hooks.json, and their
+    # apm-hooks.json sidecars) are shared with the user and never claimed in
+    # deployed_files, so they can never be "unrecorded".
+    from apm_cli.install.manifest_reconcile import merge_hook_config_paths
+
+    merge_config_paths = merge_hook_config_paths(targets)
 
     # Imperative local bundles have no authored source tree for replay. Their
     # deployed bytes are already bound by local_deployed_file_hashes and the
@@ -226,6 +267,13 @@ def diff_scratch_against_project(
                     inline_diff=_d()._inline_diff_for(scratch_path, project_path),
                 )
             )
+        elif not (rel in tracked or rel.startswith(claimed_prefixes) or rel in merge_config_paths):
+            # Content agrees, so nothing else in the audit will ever look at
+            # this file again: no manifest entry means no hash baseline and no
+            # Unicode scan. Reported only in the content-clean case -- when the
+            # bytes differ, ``modified`` already fails the check and 'apm
+            # install' is the same remedy for both.
+            findings.append(_d().DriftFinding(path=rel, kind="unrecorded", package=""))
 
     for rel in sorted(project_files.keys()):
         if rel in scratch_files:

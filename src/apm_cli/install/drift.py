@@ -2,12 +2,15 @@
 
 Reproduces the integration step from the lockfile in an isolated scratch
 directory, then diffs the resulting tree against the working project to
-surface three kinds of divergence:
+surface four kinds of divergence:
 
 * ``modified``     -- a tracked deployed file's content differs.
 * ``unintegrated`` -- a tracked deployed file is missing from the project.
 * ``orphaned``     -- a managed-directory file exists in the project but
   is not present in the scratch replay AND not tracked in the lockfile.
+* ``unrecorded``   -- the replay deploys the file and the project has it,
+  but no lockfile entry claims it, which exempts it from every
+  membership-driven check (issue #2379).
 
 Bare ``apm audit`` keeps the original **cache-only** contract: cached package
 contents under ``apm_modules/`` are the source of truth and a miss is reported
@@ -37,6 +40,18 @@ import click
 
 from apm_cli.core.command_logger import CommandLogger
 from apm_cli.deps.path_anchoring import resolve_local_dep_dir
+from apm_cli.install.drift_render import (
+    render_drift as render_drift,
+)
+from apm_cli.install.drift_render import (
+    render_drift_json as render_drift_json,
+)
+from apm_cli.install.drift_render import (
+    render_drift_sarif as render_drift_sarif,
+)
+from apm_cli.install.drift_render import (
+    render_drift_text as render_drift_text,
+)
 from apm_cli.utils.console import STATUS_SYMBOLS
 from apm_cli.utils.guards import _ReadOnlyProjectGuard
 
@@ -72,7 +87,7 @@ class DriftFinding:
     """A single divergence between the replay scratch tree and the project."""
 
     path: str
-    kind: str  # one of "modified" | "unintegrated" | "orphaned"
+    kind: str  # one of "modified" | "unintegrated" | "orphaned" | "unrecorded"
     package: str = ""
     inline_diff: str = ""
 
@@ -673,16 +688,34 @@ def run_replay(config: ReplayConfig, logger: CheckLogger) -> Path:
 
 from ._drift_diff import _INLINE_DIFF_BYTE_CAP as _INLINE_DIFF_BYTE_CAP  # noqa: E402
 from ._drift_diff import _canvas_deploy_prefixes as _canvas_deploy_prefixes  # noqa: E402
-from ._drift_diff import _collect_tracked_files as _collect_tracked_files  # noqa: E402
 from ._drift_diff import _governed_root_dirs as _governed_root_dirs  # noqa: E402
 from ._drift_diff import _inline_diff_for as _inline_diff_for  # noqa: E402
 from ._drift_diff import _walk_managed as _walk_managed  # noqa: E402
 from ._drift_diff import diff_scratch_against_project as diff_scratch_against_project  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Renderers
+# Deployment-membership projections.
+#
+# AC "Drift deployment membership must route through DeploymentLedgerCodec"
+# greps these two ``def`` bodies in THIS file by name, so they stay here
+# rather than moving to ``_drift_diff`` with the rest of the differ. The
+# differ reaches them late through the ``drift`` module so the seam and the
+# guard agree.
 # ---------------------------------------------------------------------------
-from ._drift_render import render_drift as render_drift  # noqa: E402
-from ._drift_render import render_drift_json as render_drift_json  # noqa: E402
-from ._drift_render import render_drift_sarif as render_drift_sarif  # noqa: E402
-from ._drift_render import render_drift_text as render_drift_text  # noqa: E402
+
+
+def _collect_tracked_files(lockfile: LockFile) -> dict[str, str]:
+    """Return scanner membership claims as ``{path: package_owner}``."""
+    from apm_cli.core.deployment_ledger import DeploymentLedgerCodec
+
+    return DeploymentLedgerCodec.legacy_deployed_file_claims(lockfile)
+
+
+def _collect_hashed_files(lockfile: LockFile) -> set[str]:
+    """Return every deployed path whose lock claim is explicitly file-shaped."""
+    from apm_cli.core.deployment_ledger import DeploymentLedgerCodec
+
+    return set(DeploymentLedgerCodec.legacy_deployed_file_hash_paths(lockfile))
+
+
+from ._drift_diff import _claimed_prefixes as _claimed_prefixes  # noqa: E402
