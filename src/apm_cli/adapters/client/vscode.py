@@ -289,8 +289,11 @@ class VSCodeClientAdapter(MCPClientAdapter):
             package = self._select_best_package(server_info["packages"])
             runtime_hint = package.get("runtime_hint", "") if package else ""
             registry_name = self._infer_registry_name(package) if package else ""
+            is_docker = runtime_hint == "docker" or registry_name == "docker"
             pkg_args = (
-                self._extract_package_args(package, runtime_vars=runtime_vars) if package else []
+                (self._extract_package_args(package, runtime_vars=runtime_vars) if package else [])
+                if not is_docker
+                else []
             )
 
             # Handle npm packages
@@ -307,8 +310,20 @@ class VSCodeClientAdapter(MCPClientAdapter):
                 }
 
             # Handle docker packages
-            elif runtime_hint == "docker" or registry_name == "docker":
-                args = pkg_args if pkg_args else ["run", "-i", "--rm", package.get("name")]
+            elif is_docker:
+                args = self._docker_run_args(package, runtime_vars)
+                if args is None:
+                    if package.get("runtime_arguments") or package.get("package_arguments"):
+                        _rich_warning(
+                            "Could not resolve container run options for "
+                            f"'{package.get('name', '')}'; using the default launcher. "
+                            "Set the required registry runtime variables and rerun "
+                            "'apm install'."
+                        )
+                    args = self._ensure_docker_image_arg(
+                        ["run", "-i", "--rm"],
+                        package.get("name"),
+                    )
 
                 server_config = {"type": "stdio", "command": "docker", "args": args}
 
@@ -656,6 +671,50 @@ class VSCodeClientAdapter(MCPClientAdapter):
                 return args
 
         return []
+
+    @classmethod
+    def _docker_run_args(cls, package: dict, runtime_vars: dict | None = None) -> list[str] | None:
+        """Build ``docker run`` arguments from a container package's metadata."""
+        from .vscode_docker import docker_run_args
+
+        return docker_run_args(cls, package, runtime_vars)
+
+    @classmethod
+    def _docker_arg_values(
+        cls, entries: list | None, runtime_vars: dict | None
+    ) -> list[str] | None:
+        """Resolve one registry argument list into CLI argument strings."""
+        from .vscode_docker import docker_arg_values
+
+        return docker_arg_values(cls, entries, runtime_vars)
+
+    @staticmethod
+    def _substitute_runtime_variables(
+        template: str, variables: dict, runtime_vars: dict | None
+    ) -> str | None:
+        """Substitute ``{var}`` placeholders, or return None if unresolvable.
+
+        ``workspaceFolder`` resolves to VS Code's own ``${workspaceFolder}``
+        token, which the editor expands at server start. Any other name that
+        this install did not collect a value for has no such fallback, so the
+        caller is told to decline rather than write a literal ``${name}`` into
+        a mount path.
+        """
+        for var_name in variables:
+            placeholder = f"{{{var_name}}}"
+            # A descriptor the template never references cannot make it
+            # unresolvable; declining on one would drop a usable argument.
+            if placeholder not in template:
+                continue
+            supplied = (runtime_vars or {}).get(var_name)
+            if supplied is not None and str(supplied) != "":
+                replacement = str(supplied)
+            elif var_name == "workspaceFolder":
+                replacement = "${workspaceFolder}"
+            else:
+                return None
+            template = template.replace(placeholder, replacement)
+        return template
 
     @staticmethod
     def _select_remote_with_url(remotes):

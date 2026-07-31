@@ -755,6 +755,27 @@ if [ "$target_instruction_contraction_status" -ne 0 ]; then
     violations=$((violations + 1))
 fi
 
+echo "[*] AC15b: effective package target authorization authority"
+package_target_output=$(python3 scripts/check_package_target_authority.py --root "$ROOT" 2>&1)
+package_target_status=$?
+if [ "$package_target_status" -ne 0 ]; then
+    echo "[x] Effective package target authorization must route through install/target_filter.py"
+    echo "$package_target_output"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC15c: merged-hook ownership marker authority"
+hook_ownership_owner="src/apm_cli/integration/hook_ownership.py"
+hook_ownership_consumer="src/apm_cli/integration/hook_integrator.py"
+if ! grep -q '^def dependency_hook_source_marker(' "$hook_ownership_owner" \
+    || ! grep -q '^def dependency_hook_sources(' "$hook_ownership_owner" \
+    || ! grep -q 'from apm_cli.integration.hook_ownership import (' \
+        "$hook_ownership_consumer" \
+    || grep -q '^    def _dependency_hook_source' "$hook_ownership_consumer"; then
+    echo "[x] Merged-hook ownership markers must route through integration/hook_ownership.py"
+    violations=$((violations + 1))
+fi
+
 echo "[*] AC16: post-uninstall reachability owner authority"
 # Code moved from engine.py to _orphan_ops.py in #1078 (800-line guardrail split).
 if ! grep -Eq 'reachability\.compute_forward_reachable_keys|from \.\.\.deps\.reachability import|from apm_cli\.deps\.reachability import' \
@@ -1112,9 +1133,26 @@ if [ "$(printf '%s\n' "$mcp_root_scope_body" \
     violations=$((violations + 1))
 fi
 
-
-
-
+echo "[*] AC26: MCP container launcher authority"
+mcp_container_owner="src/apm_cli/adapters/client/base.py"
+mcp_container_consumers=(
+    src/apm_cli/adapters/client/copilot.py
+    src/apm_cli/adapters/client/codex.py
+    src/apm_cli/adapters/client/gemini.py
+    src/apm_cli/adapters/client/vscode.py
+)
+mcp_image_owner_defs=$(grep -rEc \
+    '^[[:space:]]*def _ensure_docker_image_arg\(' \
+    src/apm_cli/adapters/client --include='*.py' \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+mcp_container_missing_consumers=$(grep -L \
+    '_ensure_docker_image_arg(' "${mcp_container_consumers[@]}" || true)
+if ! grep -q '_REGISTRY_TYPE_ALIASES = {"oci": "docker"}' "$mcp_container_owner" \
+    || [ "$mcp_image_owner_defs" -ne 1 ] \
+    || [ -n "$mcp_container_missing_consumers" ]; then
+    echo "[x] MCP container launcher decisions must route through MCPClientAdapter"
+    violations=$((violations + 1))
+fi
 
 if [ "$violations" -gt 0 ]; then
     echo "[x] $violations architecture boundary rule(s) failed"

@@ -48,7 +48,7 @@ from .services_integrate import (
     _log_per_kind_results,
 )
 from .services_integrate import _log_hook_display_payloads as _log_hook_display_payloads
-from .target_filter import filter_targets_for_dependency
+from .target_filter import resolve_effective_package_targets
 
 # CRITICAL: Shadow Python builtins that share names with Click commands so
 # ``set()`` / ``list()`` / ``dict()`` resolve to the builtins, not Click
@@ -221,6 +221,29 @@ def _log_skill_result(
         result["deployed_files"].extend(_skill_bundle_file_entries(tp, project_root, targets))
 
 
+def _warn_target_reconcile_failure(
+    diagnostics: DiagnosticCollector,
+    package_name: str,
+    reconcile_stats: dict,
+) -> None:
+    if not reconcile_stats.get("errors", 0):
+        return
+    failed_targets = reconcile_stats.get("failed_targets") or ["unknown"]
+    failed_paths = reconcile_stats.get("failed_paths") or ["unknown"]
+    if not isinstance(failed_targets, list):
+        failed_targets = ["unknown"]
+    if not isinstance(failed_paths, list):
+        failed_paths = ["unknown"]
+    diagnostics.warn(
+        "Could not fully reconcile hooks excluded by target restrictions",
+        package=package_name,
+        detail=(
+            f"targets: [{', '.join(failed_targets)}]; "
+            f"configs: [{', '.join(failed_paths)}]; run apm install again"
+        ),
+    )
+
+
 def integrate_package_primitives(  # noqa: PLR0913
     package_info: Any,
     project_root: Path,
@@ -288,28 +311,51 @@ def integrate_package_primitives(  # noqa: PLR0913
 
     deployed = result["deployed_files"]
 
-    # SECURITY: dep_target_subset comes from CONSUMER manifest only.
-    # Package-side targets are advisory metadata; never a routing input.
-    targets, allowed_dep_targets, dep_targets_active = filter_targets_for_dependency(
-        targets,
-        dep_target_subset,
-        diagnostics,
-        package_name,
-    )
-    if not targets:
-        return result
-
-    # ------------------------------------------------------------------
-    # Drift-replay safety guard (#drift): when ``scratch_root`` is set,
-    # the caller is replaying integration into an isolated directory.
-    # We assert it exists and is NOT inside ``project_root`` to keep the
-    # read-only contract of ``apm audit --check drift`` enforceable.
-    # ------------------------------------------------------------------
+    # Drift replay must prove every write is redirected before target cleanup
+    # or any other integration side effect can run.
     if scratch_root is not None:
         from apm_cli.utils.path_security import ensure_path_within
 
         scratch_root = Path(scratch_root).resolve()
         ensure_path_within(Path(project_root).resolve(), scratch_root)
+
+    # SECURITY: package intent may only narrow the consumer-authorized active
+    # target set. It never activates a target or expands dependency reach.
+    target_selection = resolve_effective_package_targets(
+        targets,
+        dep_target_subset,
+        package_info,
+        diagnostics,
+        package_name,
+    )
+    targets = list(target_selection.targets)
+    allowed_dep_targets = set(target_selection.consumer_allowed_targets)
+    dep_targets_active = target_selection.consumer_restriction_active
+    if logger is not None and target_selection.package_restriction_active:
+        declared = (
+            ", ".join(target_selection.package_declared_targets)
+            if target_selection.package_declared_targets
+            else "unrestricted"
+        )
+        effective = ", ".join(target.name for target in target_selection.targets) or "none"
+        logger.verbose_detail(
+            f"Package target restriction: [{declared}]; effective targets: [{effective}]"
+        )
+
+    reconcile_package_targets = getattr(
+        integrators.hook,
+        "reconcile_package_target_restriction",
+        None,
+    )
+    if target_selection.excluded_targets and callable(reconcile_package_targets):
+        reconcile_stats = reconcile_package_targets(
+            package_info,
+            project_root,
+            target_selection.excluded_targets,
+        )
+        _warn_target_reconcile_failure(diagnostics, package_name, reconcile_stats)
+    if not targets:
+        return result
 
     # Executable approval gate (npm v12-style default-deny). hooks/bin gate
     # below; mcp/canvas unused (mcp filtered upstream, canvas re-derived below).

@@ -15,6 +15,11 @@ from apm_cli.core.scope import InstallScope
 from apm_cli.integration.base_integrator import BaseIntegrator, IntegrationResult
 from apm_cli.integration.hook_bundle import copy_deployed_hook_bundle
 from apm_cli.integration.hook_file_routing import filter_hook_files_for_target
+from apm_cli.integration.hook_ownership import (
+    dependency_hook_sources,
+    legacy_source_marker_is_unambiguous,
+)
+from apm_cli.integration.hook_reconcile_types import HookTargetReconcileStats
 from apm_cli.utils.atomic_io import atomic_write_text
 from apm_cli.utils.console import (
     _rich_warning,  # noqa: F401  (testability seam -- tests monkeypatch this)
@@ -26,13 +31,8 @@ if TYPE_CHECKING:
 
 from .hook_merge import (
     _clean_apm_entries_from_json,
-    _dependency_hook_sources,
     _get_hook_source_marker,
     _is_root_local_package,
-    _load_merged_config_and_sidecar,
-    _merge_hook_file_entries,
-    _warn_empty_hook_file,
-    _write_merged_config,
 )
 from .hook_merge import (
     _get_package_name as _get_package_name_impl,
@@ -174,10 +174,6 @@ class HookIntegrator(BaseIntegrator):
         return _get_hook_source_marker(package_info, project_root, package_name)
 
     @staticmethod
-    def _dependency_hook_sources(project_root: Path) -> set[str]:
-        return _dependency_hook_sources(project_root)
-
-    @staticmethod
     def _clean_apm_entries_from_json(
         json_path: Path,
         stats: dict[str, int],
@@ -237,6 +233,39 @@ class HookIntegrator(BaseIntegrator):
         return _parse_hook_json_impl(hook_file)
 
     # -- Copilot (individual-file) integration --
+
+    @staticmethod
+    def _get_hook_source_markers(
+        package_info,
+        project_root: Path,
+        package_name: str,
+        dependency_sources: set[str] | None = None,
+    ) -> tuple[str, frozenset[str]]:
+        """Return the canonical marker and any safe legacy marker aliases."""
+        primary = HookIntegrator._get_hook_source_marker(
+            package_info,
+            project_root,
+            package_name,
+        )
+        legacy: set[str] = set()
+        root_legacy_is_unambiguous = False
+        if HookIntegrator._is_root_local_package(package_info, project_root):
+            known_dependency_sources = (
+                dependency_sources
+                if dependency_sources is not None
+                else dependency_hook_sources(project_root)
+            )
+            root_legacy_is_unambiguous = package_name not in known_dependency_sources
+        if primary != package_name and (
+            root_legacy_is_unambiguous
+            or legacy_source_marker_is_unambiguous(
+                package_info,
+                project_root,
+                package_name,
+            )
+        ):
+            legacy.add(package_name)
+        return primary, frozenset(legacy)
 
     def integrate_package_hooks(
         self,
@@ -413,146 +442,18 @@ class HookIntegrator(BaseIntegrator):
         target=None,
         user_scope: bool = False,
     ) -> HookIntegrationResult:
-        _empty = HookIntegrationResult(
-            files_integrated=0,
-            files_updated=0,
-            files_skipped=0,
-            target_paths=[],
-        )
+        from .hook_merged_flow import integrate_merged_hooks
 
-        root_dir = target.root_dir if target else f".{config.target_key}"
-        target_dir = project_root / root_dir
-
-        # Opt-in check: some targets only deploy when their dir exists
-        if config.require_dir and not target_dir.exists():
-            return _empty
-
-        # Absolutize hook commands only for user-scope deploys.
-        _deploy_root_for_rewrite = self._deploy_root_for_hook_rewrite(project_root, user_scope)
-
-        hook_files = self.find_hook_files(package_info.install_path)
-        package_name = self._get_package_name(package_info, project_root)
-        hook_files = _filter_hook_files_for_target(
-            hook_files,
-            config.target_key,
-            package_name=package_name,
-            warned_packages=self._deprecated_hook_routing_warnings,
-            package_identity=package_info.get_canonical_dependency_string(),
-        )
-        if not hook_files:
-            return _empty
-
-        source_marker = _get_hook_source_marker(package_info, project_root, package_name)
-        heal_stale = _is_root_local_package(package_info, project_root)
-        dep_sources = _dependency_hook_sources(project_root) if heal_stale else set()
-
-        hooks_integrated = 0
-        scripts_copied = 0
-        scripts_adopted = 0
-        target_paths: list[Path] = []
-        display_payloads: list = []
-        pending_display: list = []
-        cleared_events: set = set()
-
-        json_path = target_dir / config.config_filename
-        sidecar_path = target_dir / _APM_HOOKS_SIDECAR
-        json_config = _load_merged_config_and_sidecar(
-            json_path, sidecar_path, config.schema_strict, container=config.event_container_key
-        )
-
-        injected_keys: list[str] = []
-        for key, value in config.top_level_defaults.items():
-            if key not in json_config:
-                json_config[key] = value
-                injected_keys.append(key)
-        if injected_keys:
-            _log.debug(
-                "Injected top_level_defaults into %s: %s", config.config_filename, injected_keys
-            )
-
-        for hook_file in hook_files:
-            data = self._parse_hook_json(hook_file)
-            if data is None:
-                continue
-
-            rewritten, scripts = _rewrite_hooks_data(
-                data,
-                package_info.install_path,
-                package_name,
-                config.target_key,
-                hook_file_dir=hook_file.parent,
-                root_dir=root_dir,
-                deploy_root=_deploy_root_for_rewrite,
-            )
-
-            container = config.event_container_key
-            hooks = rewritten.get("hooks", {})  # source files always use "hooks" key
-            event_map = _HOOK_EVENT_MAP.get(config.target_key, {})
-            _emit_hook_event_diagnostics(list(hooks.keys()), config.target_key, event_map)
-
-            file_event_entries: dict = {}
-            appended = _merge_hook_file_entries(
-                json_config,
-                hooks,
-                config.target_key,
-                event_map,
-                source_marker,
-                cleared_events,
-                heal_stale_root_source=heal_stale,
-                dependency_sources=dep_sources,
-                capture_entries=file_event_entries,
-                container=container,
-            )
-
-            if appended:
-                hooks_integrated += 1
-                pending_display.append(
-                    (
-                        config.config_filename,
-                        config.config_filename,
-                        hook_file,
-                        file_event_entries,
-                    )
-                )
-            else:
-                _warn_empty_hook_file(hook_file, config.target_key)
-
-            copy_result = copy_deployed_hook_bundle(
-                self,
-                package_path=package_info.install_path,
-                hook_file_dir=hook_file.parent,
-                project_root=project_root,
-                scripts=scripts,
-                managed_files=managed_files,
-                force=force,
-                diagnostics=diagnostics,
-                target_paths=target_paths,
-                hook_descriptor_files=set(hook_files),
-            )
-            scripts_copied += copy_result.scripts_copied
-            scripts_adopted += copy_result.files_adopted
-
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_merged_config(json_path, sidecar_path, json_config, config.schema_strict)
-
-        for _label, _path, _hook_file, _file_event_entries in pending_display:
-            display_payloads.append(
-                self._build_display_payload(
-                    _label,
-                    _path,
-                    _hook_file,
-                    {config.event_container_key: _file_event_entries},
-                )
-            )
-
-        return HookIntegrationResult(
-            files_integrated=hooks_integrated,
-            files_updated=0,
-            files_skipped=0,
-            target_paths=target_paths,
-            scripts_copied=scripts_copied,
-            files_adopted=scripts_adopted,
-            display_payloads=display_payloads,
+        return integrate_merged_hooks(
+            self,
+            config,
+            package_info,
+            project_root,
+            force=force,
+            managed_files=managed_files,
+            diagnostics=diagnostics,
+            target=target,
+            user_scope=user_scope,
         )
 
     def integrate_package_hooks_claude(
@@ -633,7 +534,6 @@ class HookIntegrator(BaseIntegrator):
     ) -> "HookIntegrationResult":
         if dep_targets_active and (not allowed_targets or target.name not in allowed_targets):
             raise AssertionError(f"BUG: target {target.name} bypassed chokepoint filter")
-
         if target.name == "copilot":
             return self.integrate_package_hooks(
                 package_info,
@@ -677,6 +577,19 @@ class HookIntegrator(BaseIntegrator):
             files_updated=0,
             files_skipped=0,
             target_paths=[],
+        )
+
+    def reconcile_package_target_restriction(
+        self,
+        package_info,
+        project_root: Path,
+        excluded_targets,
+    ) -> HookTargetReconcileStats:
+        """Remove this package's merged hooks from newly excluded targets."""
+        from .hook_target_restriction import reconcile_package_target_restriction
+
+        return reconcile_package_target_restriction(
+            self, package_info, project_root, excluded_targets
         )
 
     def sync_integration(
@@ -749,8 +662,24 @@ class HookIntegrator(BaseIntegrator):
         user_scope: bool = False,
         lockfile: "LockFile | None" = None,
     ) -> dict:
-        """Reconcile merged-hook ownership after packages leave apm.yml (#2254)."""
+        """Reconcile merged-hook ownership after packages leave apm.yml.
+
+        ``_clean_apm_entries_from_json`` strips all ``_apm_source`` entries,
+        so dropping one package requires wiping and rebuilding from installed
+        survivors. This mirrors ``_sync_integrations_after_uninstall`` in
+        ``commands/uninstall/engine.py``, scoped to hooks only.
+
+        Rebuilds from the post-removal lockfile's direct and transitive
+        packages via uninstall Phase 2's survivor set (#2254). Callers may
+        pass that lockfile; otherwise disk is read, falling back to manifest
+        dependencies only when no lockfile is available.
+
+        Re-integration failures are logged and skipped by design.
+        Target scope (#2250): wipe and rebuild use the same resolved targets.
+        ``reconcile_dropped_targets`` separately owns target contraction.
+        """
         from apm_cli.constants import APM_MODULES_DIR
+        from apm_cli.install.target_filter import resolve_effective_package_targets
         from apm_cli.models.apm_package import (
             build_installed_package_info,
             surviving_dependency_refs_for_reintegration,
@@ -765,15 +694,37 @@ class HookIntegrator(BaseIntegrator):
         surviving_deps = surviving_dependency_refs_for_reintegration(
             apm_package, project_root, lockfile=lockfile
         )
+        rebuild_plan = []
+        for dep_ref in surviving_deps:
+            modules_root = project_root / APM_MODULES_DIR
+            install_path = dep_ref.get_install_path(modules_root)
+            pkg_info = build_installed_package_info(dep_ref, modules_root)
+            if pkg_info is None:
+                if install_path.exists():
+                    raise ValueError(
+                        "Cannot validate surviving package before hook rebuild: "
+                        f"{dep_ref.get_identity()}"
+                    )
+                continue
+            target_selection = resolve_effective_package_targets(
+                targets,
+                dep_ref.target_subset,
+                pkg_info,
+                None,
+                dep_ref.get_identity(),
+            )
+            rebuild_plan.append((dep_ref, pkg_info, target_selection))
+
+        # Empty managed_files (not None) skips file-level deletion while
+        # still triggering the merged-hook JSON wipe, scoped to the same
+        # resolved `targets` the rebuild loop below uses (#2250).
         stats = self.sync_integration(
             apm_package, project_root, managed_files=set(), targets=targets
         )
-        for dep_ref in surviving_deps:
-            pkg_info = build_installed_package_info(dep_ref, project_root / APM_MODULES_DIR)
-            if pkg_info is None:
-                continue
+
+        for dep_ref, pkg_info, target_selection in rebuild_plan:
             try:
-                for target in targets:
+                for target in target_selection.targets:
                     self.integrate_hooks_for_target(
                         target, pkg_info, project_root, user_scope=user_scope
                     )

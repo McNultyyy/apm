@@ -12,12 +12,11 @@ from pathlib import Path
 
 import yaml
 
-from apm_cli.utils.console import _rich_warning
-from apm_cli.utils.path_security import (
-    PathTraversalError,
-    ensure_path_within,
-    validate_path_segments,
+from apm_cli.integration.hook_ownership import (
+    dependency_hook_source_marker,
+    dependency_hook_sources,
 )
+from apm_cli.utils.console import _rich_warning
 
 from .hook_native_formats import _to_claude_hook_entries
 from .hook_transforms import (
@@ -118,6 +117,14 @@ def _get_hook_source_marker(
         if package_name == "_local":
             return "_local"
         return f"_local/{package_name}"
+    try:
+        dependency_ref = vars(package_info).get("dependency_ref")
+    except TypeError:
+        dependency_ref = None
+    if dependency_ref is not None:
+        marker = dependency_hook_source_marker(dependency_ref)
+        if isinstance(marker, str) and marker and marker != "unknown":
+            return marker
     return package_name
 
 
@@ -132,187 +139,17 @@ def _hook_entry_content_key(entry: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _dependency_hook_sources(project_root: Path) -> set[str]:
-    """Return source markers that correspond to installed dependency dirs."""
-    apm_modules = project_root / "apm_modules"
-    if not apm_modules.is_dir():
-        return set()
-
-    lockfile_paths, lockfile_readable = _lockfile_dependency_paths(project_root)
-    if lockfile_readable:
-        sources: set[str] = set()
-        for rel_path in lockfile_paths:
-            package_path = _safe_dependency_path(apm_modules, rel_path)
-            if package_path is None:
-                continue
-            _add_dependency_source(sources, package_path)
-        return sources
-
-    return _bounded_dependency_hook_sources(apm_modules)
-
-
-def _lockfile_dependency_paths(project_root: Path) -> tuple[list[str], bool]:
-    """Return installed dependency paths from a readable lockfile, if present."""
-    try:
-        from apm_cli.deps.lockfile import LEGACY_LOCKFILE_NAME, LockFile, get_lockfile_path
-
-        lockfile_path = get_lockfile_path(project_root)
-        if not lockfile_path.exists():
-            legacy_path = project_root / LEGACY_LOCKFILE_NAME
-            if legacy_path.exists():
-                lockfile_path = legacy_path
-        if not lockfile_path.exists():
-            return [], False
-        lockfile = LockFile.read(lockfile_path)
-        if lockfile is None:
-            return [], False
-        return lockfile.get_installed_paths(project_root / "apm_modules"), True
-    except (AttributeError, OSError, TypeError, ValueError, KeyError):
-        return [], False
-
-
-def _safe_dependency_path(apm_modules: Path, rel_path: str) -> Path | None:
-    """Return a lockfile dependency path without escaping apm_modules."""
-    try:
-        validate_path_segments(
-            rel_path,
-            context="lockfile dependency path",
-            reject_empty=True,
-        )
-        package_path = apm_modules / Path(rel_path)
-        ensure_path_within(package_path, apm_modules)
-        if _has_symlink_component(apm_modules, package_path):
-            return None
-        return package_path
-    except (OSError, PathTraversalError, RuntimeError, TypeError):
-        return None
-
-
-def _has_symlink_component(apm_modules: Path, package_path: Path) -> bool:
-    """Return True when any component below apm_modules is a symlink."""
-    try:
-        relative = package_path.relative_to(apm_modules)
-        current = apm_modules
-        for part in relative.parts:
-            current = current / part
-            if current.is_symlink():
-                return True
-        return False
-    except (OSError, ValueError):
-        return True
-
-
-def _is_dependency_package_dir(path: Path) -> bool:
-    """Return True when *path* looks like an installed package root."""
-    try:
-        hooks = path / "hooks"
-        apm_hooks = path / ".apm" / "hooks"
-        apm_yml = path / "apm.yml"
-        skill_md = path / "SKILL.md"
-        return (
-            (hooks.is_dir() and not hooks.is_symlink())
-            or (apm_hooks.is_dir() and not apm_hooks.is_symlink())
-            or (apm_yml.is_file() and not apm_yml.is_symlink())
-            or (skill_md.is_file() and not skill_md.is_symlink())
-        )
-    except OSError:
-        return False
-
-
-def _add_dependency_source(sources: set[str], package_path: Path) -> bool:
-    """Add package_path.name to sources when package_path is a package root."""
-    try:
-        if (
-            not package_path.is_dir()
-            or package_path.is_symlink()
-            or not _is_dependency_package_dir(package_path)
-        ):
-            return False
-    except OSError:
-        return False
-    sources.add(package_path.name)
-    return True
-
-
-def _child_dependency_dirs(path: Path) -> list[Path]:
-    """Return direct non-hidden child dirs without following symlink roots."""
-    try:
-        if path.is_symlink() or not path.is_dir():
-            return []
-        return sorted(
-            [
-                child
-                for child in path.iterdir()
-                if not child.is_symlink() and child.is_dir() and not child.name.startswith(".")
-            ],
-            key=lambda child: child.name,
-        )
-    except OSError:
-        return []
-
-
-def _collect_known_subdirectory_sources(sources: set[str], repo_root: Path) -> None:
-    """Collect dependency sources from known virtual subdirectory layouts."""
-    for namespace in ("collections", "skills"):
-        for package_path in _child_dependency_dirs(repo_root / namespace):
-            _add_dependency_source(sources, package_path)
-
-    apm_dir = repo_root / ".apm"
-    try:
-        if apm_dir.is_symlink() or not apm_dir.is_dir():
-            return
-    except OSError:
-        return
-    for primitive in ("agents", "commands", "hooks", "instructions", "prompts", "skills"):
-        for package_path in _child_dependency_dirs(apm_dir / primitive):
-            _add_dependency_source(sources, package_path)
-
-
-def _collect_remote_dependency_sources(sources: set[str], namespace: Path) -> None:
-    """Collect fallback sources from explicit remote install layouts."""
-    if _add_dependency_source(sources, namespace):
-        return
-
-    for repo_or_project in _child_dependency_dirs(namespace):
-        if _add_dependency_source(sources, repo_or_project):
-            continue
-
-        _collect_known_subdirectory_sources(sources, repo_or_project)
-
-        for ado_repo in _child_dependency_dirs(repo_or_project):
-            if _add_dependency_source(sources, ado_repo):
-                continue
-            _collect_known_subdirectory_sources(sources, ado_repo)
-
-
-def _collect_local_dependency_sources(sources: set[str], local_namespace: Path) -> None:
-    """Collect apm_modules/_local/<name> package roots only."""
-    for local_package in _child_dependency_dirs(local_namespace):
-        _add_dependency_source(sources, local_package)
-
-
-def _bounded_dependency_hook_sources(apm_modules: Path) -> set[str]:
-    """Fallback source scan limited to known apm_modules package layouts."""
-    sources: set[str] = set()
-
-    for package_root in _child_dependency_dirs(apm_modules):
-        if package_root.name == "_local":
-            _collect_local_dependency_sources(sources, package_root)
-            continue
-
-        _collect_remote_dependency_sources(sources, package_root)
-    return sources
-
-
-# ---------------------------------------------------------------------------
-# Merge-entry filtering
-# ---------------------------------------------------------------------------
+# Dependency-source discovery converged with main's integration/hook_ownership.py
+# (#2362): main extracted the same family this branch had split here. Main's
+# copy is canonical; keep a thin alias so existing importers keep working.
+_dependency_hook_sources = dependency_hook_sources
 
 
 def _should_remove_prior_merged_entry(
     entry,
     *,
     source_marker: str,
+    legacy_source_markers: frozenset[str] = frozenset(),
     fresh_content_keys: set[str],
     heal_stale_root_source: bool,
     dependency_sources: set[str],
@@ -323,6 +160,8 @@ def _should_remove_prior_merged_entry(
         return False
     source = entry.get("_apm_source")
     if remove_current_source and source == source_marker:
+        return True
+    if remove_current_source and source in legacy_source_markers:
         return True
     if not heal_stale_root_source or not source or source in dependency_sources:
         return False
@@ -408,6 +247,7 @@ def _merge_hook_file_entries(
     source_marker: str,
     cleared_events: set,
     *,
+    legacy_source_markers: frozenset[str] = frozenset(),
     heal_stale_root_source: bool,
     dependency_sources: set,
     capture_entries: dict | None = None,
@@ -464,6 +304,7 @@ def _merge_hook_file_entries(
                 json_config,
                 event_name,
                 source_marker,
+                legacy_source_markers,
                 fresh_content_keys,
                 heal_stale_root_source,
                 dependency_sources,
@@ -490,6 +331,7 @@ def _upsert_event_entries(
     json_config: dict,
     event_name: str,
     source_marker: str,
+    legacy_source_markers: frozenset[str],
     fresh_content_keys: set[str],
     heal_stale_root_source: bool,
     dependency_sources: set,
@@ -508,6 +350,7 @@ def _upsert_event_entries(
         if not _should_remove_prior_merged_entry(
             e,
             source_marker=source_marker,
+            legacy_source_markers=legacy_source_markers,
             fresh_content_keys=fresh_content_keys,
             heal_stale_root_source=heal_stale_root_source,
             dependency_sources=dependency_sources,
@@ -545,6 +388,7 @@ def _upsert_event_entries(
                 if not _should_remove_prior_merged_entry(
                     e,
                     source_marker=source_marker,
+                    legacy_source_markers=legacy_source_markers,
                     fresh_content_keys=fresh_content_keys,
                     heal_stale_root_source=heal_stale_root_source,
                     dependency_sources=dependency_sources,
