@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-08-01
+
+### Fixed
+
+- Installation now preserves caller Git configuration during credential-free
+  probes, projects `targets: [copilot]` to `.vscode/mcp.json`, retains usage
+  errors for malformed manifests, and serializes conflicting local dependency
+  materialization. This repairs the failed v0.27.0 release gate without adding
+  new user-facing surface. (#2417)
+
 ## [0.27.0] - 2026-07-31
 
 ### Added
