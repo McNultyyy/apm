@@ -26,6 +26,45 @@ def test_policy_cache_metadata_redaction_has_single_owner() -> None:
     assert "Policy cache metadata must redact URL credentials at its canonical writer" in guard
 
 
+def test_nested_worktree_cleanup_guard_rejects_unbounded_agents_scan(
+    tmp_path: Path,
+) -> None:
+    """The cleanup boundary guard requires pruning nested .git-file roots."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    compiler_path = sandbox / "src/apm_cli/compilation/distributed_compiler.py"
+    source = compiler_path.read_text(encoding="utf-8")
+    compiler_path.write_text(
+        source.replace('(directory_path / ".git").is_file()', "False", 1),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Nested worktree cleanup must prune .git-file roots" in result.stdout
+
+
 def test_intellij_mcp_config_path_has_single_owner() -> None:
     """JetBrains Copilot path selection must stay in its client adapter."""
     root = Path(__file__).parents[2]

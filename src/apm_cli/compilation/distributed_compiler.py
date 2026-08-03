@@ -7,6 +7,7 @@ for nested agent context files.
 
 import builtins
 import logging
+import os
 from collections import defaultdict
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
@@ -813,43 +814,40 @@ class DistributedAgentsCompiler:
         generated_set = set(generated_paths)
         suppressed_set = set(suppressed_empty_paths or [])
 
-        # Find all existing AGENTS.md files in the project
-        for agents_file in self.base_dir.rglob("AGENTS.md"):
-            # Skip files that are outside our project or in special directories
-            try:
-                relative_path = agents_file.resolve().relative_to(self.base_dir.resolve())
-
-                # Skip files in certain directories that shouldn't be cleaned
-                skip_dirs = {
-                    ".git",
-                    ".apm",
-                    "node_modules",
-                    "__pycache__",
-                    ".pytest_cache",
-                    "apm_modules",
-                }
-                if any(part in skip_dirs for part in relative_path.parts):
-                    continue
-
-                # Candidate: either a traditional orphan (not in current run)
-                # or a suppressed empty shell (skip_instructions active).
-                is_traditional_orphan = agents_file not in generated_set
-                is_suppressed_empty = agents_file in suppressed_set
-
-                if not is_traditional_orphan and not is_suppressed_empty:
-                    continue
-
-                # Marker gate: only touch APM-generated files.  Hand-authored
-                # AGENTS.md files (no marker) are never candidates for cleanup.
-                # Read only a bounded prefix to limit I/O on large files.
-                if not self._file_has_apm_marker(agents_file):
-                    continue  # Hand-authored or unreadable -- skip silently
-
-                orphaned_files.append(agents_file)
-
-            except ValueError:
-                # File is outside base_dir, skip it
+        skip_dirs = {
+            ".git",
+            ".apm",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            "apm_modules",
+        }
+        for directory, child_dirs, files in os.walk(self.base_dir):
+            directory_path = Path(directory)
+            if directory_path != self.base_dir and (directory_path / ".git").is_file():
+                child_dirs.clear()
                 continue
+
+            child_dirs[:] = [child for child in child_dirs if child not in skip_dirs]
+            if "AGENTS.md" not in files:
+                continue
+
+            agents_file = directory_path / "AGENTS.md"
+            # Candidate: either a traditional orphan (not in current run)
+            # or a suppressed empty shell (skip_instructions active).
+            is_traditional_orphan = agents_file not in generated_set
+            is_suppressed_empty = agents_file in suppressed_set
+
+            if not is_traditional_orphan and not is_suppressed_empty:
+                continue
+
+            # Marker gate: only touch APM-generated files.  Hand-authored
+            # AGENTS.md files (no marker) are never candidates for cleanup.
+            # Read only a bounded prefix to limit I/O on large files.
+            if not self._file_has_apm_marker(agents_file):
+                continue
+
+            orphaned_files.append(agents_file)
 
         return orphaned_files
 
