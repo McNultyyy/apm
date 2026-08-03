@@ -94,7 +94,7 @@ if [ -n "$compiled_write_hits" ]; then
 fi
 distributed_compiler="src/apm_cli/compilation/distributed_compiler.py"
 nested_worktree_walk_count=$(grep -Fc \
-    'for directory, child_dirs, files in os.walk(self.base_dir):' \
+    'for directory, child_dirs, files in os.walk(self.base_dir, followlinks=False):' \
     "$distributed_compiler" || true)
 nested_worktree_boundary_count=$(grep -Fc \
     '(directory_path / ".git").is_file()' \
