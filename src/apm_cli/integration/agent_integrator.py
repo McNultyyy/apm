@@ -347,16 +347,19 @@ class AgentIntegrator(BaseIntegrator):
     def _apply_github_agent_tool_renames(content: str) -> str:
         """Rewrite deprecated VSCode built-in tool names in a github_agent file.
 
-        Applies GITHUB_AGENT_TOOL_RENAMES to every entry in the YAML
-        frontmatter ``tools:`` list.  All other frontmatter fields and the
-        entire markdown body are left completely unchanged.  Returns the
-        original *content* unchanged when:
+        Applies GITHUB_AGENT_TOOL_RENAMES to every string entry in the YAML
+        frontmatter ``tools:`` list.  Non-string entries (mappings, sequences,
+        etc.) are preserved as-is without coercion.  Other frontmatter field
+        *values* are semantically preserved, but their serialisation formatting
+        (quoting style, key order) may change due to the YAML roundtrip.  The
+        markdown body is byte-for-byte unchanged.  Returns the original
+        *content* unchanged when:
 
         - the file has no YAML frontmatter
         - the frontmatter is unparseable
         - there is no ``tools:`` key
         - ``tools:`` is null or not a list
-        - no entry in the list matches a known rename
+        - no string entry in the list matches a known rename
         """
         fm_match = AgentIntegrator._FRONTMATTER_RE.match(content)
         if not fm_match:
@@ -370,8 +373,15 @@ class AgentIntegrator(BaseIntegrator):
         tools_raw = fm.get("tools")
         if not isinstance(tools_raw, list):
             return content
-        renamed = [GITHUB_AGENT_TOOL_RENAMES.get(str(t), str(t)) for t in tools_raw]
-        if renamed == [str(t) for t in tools_raw]:
+        any_renamed = False
+        renamed = []
+        for t in tools_raw:
+            if isinstance(t, str) and t in GITHUB_AGENT_TOOL_RENAMES:
+                renamed.append(GITHUB_AGENT_TOOL_RENAMES[t])
+                any_renamed = True
+            else:
+                renamed.append(t)
+        if not any_renamed:
             return content
         fm["tools"] = renamed
         body = content[fm_match.end() :]
