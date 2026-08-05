@@ -851,13 +851,21 @@ class EffectiveTargetDecision:
 
     @cached_property
     def runtime_targets(self) -> tuple[str, ...] | None:
-        """Return MCP runtime identifiers represented by this target decision."""
+        """Return MCP runtime identifiers represented by this target decision.
+
+        Targets that are not MCP-capable (``capability.mcp_capable is False``)
+        are excluded from the returned tuple. This prevents skills-only targets
+        such as ``agent-skills`` from being passed to the MCP install phase,
+        which has no adapter for them (#2485).
+        """
         if self.value is None:
             return None
 
         runtimes: list[str] = []
         seen: set[str] = set()
         for target, capability in _target_capabilities(self.value):
+            if not capability.mcp_capable:
+                continue
             runtime = (
                 capability.compile_family
                 if capability.compile_family in capability.runtimes

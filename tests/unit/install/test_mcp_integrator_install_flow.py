@@ -630,3 +630,70 @@ class TestRunMcpInstallConsoleNone:
         # At least the initial progress/info about MCP deps should appear
         any_log = logger.progress.call_args_list or logger.warning.call_args_list
         assert len(any_log) >= 0  # function executed at all
+
+
+# ---------------------------------------------------------------------------
+# #2485: agent-skills target must not cause MCP install errors
+# ---------------------------------------------------------------------------
+
+
+class TestRunMcpInstallAgentSkillsTarget:
+    """Tests covering the non-MCP-capable target filtering (#2485)."""
+
+    def test_mixed_codex_agent_skills_only_targets_codex(self, tmp_path: Path) -> None:
+        """With [codex, agent-skills], MCP install must only attempt codex."""
+        from apm_cli.core.target_detection import EffectiveTargetDecision
+        from apm_cli.integration.mcp_integrator_install import run_mcp_install
+
+        decision = EffectiveTargetDecision(["codex", "agent-skills"], source="apm.yml")
+        dep = _make_self_defined_dep("my-server")
+        logger = MagicMock()
+
+        attempted_runtimes: list[str] = []
+
+        def track_installs(runtime, *args, **kwargs):
+            attempted_runtimes.append(runtime)
+            return True
+
+        from apm_cli.integration import mcp_integrator as mi_mod
+
+        with (
+            patch.object(mi_mod.MCPIntegrator, "_install_for_runtime", side_effect=track_installs),
+            patch.object(
+                mi_mod.MCPIntegrator,
+                "_check_self_defined_servers_needing_installation",
+                return_value=["my-server"],
+            ),
+            patch.object(mi_mod.MCPIntegrator, "_build_self_defined_info", return_value={}),
+            patch.object(
+                mi_mod.MCPIntegrator,
+                "_gate_project_scoped_runtimes",
+                side_effect=lambda rts, **kw: rts,
+            ),
+        ):
+            run_mcp_install(
+                [dep],
+                target_decision=decision,
+                project_root=str(tmp_path),
+                logger=logger,
+            )
+
+        assert attempted_runtimes == ["codex"], f"Expected only codex but got {attempted_runtimes}"
+
+    def test_agent_skills_only_target_raises_install_failure(self, tmp_path: Path) -> None:
+        """[agent-skills] alone with MCP deps must raise InstallFailureAlreadyRendered."""
+        from apm_cli.core.target_detection import EffectiveTargetDecision
+        from apm_cli.install.errors import InstallFailureAlreadyRendered
+        from apm_cli.integration.mcp_integrator_install import run_mcp_install
+
+        decision = EffectiveTargetDecision(["agent-skills"], source="apm.yml")
+        dep = _make_self_defined_dep("my-server")
+        logger = MagicMock()
+
+        with pytest.raises(InstallFailureAlreadyRendered, match="No MCP-capable target"):
+            run_mcp_install(
+                [dep],
+                target_decision=decision,
+                project_root=str(tmp_path),
+                logger=logger,
+            )

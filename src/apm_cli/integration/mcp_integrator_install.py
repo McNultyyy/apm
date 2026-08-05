@@ -499,6 +499,18 @@ def _resolve_target_runtimes(
         target_runtimes = list(
             target_decision.runtime_targets_for_scope(user_scope=user_scope) or ()
         )
+        # If runtime_targets is empty but canonical_targets is non-empty, every
+        # declared target is non-MCP-capable (e.g. agent-skills only). This is a
+        # hard error: MCP deps are present but no target can accept them (#2485).
+        if not target_runtimes and target_decision.canonical_targets:
+            targets_csv = ", ".join(sorted(target_decision.canonical_targets))
+            message = (
+                f"No MCP-capable target in the declared target set ({targets_csv}). "
+                "Add an MCP-capable target (e.g., codex, copilot, claude) to install "
+                "MCP dependencies."
+            )
+            logger.error(message)
+            raise InstallFailureAlreadyRendered(message)
         if target_decision.source == "apm.yml":
             selection_source = _TargetSelectionSource.MANIFEST
         elif target_decision.source.startswith("auto-detect"):
@@ -547,6 +559,22 @@ def _resolve_target_runtimes(
             # developers with different harnesses installed, instead of each
             # `apm install` "stealing" MCP ownership toward whatever the current
             # machine happens to have (issue #2298).
+            #
+            # If projection left an empty list, every declared target is
+            # non-MCP-capable (#2485).  Fail with an actionable message.
+            if not declared_targets:
+                try:
+                    original = parse_targets_field(apm_config) or []
+                    targets_csv = ", ".join(sorted(str(t) for t in original))
+                except (ConflictingTargetsError, EmptyTargetsListError, UnknownTargetError):
+                    targets_csv = "<unknown>"
+                message = (
+                    f"No MCP-capable target in the declared target set ({targets_csv}). "
+                    "Add an MCP-capable target (e.g., codex, copilot, claude) to install "
+                    "MCP dependencies."
+                )
+                logger.error(message)
+                raise InstallFailureAlreadyRendered(message)
             target_runtimes = declared_targets
             selection_source = _TargetSelectionSource.MANIFEST
             logger.verbose_detail(
