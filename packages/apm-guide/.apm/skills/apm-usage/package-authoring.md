@@ -423,43 +423,36 @@ instructions: |
 ---
 ```
 
-#### OpenCode target: frontmatter constraints
+#### OpenCode target: frontmatter translation
 
 OpenCode (`target: opencode`, deploys to `.opencode/agents/`) parses
-agent frontmatter through a strict Zod schema and refuses to load
-the agent on any mismatch. APM installs OpenCode agents verbatim
-and emits an install-time warning when it detects either of these
-known incompatibilities -- the file is still copied so you can fix
-it in place, but OpenCode will fail to start until you do.
+agent frontmatter through a strict schema. APM translates portable source
+frontmatter before deployment:
 
-- `tools:` must be a **mapping of tool-name to boolean**, not a list
-  or comma-separated string:
+- `tools:` may be a list, comma-separated string, or boolean mapping. APM
+  emits OpenCode's `tool-name: boolean` mapping:
 
   ```yaml
-  # OK
+  # Portable source
+  tools: [read, edit, search, execute, agent, todo, vscode]
+
+  # Deployed OpenCode frontmatter
   tools:
-    Read: true
-    Grep: true
-    Edit: false
-
-  # Rejected by OpenCode (Claude/Copilot-style):
-  # tools: [Read, Grep]
-  # tools: "Read, Grep"
+    read: true
+    edit: true
+    grep: true
+    bash: true
+    task: true
   ```
 
-- `color:` must be either a **hex value** (`#abc` or `#aabbcc`) or
-  one of the OpenCode theme tokens: `primary`, `secondary`, `accent`,
-  `success`, `warning`, `error`, `info`. Free-form names such as
-  `cyan` or `magenta` are rejected:
-
-  ```yaml
-  # OK
-  color: "#aabbcc"
-  color: accent
-
-  # Rejected by OpenCode:
-  # color: cyan
-  ```
+- Portable mappings are `search` -> `grep`, `execute`/`shell` -> `bash`, and
+  `agent` -> `task`. Native OpenCode names pass through. Unsupported names,
+  including `todo`, `vscode`, and namespaced MCP tools, are dropped.
+- Bare model IDs and Copilot display names resolve to
+  `github-copilot/<model-id>`. Explicit `provider/model` values pass through.
+- Unsupported keys and invalid colors are dropped. Valid colors are `#rgb`,
+  `#rrggbb`, or an OpenCode theme token (`primary`, `secondary`, `accent`,
+  `success`, `warning`, `error`, `info`).
 
 If you target multiple agent runtimes from one source file, keep the
 frontmatter to the intersection of their schemas (or maintain

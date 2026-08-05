@@ -1537,6 +1537,32 @@ if ! uv run --extra dev python scripts/lint-bootstrap-project-name.py; then
     violations=$((violations + 1))
 fi
 
+echo "[*] AC33: OpenCode agent translation authority"
+opencode_agent_owner="src/apm_cli/integration/opencode_frontmatter.py"
+opencode_agent_consumer="src/apm_cli/integration/agent_integrator.py"
+opencode_agent_translator_defs=$(grep -rEc --include='*.py' \
+    '^def translate_opencode_agent\(' src/apm_cli \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+opencode_agent_parallel_maps=$(
+    grep -rEn --include='*.py' \
+        '^_?OPENCODE_.*(TOOL|MODEL).*(ALIASES|MAP)[[:space:]]*=' \
+        src/apm_cli \
+        | grep -v "^${opencode_agent_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if [ "$opencode_agent_translator_defs" -ne 1 ] \
+    || ! grep -q \
+        'from apm_cli.integration.opencode_frontmatter import (' \
+        "$opencode_agent_consumer" \
+    || ! grep -q 'return translate_opencode_agent(content), links_resolved' \
+        "$opencode_agent_consumer" \
+    || [ -n "$opencode_agent_parallel_maps" ]; then
+    echo "[x] OpenCode agent translation must route through integration/opencode_frontmatter.py"
+    [ -n "$opencode_agent_parallel_maps" ] && echo "$opencode_agent_parallel_maps"
+    violations=$((violations + 1))
+fi
+
 if [ "$violations" -gt 0 ]; then
     echo "[x] $violations architecture boundary rule(s) failed"
     exit 1

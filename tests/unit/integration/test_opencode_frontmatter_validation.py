@@ -1,14 +1,11 @@
-"""Tests for OpenCode frontmatter validate-and-warn (Phase 1 of #581).
-
-Covers both the pure validator and the install-time integration that
-fires it before copy_agent() writes the file to .opencode/agents/.
-"""
+"""Tests for OpenCode frontmatter validation and native translation."""
 
 from __future__ import annotations
 
 import tempfile
 from pathlib import Path
 
+import frontmatter
 import pytest
 
 from apm_cli.integration import AgentIntegrator
@@ -220,9 +217,8 @@ class TestValidateOpencodeFrontmatter:
         assert "#rrggbb" in msgs[0]
 
 
-class TestOpencodeInstallEmitsWarnings:
-    """End-to-end: integrate_agents_for_target() emits diagnostics.warn()
-    for OpenCode-incompatible frontmatter before deploying the file."""
+class TestOpencodeInstallTranslation:
+    """End-to-end tests for OpenCode agent translation during install."""
 
     def setup_method(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -245,7 +241,7 @@ class TestOpencodeInstallEmitsWarnings:
         agent_path.write_text(f"---\n{frontmatter}\n---\n\n# Demo\n")
         return pkg
 
-    def test_tools_as_list_emits_warning(self):
+    def test_tools_as_list_translates_without_warning(self):
         pkg = self._write_agent("tools:\n  - Read\n  - Grep\n")
         pkg_info = _make_package_info(pkg)
         diagnostics = DiagnosticCollector()
@@ -256,11 +252,52 @@ class TestOpencodeInstallEmitsWarnings:
 
         assert result.files_integrated == 1
         msgs = _warning_messages(diagnostics)
-        # Warning must name the offending file AND prefix it with the
-        # owning package so multi-package installs are diagnosable.
-        assert any("tools" in m and "test-pkg/demo.agent.md" in m and "Fix:" in m for m in msgs), (
-            msgs
+        assert msgs == []
+        deployed = frontmatter.load(self.project_root / ".opencode" / "agents" / "demo.md")
+        assert deployed.metadata["tools"] == {"read": True, "grep": True}
+
+    def test_install_translates_portable_agent_to_opencode_schema(self):
+        pkg = self._write_agent(
+            "name: SomeAgent\n"
+            "description: Reviews changes\n"
+            "model: Claude Sonnet 5 (copilot)\n"
+            "target: vscode\n"
+            "user-invocable: false\n"
+            "handoffs: [planner]\n"
+            "tools:\n"
+            "  - read\n"
+            "  - edit\n"
+            "  - search\n"
+            "  - execute\n"
+            "  - todo\n"
+            "  - vscode\n"
+            "  - agent\n"
+            "  - github/*\n"
         )
+        pkg_info = _make_package_info(pkg)
+
+        result = self.integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["opencode"],
+            pkg_info,
+            self.project_root,
+        )
+
+        assert result.files_integrated == 1
+        deployed = frontmatter.load(self.project_root / ".opencode" / "agents" / "demo.md")
+        assert deployed.metadata == {
+            "name": "SomeAgent",
+            "description": "Reviews changes",
+            "mode": "subagent",
+            "model": "github-copilot/claude-sonnet-5",
+            "tools": {
+                "read": True,
+                "edit": True,
+                "grep": True,
+                "bash": True,
+                "task": True,
+            },
+        }
+        assert deployed.content == "# Demo"
 
     def test_tools_as_dict_no_warning(self):
         pkg = self._write_agent("tools:\n  Read: true\n  Grep: false\n")
@@ -273,8 +310,10 @@ class TestOpencodeInstallEmitsWarnings:
 
         msgs = _warning_messages(diagnostics)
         assert not any("OpenCode agent" in m for m in msgs), msgs
+        deployed = frontmatter.load(self.project_root / ".opencode" / "agents" / "demo.md")
+        assert deployed.metadata["tools"] == {"read": True, "grep": False}
 
-    def test_color_named_emits_warning(self):
+    def test_color_named_is_dropped(self):
         pkg = self._write_agent('color: "cyan"\n')
         pkg_info = _make_package_info(pkg)
         diagnostics = DiagnosticCollector()
@@ -284,7 +323,9 @@ class TestOpencodeInstallEmitsWarnings:
         )
 
         msgs = _warning_messages(diagnostics)
-        assert any("color" in m and "cyan" in m for m in msgs), msgs
+        assert msgs == []
+        deployed = frontmatter.load(self.project_root / ".opencode" / "agents" / "demo.md")
+        assert "color" not in deployed.metadata
 
     def test_color_hex_no_warning(self):
         pkg = self._write_agent('color: "#aabbcc"\n')
@@ -298,10 +339,7 @@ class TestOpencodeInstallEmitsWarnings:
         msgs = _warning_messages(diagnostics)
         assert not any("OpenCode agent" in m for m in msgs), msgs
 
-    def test_file_is_still_deployed_when_warning_emitted(self):
-        # Warnings must NOT block install: file lands in .opencode/agents/
-        # so users can fix the source and reinstall, and so other valid
-        # agents in the same package are not held up by the bad one.
+    def test_file_is_deployed_after_translation(self):
         pkg = self._write_agent("tools:\n  - Read\n")
         pkg_info = _make_package_info(pkg)
         diagnostics = DiagnosticCollector()
@@ -314,8 +352,7 @@ class TestOpencodeInstallEmitsWarnings:
         deployed = self.project_root / ".opencode" / "agents" / "demo.md"
         assert deployed.exists()
 
-    def test_rendered_package_name_is_sanitized(self, capsys):
-        """OpenCode wrapper attribution must not reintroduce terminal controls."""
+    def test_translation_emits_no_package_warning(self, capsys):
         pkg = self._write_agent("tools:\n  - Read\n")
         pkg_info = _make_package_info(pkg, name="evil\x1b[31mpkg\nnext")
         diagnostics = DiagnosticCollector()
@@ -328,8 +365,7 @@ class TestOpencodeInstallEmitsWarnings:
         )
 
         warnings = [item for item in diagnostics._diagnostics if item.category == "warning"]
-        assert len(warnings) == 1
-        assert warnings[0].package == "evil?[31mpkg?next"
+        assert warnings == []
         diagnostics.render_summary()
         output = capsys.readouterr().out
         assert "\x1b" not in output
@@ -340,10 +376,12 @@ class TestOpencodeInstallEmitsWarnings:
         pkg_info = _make_package_info(pkg)
         diagnostics = DiagnosticCollector()
 
-        # Should not raise; validator gets empty fm when YAML is invalid.
+        # Should not raise; malformed metadata is stripped from deployed output.
         self.integrator.integrate_agents_for_target(
             KNOWN_TARGETS["opencode"], pkg_info, self.project_root, diagnostics=diagnostics
         )
+        deployed = frontmatter.load(self.project_root / ".opencode" / "agents" / "demo.md")
+        assert deployed.metadata == {"mode": "subagent"}
 
     def test_diagnostics_none_does_not_crash(self):
         # Defensive guard: _warn_opencode_frontmatter must early-return

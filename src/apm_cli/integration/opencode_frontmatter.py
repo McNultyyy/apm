@@ -1,28 +1,14 @@
-"""OpenCode agent frontmatter validation (Phase 1 of #581).
-
-OpenCode's loadAgent() calls Agent.safeParse() on parsed YAML
-frontmatter; on validation failure it raises an uncaught
-InvalidError and OpenCode fails to start. APM previously deployed
-agent files verbatim to .opencode/agents/, so a Claude-style agent
-file (tools as string/array, named color) would silently install and
-then crash OpenCode at runtime.
-
-This module inspects frontmatter for the known Zod-fatal shapes and
-returns human-readable warning messages. It does NOT mutate the
-frontmatter and does NOT block installation; the install path emits
-the warnings via the diagnostics collector so the user understands
-why OpenCode will refuse to load the agent.
-
-Phase 2 (per-target frontmatter transformer) is tracked separately
-and is intentionally out of scope here.
-"""
+"""Canonical translation of portable agent frontmatter to OpenCode."""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
+import yaml
+
 from apm_cli.utils.diagnostics import printable_ascii_text
+from apm_cli.utils.yaml_io import load_yaml_str, yaml_to_str
 
 # OpenCode theme color enum (see sst/opencode config schema).
 OPENCODE_THEME_COLORS = frozenset(
@@ -31,6 +17,135 @@ OPENCODE_THEME_COLORS = frozenset(
 
 # Hex color regex: #RGB or #RRGGBB, case-insensitive.
 _HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+_MODEL_PROVIDER_RE = re.compile(r"^(.*?)\s*\(([^()]+)\)\s*$")
+
+_OPENCODE_FRONTMATTER_KEYS = (
+    "name",
+    "description",
+    "temperature",
+    "top_p",
+    "prompt",
+    "permission",
+    "disable",
+    "hidden",
+    "steps",
+)
+_OPENCODE_MODES = frozenset({"primary", "subagent", "all"})
+_OPENCODE_TOOL_ALIASES = {
+    "bash": "bash",
+    "edit": "edit",
+    "execute": "bash",
+    "fetch": "webfetch",
+    "glob": "glob",
+    "grep": "grep",
+    "read": "read",
+    "search": "grep",
+    "shell": "bash",
+    "task": "task",
+    "agent": "task",
+    "web": "webfetch",
+    "webfetch": "webfetch",
+    "write": "write",
+}
+_MODEL_PROVIDER_ALIASES = {
+    "copilot": "github-copilot",
+    "github copilot": "github-copilot",
+    "github-copilot": "github-copilot",
+}
+
+
+def translate_opencode_agent(content: str) -> str:
+    """Render portable Markdown agent content in OpenCode's native schema.
+
+    Unknown frontmatter keys and unsupported tools are dropped. Portable tool
+    lists, comma-separated strings, and boolean mappings become OpenCode's
+    ``Record<string, boolean>`` shape. Model display names and bare model IDs
+    resolve to ``provider/model`` identifiers.
+    """
+    match = _FRONTMATTER_RE.match(content)
+    if not match:
+        return content
+
+    try:
+        metadata = load_yaml_str(match.group(1)) or {}
+    except yaml.YAMLError:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    translated = {key: metadata[key] for key in _OPENCODE_FRONTMATTER_KEYS if key in metadata}
+
+    mode = metadata.get("mode")
+    if not isinstance(mode, str) or mode not in _OPENCODE_MODES:
+        mode = "subagent"
+    translated["mode"] = mode
+
+    model = _translate_model(metadata.get("model"))
+    if model is not None:
+        translated["model"] = model
+
+    tools = _translate_tools(metadata.get("tools"))
+    if tools:
+        translated["tools"] = tools
+
+    color = metadata.get("color")
+    if _is_valid_opencode_color(color):
+        translated["color"] = color
+
+    body = content[match.end() :]
+    rendered_frontmatter = yaml_to_str(translated, sort_keys=False).rstrip()
+    return f"---\n{rendered_frontmatter}\n---\n\n{body.lstrip()}"
+
+
+def _translate_model(value: object) -> str | None:
+    """Return an OpenCode ``provider/model`` identifier."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if "/" in value:
+        return value
+
+    provider = "github-copilot"
+    provider_match = _MODEL_PROVIDER_RE.match(value)
+    if provider_match:
+        value = provider_match.group(1).strip()
+        provider_name = provider_match.group(2).strip().lower()
+        provider = _MODEL_PROVIDER_ALIASES.get(provider_name, _slugify(provider_name))
+
+    model = _slugify(value)
+    if not model or not provider:
+        return None
+    return f"{provider}/{model}"
+
+
+def _translate_tools(value: object) -> dict[str, bool]:
+    """Map portable tool declarations to OpenCode's native vocabulary."""
+    entries: list[tuple[object, object]]
+    if isinstance(value, dict):
+        entries = list(value.items())
+    elif isinstance(value, list):
+        entries = [(item, True) for item in value]
+    elif isinstance(value, str):
+        entries = [(item.strip(), True) for item in value.split(",")]
+    else:
+        return {}
+
+    translated: dict[str, bool] = {}
+    for source_name, enabled in entries:
+        if not isinstance(source_name, str) or not isinstance(enabled, bool):
+            continue
+        native_name = _OPENCODE_TOOL_ALIASES.get(source_name.strip().lower())
+        if native_name is not None:
+            translated[native_name] = enabled
+    return translated
+
+
+def _slugify(value: str) -> str:
+    """Normalize a model or provider display name to an identifier segment."""
+    return re.sub(r"[^a-z0-9._-]+", "-", value.lower()).strip("-")
 
 
 def _ascii_repr(value: object) -> str:

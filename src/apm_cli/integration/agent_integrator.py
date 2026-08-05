@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING
 import yaml
 
 from apm_cli.integration.base_integrator import BaseIntegrator, IntegrationResult
-from apm_cli.integration.opencode_frontmatter import validate_opencode_frontmatter
+from apm_cli.integration.opencode_frontmatter import (
+    translate_opencode_agent,
+    validate_opencode_frontmatter,
+)
 from apm_cli.utils.atomic_io import normalize_crlf_to_lf, write_text_lf
 from apm_cli.utils.diagnostics import printable_ascii_text
 from apm_cli.utils.path_security import PathTraversalError, ensure_path_within
@@ -220,6 +223,36 @@ class AgentIntegrator(BaseIntegrator):
 
             rel_path = portable_relpath(target_path, project_root)
 
+            if mapping.format_id == "opencode_agent":
+                rendered, links_resolved = self._render_opencode_agent(
+                    source_file,
+                    target_path,
+                )
+                if target_path.exists() and not target_path.is_symlink():
+                    try:
+                        existing = target_path.read_bytes()
+                        rendered_bytes = normalize_crlf_to_lf(rendered).encode("utf-8")
+                        if existing == rendered_bytes:
+                            target_paths.append(target_path)
+                            files_adopted += 1
+                            continue
+                    except OSError:
+                        pass
+                if self.check_collision(
+                    target_path,
+                    rel_path,
+                    managed_files,
+                    force,
+                    diagnostics=diagnostics,
+                ):
+                    files_skipped += 1
+                    continue
+                write_text_lf(target_path, rendered)
+                total_links_resolved += links_resolved
+                files_integrated += 1
+                target_paths.append(target_path)
+                continue
+
             skip, adopted = self._check_adopt_or_skip(
                 target_path, source_file, rel_path, managed_files, force, diagnostics, target_paths
             )
@@ -239,10 +272,6 @@ class AgentIntegrator(BaseIntegrator):
                 )
                 links_resolved = 0
             else:
-                if mapping.format_id == "opencode_agent":
-                    self._warn_opencode_frontmatter(
-                        source_file, diagnostics, package_info.package.name
-                    )
                 links_resolved = self.copy_agent(source_file, target_path)
             total_links_resolved += links_resolved
             files_integrated += 1
@@ -321,8 +350,16 @@ class AgentIntegrator(BaseIntegrator):
         write_text_lf(target, content)
         return links_resolved
 
+    def _render_opencode_agent(self, source: Path, target: Path) -> tuple[str, int]:
+        """Resolve links and translate one portable agent for OpenCode."""
+        if source.is_symlink():
+            raise ValueError(f"Refusing to read symlink source: {source}")
+        content = source.read_text(encoding="utf-8")
+        content, links_resolved = self.resolve_links(content, source, target)
+        return translate_opencode_agent(content), links_resolved
+
     # ------------------------------------------------------------------
-    # OpenCode validate-and-warn (Phase 1 of #581)
+    # OpenCode compatibility validator (retained for external callers)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -331,14 +368,7 @@ class AgentIntegrator(BaseIntegrator):
         diagnostics: DiagnosticCollector | None,
         package_name: str,
     ) -> None:
-        """Emit warnings for OpenCode-incompatible agent frontmatter.
-
-        Phase 1 only: surfaces Zod-fatal shapes (tools as list/string,
-        named colors outside the OpenCode theme enum) so users learn
-        why OpenCode will refuse to load the agent. The file is still
-        copied verbatim; Phase 2 (per-target frontmatter transformer)
-        is tracked separately.
-        """
+        """Emit compatibility warnings for raw OpenCode frontmatter."""
         if diagnostics is None:
             return
         if source.is_symlink():

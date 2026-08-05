@@ -164,8 +164,10 @@ for...
 | `color` | optional | Display color for harnesses that render it (Copilot, Claude, OpenCode). OpenCode requires a `#rgb`/`#rrggbb` hex literal or one of its theme names; see "Common pitfalls" below |
 | `handoffs` | optional | List of agent names (or VS Code structured handoff objects) this agent can hand off to |
 
-`model` and `tools` reach Copilot, Claude, Grok Build, Cursor, and OpenCode
-verbatim. Kiro receives `description`, `model`, and `tools` only;
+`model` and `tools` reach Copilot, Claude, Grok Build, and Cursor
+verbatim. OpenCode receives target-native frontmatter: APM resolves models to
+`provider/model`, converts tools to a boolean map, maps portable tool names,
+and drops unsupported tools and keys. Kiro receives `description`, `model`, and `tools` only;
 unknown frontmatter fields (including `name`) are stripped because
 Kiro derives agent identity from the deployed path, not from a `name`
 field. Tools are permission-bearing for Kiro: each value must be one
@@ -184,14 +186,13 @@ generated agent with Codex. Windsurf and Gemini do not receive
 `.agent.md` files at all -- use skills for Windsurf personas; Gemini
 CLI has no agents primitive.
 
-OpenCode is the strictest of the verbatim targets: it requires
-`tools` as a `tool-name: boolean` **mapping** (not a list, not a
-string) and `color` to be either a `#rrggbb` hex literal or one of
-its theme names (`primary`, `secondary`, `accent`, `success`,
-`warning`, `error`, `info`). `apm install -t opencode` warns at
-install time when an agent ships shapes OpenCode would reject at
-load time -- the file is still deployed, but the warning names the
-offending package and field so you can fix the source.
+For OpenCode, tool lists, comma-separated strings, and boolean maps are
+accepted as portable source. APM maps `search` to `grep`, `execute` and
+`shell` to `bash`, and `agent` to `task`; native names pass through.
+Unsupported names such as `todo`, `vscode`, and namespaced MCP tools are
+dropped. Bare model IDs and Copilot display names resolve through the
+`github-copilot` provider; an explicit `provider/model` stays unchanged.
+Invalid colors and non-OpenCode keys are dropped.
 
 ### Body conventions
 
@@ -213,7 +214,7 @@ offending package and field so you can fix the source.
 | claude | `.claude/agents/<name>.md` | verbatim |
 | grok-build | `.grok/agents/<name>.md` | verbatim |
 | cursor | `.cursor/agents/<name>.md` | verbatim |
-| opencode | `.opencode/agents/<name>.md` | verbatim |
+| opencode | `.opencode/agents/<name>.md` | model, tools, mode, color, and supported keys normalized to OpenCode frontmatter |
 | codex | `.codex/agents/<name>.toml` | `name` and `description` -> TOML; body becomes `developer_instructions`; unsupported `tools` emits a warning |
 | kiro | `.kiro/agents/<relative-stem>.md` | `description`, `model`, `tools` kept; `name` and unknown fields stripped; identity from path; fail closed on unsupported tools (ref: [kiro.dev/docs/custom-agents](https://kiro.dev/docs/custom-agents/), accessed 2026-08-03) |
 | grok-build | `.grok/agents/<name>.md` | verbatim |
@@ -265,14 +266,10 @@ dedicated persona.
   agents primitive. Cascade auto-invokes skills by description and
   Gemini folds context into `GEMINI.md`. If a persona must reach those
   targets, author it as a skill under `.apm/skills/<name>/SKILL.md`.
-- **`tools:` as a list, or a named color, on an OpenCode-targeted
-  agent.** OpenCode's loader rejects `tools: [Read, Grep]` and
-  colors like `cyan`. Use the mapping form (`tools: {Read: true}`)
-  and either a `#rrggbb` hex literal or one of OpenCode's theme
-  names (`primary, secondary, accent, success, warning, error,
-  info`). `apm install -t opencode` will warn at install time when
-  it detects either shape; the file still deploys but OpenCode will
-  refuse to load it.
+- **Assuming every tool has an OpenCode equivalent.** APM converts portable
+  tool declarations to OpenCode's boolean map and drops unsupported names.
+  Check the mapping above when a restricted agent depends on a target-specific
+  tool.
 - **Agent body that re-states global instructions.** Agents inherit
   the workspace's compiled context. Restate only what the persona
   needs to *override* or *add*; do not duplicate `python-style`

@@ -14,6 +14,62 @@ from types import ModuleType
 import pytest
 
 
+def test_opencode_agent_translation_has_single_owner() -> None:
+    """OpenCode agent schema decisions must stay in one edge translator."""
+    root = Path(__file__).parents[2]
+    owner = (root / "src/apm_cli/integration/opencode_frontmatter.py").read_text(encoding="utf-8")
+    consumer = (root / "src/apm_cli/integration/agent_integrator.py").read_text(encoding="utf-8")
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
+
+    assert owner.count("def translate_opencode_agent(") == 1
+    assert "return translate_opencode_agent(content), links_resolved" in consumer
+    assert (
+        "OpenCode agent translation must route through integration/opencode_frontmatter.py"
+    ) in guard
+
+
+def test_opencode_agent_translation_guard_rejects_parallel_owner(
+    tmp_path: Path,
+) -> None:
+    """AC33 must reject a second OpenCode agent translator."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    consumer = sandbox / "src/apm_cli/integration/agent_integrator.py"
+    consumer.write_text(
+        consumer.read_text(encoding="utf-8")
+        + "\ndef translate_opencode_agent(content: str) -> str:\n"
+        + "    return content\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert (
+        "OpenCode agent translation must route through integration/opencode_frontmatter.py"
+    ) in result.stdout
+
+
 def test_policy_cache_metadata_redaction_has_single_owner() -> None:
     """Policy cache refs must be sanitized by the canonical writer."""
     root = Path(__file__).parents[2]
