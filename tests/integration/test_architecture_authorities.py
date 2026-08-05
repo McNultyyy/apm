@@ -75,6 +75,46 @@ def test_opencode_agent_translation_guard_rejects_parallel_owner(
     ) in result.stdout
 
 
+def test_rendered_agent_adoption_guard_rejects_parallel_owner(
+    tmp_path: Path,
+) -> None:
+    """AC34 must reject a second rendered-agent adoption owner."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    consumer = sandbox / "src/apm_cli/integration/agent_integrator.py"
+    consumer.write_text(
+        consumer.read_text(encoding="utf-8")
+        + "\ndef _check_rendered_adopt_or_skip(*args, **kwargs):\n"
+        + "    return False, False\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Rendered agent adoption must route through BaseIntegrator" in result.stdout
+
+
 def test_policy_cache_metadata_redaction_has_single_owner() -> None:
     """Policy cache refs must be sanitized by the canonical writer."""
     root = Path(__file__).parents[2]

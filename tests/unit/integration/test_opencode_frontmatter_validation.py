@@ -9,6 +9,7 @@ import frontmatter
 import pytest
 
 from apm_cli.integration import AgentIntegrator
+from apm_cli.integration.opencode_frontmatter import OpencodeAgentTranslationError
 from apm_cli.integration.targets import KNOWN_TARGETS
 from apm_cli.models.apm_package import APMPackage, GitReferenceType, PackageInfo, ResolvedReference
 from apm_cli.utils.diagnostics import CATEGORY_ERROR, DiagnosticCollector
@@ -379,7 +380,7 @@ class TestOpencodeInstallTranslation:
         except OSError:
             pytest.skip("symlink creation is unavailable")
 
-        with pytest.raises(ValueError, match="Refusing to read symlink source"):
+        with pytest.raises(OpencodeAgentTranslationError, match="Refusing to read symlink source"):
             self.integrator._render_opencode_agent(source, self.project_root / "target.md")
 
     @pytest.mark.parametrize("target_name", ["copilot", "claude", "codex", "windsurf", "cursor"])
