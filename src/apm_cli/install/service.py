@@ -55,6 +55,12 @@ def _absent_apm_package_mcp_configs(
     """
     from apm_cli.models.validation import PackageType
 
+    # Short-circuit: if modules_dir itself is absent every remote dep is absent,
+    # but we still need to walk dependencies to build absent_declarers.  However,
+    # when modules_dir does not exist we can skip the per-dep exists() stat entirely
+    # because all remote deps are guaranteed absent.
+    modules_dir_exists = modules_dir.exists()
+
     absent_declarers: set[str] = set()
     for dep in lockfile.dependencies.values():
         if dep.package_type != PackageType.APM_PACKAGE.value:
@@ -62,7 +68,7 @@ def _absent_apm_package_mcp_configs(
         if dep.source == "local":
             continue
         install_path = dep.to_dependency_ref().get_install_path(modules_dir)
-        if not install_path.exists():
+        if not modules_dir_exists or not install_path.exists():
             # The declarer used when this package contributed MCP was:
             #   package.apm_yml.name  (stored in dep.name by the lock writer)
             #   or the install-directory name (fallback)
@@ -311,7 +317,7 @@ class InstallService:
             # the derived current state with those stored configs so the comparison
             # produces no false lock_only entries for cold-cache hydration targets.
             cold_cache_mcp = _absent_apm_package_mcp_configs(lockfile, modules_dir)
-            effective_configs: dict = {**current_mcp.configs, **cold_cache_mcp}
+            effective_configs: dict = {**cold_cache_mcp, **current_mcp.configs}
             config_diff = McpConfigDiff.between(effective_configs, lockfile.mcp_configs)
             if current_mcp.problems:
                 reasons.extend(
