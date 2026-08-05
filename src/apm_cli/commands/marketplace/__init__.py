@@ -258,6 +258,9 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
         from the host via ``AuthResolver.classify_host``, ``url`` rewritten
         to the SCP form (subprocess git understands it natively),
         ``embedded_host=<host>``.
+      * Full ``ssh://`` URL (``ssh://git@host/org/repo.git`` or with port,
+        e.g. ``ssh://git@host:7999/org/repo.git``). Returns the URL untouched,
+        ``embedded_host`` extracted, ``kind`` classified by host.
       * Full HTTPS URL. Returns the URL untouched, ``embedded_host``
         extracted, ``kind`` classified by host. Hosts that ``AuthResolver``
         does not recognise as github/gitlab fall through as ``kind="git"``
@@ -305,6 +308,39 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
         host_info = AuthResolver.classify_host(host)
         kind = _host_kind_to_fetcher_kind(host_info.kind)
         return raw, kind, host
+
+    # --- ssh:// protocol URL (ssh://git@host/org/repo.git or with port) ----
+    if lowered.startswith("ssh://"):
+        from urllib.parse import unquote as _unquote
+
+        # SECURITY: reject percent-encoded userinfo before urlparse decodes it.
+        # Same guard as DependencyReference._parse_ssh_protocol_url.
+        userinfo_match = re.match(r"^ssh://([^@/?#]+)@", raw)
+        if userinfo_match and "%" in userinfo_match.group(1):
+            raise ValueError(
+                "Percent-encoded characters are not allowed in SSH userinfo. "
+                "Use the literal username (e.g. 'ssh://myuser@host/...')."
+            )
+        parsed = urlparse(raw)
+        embedded_host = (parsed.hostname or "").strip().lower()
+        if not embedded_host:
+            raise ValueError(f"ssh:// URL is missing a host: '{raw}'")
+        path_segments = [s for s in _unquote(parsed.path or "").split("/") if s]
+        for seg in path_segments:
+            validate_path_segments(seg, context="marketplace SSH URL path", reject_empty=True)
+        if not path_segments:
+            raise ValueError(f"ssh:// URL is missing a repo path: '{raw}'")
+        if host_flag and host_flag.strip().lower() != embedded_host:
+            import shlex as _shlex
+
+            raise ValueError(
+                f"Conflicting host: --host '{host_flag}' does not match "
+                f"'{embedded_host}' in '{raw}'.\n"
+                f"To fix: drop --host and run: apm marketplace add {_shlex.quote(raw)}"
+            )
+        host_info = AuthResolver.classify_host(embedded_host)
+        kind = _host_kind_to_fetcher_kind(host_info.kind)
+        return raw, kind, embedded_host
 
     # --- HTTPS URL --------------------------------------------------------
     if lowered.startswith("https://"):
