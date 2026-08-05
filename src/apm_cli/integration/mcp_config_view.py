@@ -233,18 +233,9 @@ def _allows_missing_manifest(
         package_type, _ = detect_package_type(package_dir)
         return package_type is PackageType.CLAUDE_SKILL
 
-    dependency_ref = dependency.to_dependency_ref()
-    if not dependency_ref.is_virtual_subdirectory():
-        return False
-
-    if not package_dir.exists():
-        return False
-
-    package_type, _ = detect_package_type(package_dir)
-    return (
-        package_type is PackageType.CLAUDE_SKILL
-        and dependency.package_type == PackageType.CLAUDE_SKILL.value
-    )
+    # Only skill_bundle and claude_skill may legitimately omit apm.yml.
+    # Any other package type reaching this point is missing its manifest.
+    return False
 
 
 def _collect_locked_dependencies(
