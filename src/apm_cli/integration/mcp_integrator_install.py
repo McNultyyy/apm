@@ -500,12 +500,14 @@ def _resolve_target_runtimes(
             target_decision.runtime_targets_for_scope(user_scope=user_scope) or ()
         )
         # If runtime_targets is empty but canonical_targets is non-empty, every
-        # declared target is non-MCP-capable (e.g. agent-skills only). This is a
+        # selected target is non-MCP-capable (e.g. agent-skills only). This is a
         # hard error: MCP deps are present but no target can accept them (#2485).
         if not target_runtimes and target_decision.canonical_targets:
             targets_csv = ", ".join(sorted(target_decision.canonical_targets))
+            source = target_decision.source or "unknown"
+            label = "declared" if source == "apm.yml" else "selected"
             message = (
-                f"No MCP-capable target in the declared target set ({targets_csv}). "
+                f"No MCP-capable target in the {label} target set ({targets_csv}). "
                 "Add an MCP-capable target (e.g., codex, copilot, claude) to install "
                 "MCP dependencies."
             )
