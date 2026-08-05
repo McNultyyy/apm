@@ -565,11 +565,14 @@ def _resolve_target_runtimes(
             # If projection left an empty list, every declared target is
             # non-MCP-capable (#2485).  Fail with an actionable message.
             if not declared_targets:
-                try:
-                    original = parse_targets_field(apm_config) or []
-                    targets_csv = ", ".join(sorted(str(t) for t in original))
-                except (ConflictingTargetsError, EmptyTargetsListError, UnknownTargetError):
-                    targets_csv = "<unknown>"
+                raw = (
+                    (apm_config.get("targets") or apm_config.get("target") or [])
+                    if apm_config
+                    else []
+                )
+                if isinstance(raw, str):
+                    raw = [raw]
+                targets_csv = ", ".join(sorted(str(t) for t in raw)) or "<unknown>"
                 message = (
                     f"No MCP-capable target in the declared target set ({targets_csv}). "
                     "Add an MCP-capable target (e.g., codex, copilot, claude) to install "
