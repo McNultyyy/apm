@@ -809,14 +809,14 @@ class TestHttpLoopbackMcpUrlRegression:
     """Codex adapter must allow http:// for loopback hosts and reject it for
     genuinely remote hosts.  Regression guard for issue #2467."""
 
-    def _remote_server_info(self, url: str) -> dict:
+    def _remote_server_info(self, url: str) -> dict[str, object]:
         return {
             "name": "my-server",
             "remotes": [{"url": url, "transport_type": "streamable-http", "headers": []}],
             "packages": [],
         }
 
-    def _make_and_format(self, tmp_path, url: str):
+    def _make_and_format(self, tmp_path: Path, url: str) -> dict[str, object] | None:
         adapter = _make_adapter(project_root=tmp_path)
         server_info = self._remote_server_info(url)
         return adapter._format_server_config(server_info)
