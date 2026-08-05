@@ -159,6 +159,18 @@ def test_ssh_protocol_url_percent_encoded_userinfo_raises() -> None:
             "ssh://%2DoProxyCommand%3Devil@gitea.example.com/org/repo.git",
             host_flag=None,
         )
+    # Security guard must also fire for mixed/upper-case scheme (SSH://, Ssh://).
+    with pytest.raises(ValueError, match="Percent-encoded"):
+        _parse_marketplace_source(
+            "SSH://%2DoProxyCommand%3Devil@gitea.example.com/org/repo.git",
+            host_flag=None,
+        )
+
+
+def test_ssh_protocol_url_github_single_segment_raises() -> None:
+    """GitHub SSH URLs must be OWNER/REPO-shaped; single path segment is rejected."""
+    with pytest.raises(ValueError, match="Expected 'OWNER/REPO'"):
+        _parse_marketplace_source("ssh://git@github.com/repo.git", host_flag=None)
 
 
 def test_https_ado_url_classified_as_git() -> None:

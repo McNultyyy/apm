@@ -315,7 +315,8 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
 
         # SECURITY: reject percent-encoded userinfo before urlparse decodes it.
         # Same guard as DependencyReference._parse_ssh_protocol_url.
-        userinfo_match = re.match(r"^ssh://([^@/?#]+)@", raw)
+        # Use re.IGNORECASE so the guard fires for SSH://, Ssh://, etc.
+        userinfo_match = re.match(r"^ssh://([^@/?#]+)@", raw, re.IGNORECASE)
         if userinfo_match and "%" in userinfo_match.group(1):
             raise ValueError(
                 "Percent-encoded characters are not allowed in SSH userinfo. "
@@ -330,6 +331,13 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
             validate_path_segments(seg, context="marketplace SSH URL path", reject_empty=True)
         if not path_segments:
             raise ValueError(f"ssh:// URL is missing a repo path: '{raw}'")
+        host_info = AuthResolver.classify_host(embedded_host)
+        kind = _host_kind_to_fetcher_kind(host_info.kind)
+        if kind in ("github", "gitlab") and len(path_segments) < 2:
+            # GitHub / GitLab SSH URLs are owner/repo-shaped; a single
+            # path segment is ambiguous (no owner). Generic git URLs
+            # (kind == "git") MAY legitimately have a single segment.
+            raise ValueError(f"Invalid format: '{raw}'. Expected 'OWNER/REPO' in the URL path.")
         if host_flag and host_flag.strip().lower() != embedded_host:
             import shlex as _shlex
 
@@ -338,8 +346,6 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
                 f"'{embedded_host}' in '{raw}'.\n"
                 f"To fix: drop --host and run: apm marketplace add {_shlex.quote(raw)}"
             )
-        host_info = AuthResolver.classify_host(embedded_host)
-        kind = _host_kind_to_fetcher_kind(host_info.kind)
         return raw, kind, embedded_host
 
     # --- HTTPS URL --------------------------------------------------------
