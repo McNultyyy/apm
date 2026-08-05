@@ -36,7 +36,6 @@ def repo_copy(tmp_path: Path) -> Path:
     for relative in (
         "src/apm_cli/utils/diagnostics.py",
         "src/apm_cli/integration/agent_integrator.py",
-        "src/apm_cli/integration/opencode_frontmatter.py",
     ):
         source = REPO_ROOT / relative
         target = root / relative
@@ -49,7 +48,7 @@ def test_real_repository_passes(checker) -> None:
 
 
 def test_retired_private_helper_is_rejected(repo_copy: Path, checker) -> None:
-    consumer = repo_copy / "src/apm_cli/integration/opencode_frontmatter.py"
+    consumer = repo_copy / "src/apm_cli/integration/agent_integrator.py"
     consumer.write_text(
         consumer.read_text(encoding="utf-8")
         + "\n\ndef _ascii_safe_name(value: str) -> str:\n    return value\n",
@@ -83,17 +82,17 @@ def test_decorative_owner_call_cannot_hide_regex_override(
     checker,
 ) -> None:
     """A real rendered value must flow from the owner, not a decorative call."""
-    consumer = repo_copy / "src/apm_cli/integration/opencode_frontmatter.py"
+    consumer = repo_copy / "src/apm_cli/integration/agent_integrator.py"
     source = consumer.read_text(encoding="utf-8")
     source = source.replace(
-        "def validate_opencode_frontmatter(",
-        "def _display_safe(value: str) -> str:\n"
-        '    return re.sub(r"[^ -~]", "?", value)\n\n\n'
-        "def validate_opencode_frontmatter(",
+        "    def _warn_opencode_frontmatter(",
+        "    def _display_safe(value: str) -> str:\n"
+        '        return re.sub(r"[^ -~]", "?", value)\n\n'
+        "    def _warn_opencode_frontmatter(",
     )
     source = source.replace(
-        "safe_name = printable_ascii_text(source.name)",
-        "safe_name = printable_ascii_text(source.name)\n    safe_name = _display_safe(source.name)",
+        'f"OpenCode agent {printable_ascii_text(source.name)}: "',
+        'f"OpenCode agent {_display_safe(source.name)}: "',
     )
     consumer.write_text(source, encoding="utf-8")
 
@@ -140,10 +139,10 @@ def test_sanitized_identifier_cannot_share_message_with_raw_name(
     checker,
 ) -> None:
     """A sanitized prefix must not excuse a second raw interpolation."""
-    consumer = repo_copy / "src/apm_cli/integration/opencode_frontmatter.py"
+    consumer = repo_copy / "src/apm_cli/integration/agent_integrator.py"
     source = consumer.read_text(encoding="utf-8").replace(
-        "f\"OpenCode agent '{identifier}' has tools as {kind}; \"",
-        "f\"OpenCode agent '{identifier}' (raw file: {source.name}) has tools as {kind}; \"",
+        'f"OpenCode agent {printable_ascii_text(source.name)}: "',
+        'f"OpenCode agent {printable_ascii_text(source.name)} (raw file: {source.name}): "',
         1,
     )
     consumer.write_text(source, encoding="utf-8")
@@ -178,17 +177,18 @@ def test_opencode_wrapper_package_field_must_use_owner(
 
 
 def test_missing_owner_call_is_rejected(repo_copy: Path, checker) -> None:
-    consumer = repo_copy / "src/apm_cli/integration/opencode_frontmatter.py"
+    consumer = repo_copy / "src/apm_cli/integration/agent_integrator.py"
     source = consumer.read_text(encoding="utf-8").replace(
-        "safe_name = printable_ascii_text(source.name)",
-        "safe_name = source.name",
+        'f"OpenCode agent {printable_ascii_text(source.name)}: "',
+        'f"OpenCode agent {source.name}: "',
     )
     consumer.write_text(source, encoding="utf-8")
 
     violations = checker.check(repo_copy)
 
     assert any(
-        "validate_opencode_frontmatter must derive" in violation.message for violation in violations
+        "AgentIntegrator._warn_opencode_frontmatter must derive" in violation.message
+        for violation in violations
     )
 
 

@@ -876,6 +876,70 @@ def test_kiro_agent_tools_gate_fails_closed_before_adopt(tmp_path: Path) -> None
     )
 
 
+@pytest.mark.req("req-tg-009")
+def test_opencode_agent_tools_gate_fails_closed_before_adopt(tmp_path: Path) -> None:
+    """OpenCode rejects unrepresentable tool capabilities before adoption."""
+    from datetime import datetime
+
+    from apm_cli.models.apm_package import (
+        GitReferenceType,
+        PackageInfo,
+        ResolvedReference,
+    )
+    from apm_cli.utils.diagnostics import CATEGORY_ERROR
+
+    (tmp_path / ".opencode").mkdir()
+    package_dir = tmp_path / "pkg"
+    apm_agents = package_dir / ".apm" / "agents"
+    apm_agents.mkdir(parents=True)
+    source = apm_agents / "hacked.agent.md"
+    source.write_text(
+        "---\ntools: [read, execute_arbitrary_code]\n---\n\n# Hacked\n",
+        encoding="utf-8",
+    )
+
+    target = tmp_path / ".opencode" / "agents" / "hacked.md"
+    target.parent.mkdir()
+    original_target = "---\nmode: subagent\ntools:\n  read: true\n---\n\n# Hacked\n"
+    target.write_text(original_target, encoding="utf-8")
+
+    package = APMPackage(
+        name="test-pkg",
+        version="1.0.0",
+        package_path=package_dir,
+        source="github.com/test/test-pkg",
+    )
+    package_info = PackageInfo(
+        package=package,
+        install_path=package_dir,
+        resolved_reference=ResolvedReference(
+            original_ref="main",
+            ref_type=GitReferenceType.BRANCH,
+            resolved_commit="abc123",
+            ref_name="main",
+        ),
+        installed_at=datetime.now().isoformat(),
+    )
+    diagnostics = DiagnosticCollector()
+
+    result = AgentIntegrator().integrate_agents_for_target(
+        KNOWN_TARGETS["opencode"],
+        package_info,
+        tmp_path,
+        managed_files={".opencode/agents/hacked.md"},
+        diagnostics=diagnostics,
+    )
+
+    assert result.files_integrated == 0
+    assert result.files_adopted == 0
+    assert target not in result.target_paths
+    assert target.read_text(encoding="utf-8") == original_target
+    errors = [item for item in diagnostics._diagnostics if item.category == CATEGORY_ERROR]
+    assert len(errors) == 1
+    assert "execute_arbitrary_code" in errors[0].message
+    assert "use only approved names" in errors[0].message
+
+
 # --- req-cf-001..002 --------------------------------------------------
 
 

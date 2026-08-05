@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from dataclasses import dataclass
 
 import yaml
 
-from apm_cli.utils.diagnostics import printable_ascii_text
 from apm_cli.utils.yaml_io import load_yaml_str, yaml_to_str
 
 # OpenCode theme color enum (see sst/opencode config schema).
@@ -55,35 +54,73 @@ _MODEL_PROVIDER_ALIASES = {
 }
 
 
-def translate_opencode_agent(content: str) -> str:
+@dataclass(frozen=True)
+class OpencodeAgentTranslation:
+    """Rendered OpenCode content plus user-visible lossy-conversion notices."""
+
+    content: str
+    notices: tuple[str, ...] = ()
+
+
+class OpencodeAgentTranslationError(ValueError):
+    """Raised when source intent cannot be represented safely in OpenCode."""
+
+
+def translate_opencode_agent(content: str) -> OpencodeAgentTranslation:
     """Render portable Markdown agent content in OpenCode's native schema.
 
-    Unknown frontmatter keys and unsupported tools are dropped. Portable tool
-    lists, comma-separated strings, and boolean mappings become OpenCode's
-    ``Record<string, boolean>`` shape. Model display names and bare model IDs
-    resolve to ``provider/model`` identifiers.
+    Unknown frontmatter keys and invalid optional values are omitted with a
+    notice. Unsupported tools and malformed metadata fail closed. Portable
+    tool lists, comma-separated strings, and boolean mappings become
+    OpenCode's ``Record<string, boolean>`` shape. Model display names and bare
+    model IDs resolve to ``provider/model`` identifiers.
     """
     match = _FRONTMATTER_RE.match(content)
     if not match:
-        return content
+        return OpencodeAgentTranslation(content)
 
     try:
         metadata = load_yaml_str(match.group(1)) or {}
-    except yaml.YAMLError:
-        metadata = {}
+    except yaml.YAMLError as exc:
+        raise OpencodeAgentTranslationError(
+            "frontmatter is invalid YAML; fix the YAML syntax"
+        ) from exc
     if not isinstance(metadata, dict):
-        metadata = {}
+        raise OpencodeAgentTranslationError(
+            "frontmatter must be a YAML mapping; replace the top-level value with key/value fields"
+        )
 
-    translated = {key: metadata[key] for key in _OPENCODE_FRONTMATTER_KEYS if key in metadata}
+    notices: list[str] = []
+    translated: dict[str, object] = {}
+    for key in _OPENCODE_FRONTMATTER_KEYS:
+        if key not in metadata:
+            continue
+        value = metadata[key]
+        if _is_valid_supported_value(key, value):
+            translated[key] = value
+        else:
+            notices.append(f"dropped invalid '{key}' value")
+
+    ignored_keys = sorted(
+        str(key)
+        for key in metadata
+        if key not in {*_OPENCODE_FRONTMATTER_KEYS, "mode", "model", "tools", "color"}
+    )
+    if ignored_keys:
+        notices.append(f"dropped unsupported fields: {', '.join(ignored_keys)}")
 
     mode = metadata.get("mode")
     if not isinstance(mode, str) or mode not in _OPENCODE_MODES:
+        if "mode" in metadata:
+            notices.append("replaced invalid 'mode' with 'subagent'")
         mode = "subagent"
     translated["mode"] = mode
 
     model = _translate_model(metadata.get("model"))
     if model is not None:
         translated["model"] = model
+    elif "model" in metadata:
+        notices.append("dropped invalid 'model' value")
 
     tools = _translate_tools(metadata.get("tools"))
     if tools:
@@ -92,10 +129,13 @@ def translate_opencode_agent(content: str) -> str:
     color = metadata.get("color")
     if _is_valid_opencode_color(color):
         translated["color"] = color
+    elif "color" in metadata:
+        notices.append("dropped invalid 'color' value")
 
     body = content[match.end() :]
     rendered_frontmatter = yaml_to_str(translated, sort_keys=False).rstrip()
-    return f"---\n{rendered_frontmatter}\n---\n\n{body.lstrip()}"
+    rendered = f"---\n{rendered_frontmatter}\n---\n\n{body.lstrip()}"
+    return OpencodeAgentTranslation(rendered, tuple(notices))
 
 
 def _translate_model(value: object) -> str | None:
@@ -122,7 +162,10 @@ def _translate_model(value: object) -> str | None:
 
 
 def _translate_tools(value: object) -> dict[str, bool]:
-    """Map portable tool declarations to OpenCode's native vocabulary."""
+    """Map portable tools, failing closed when any tool is unrepresentable."""
+    if value is None:
+        return {}
+
     entries: list[tuple[object, object]]
     if isinstance(value, dict):
         entries = list(value.items())
@@ -131,15 +174,28 @@ def _translate_tools(value: object) -> dict[str, bool]:
     elif isinstance(value, str):
         entries = [(item.strip(), True) for item in value.split(",")]
     else:
-        return {}
+        raise OpencodeAgentTranslationError(
+            "'tools' must be a list, comma-separated string, or boolean mapping"
+        )
 
     translated: dict[str, bool] = {}
+    unsupported: list[str] = []
     for source_name, enabled in entries:
         if not isinstance(source_name, str) or not isinstance(enabled, bool):
-            continue
+            raise OpencodeAgentTranslationError(
+                "'tools' entries must use string names and boolean values"
+            )
         native_name = _OPENCODE_TOOL_ALIASES.get(source_name.strip().lower())
-        if native_name is not None:
-            translated[native_name] = enabled
+        if native_name is None:
+            unsupported.append(source_name)
+            continue
+        translated[native_name] = translated.get(native_name, True) and enabled
+    if unsupported:
+        values = ", ".join(sorted(unsupported))
+        approved = ", ".join(sorted(_OPENCODE_TOOL_ALIASES))
+        raise OpencodeAgentTranslationError(
+            f"unsupported tools: {values}; use only approved names: {approved}"
+        )
     return translated
 
 
@@ -148,79 +204,19 @@ def _slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9._-]+", "-", value.lower()).strip("-")
 
 
-def _ascii_repr(value: object) -> str:
-    """Return an ASCII-only repr of ``value``.
-
-    Drop-in replacement for ``!r`` interpolation: ``ascii()`` escapes
-    any non-ASCII codepoints (e.g. ``'cy\\xe1n'``) so diagnostics never
-    leak raw non-ASCII bytes from user frontmatter into CLI output.
-    """
-    return ascii(value)
-
-
-def validate_opencode_frontmatter(
-    fm: dict | None,
-    source: Path,
-    package_name: str | None = None,
-) -> list[str]:
-    """Return ASCII warning messages for OpenCode-incompatible fields.
-
-    Empty list means no incompatibilities were detected. The caller
-    is responsible for surfacing each message via the diagnostics
-    collector; this function is pure.
-
-    Args:
-        fm: Parsed YAML frontmatter (may be ``None`` or empty dict).
-        source: Source agent file path, used in messages so the user
-            can locate the offending file.
-        package_name: Optional owning APM package name. When provided,
-            the warning identifies the agent as ``<pkg>/<file>`` so
-            users running multi-package installs can tell which
-            dependency the bad frontmatter came from.
-    """
-    if not fm or not isinstance(fm, dict):
-        return []
-
-    messages: list[str] = []
-    safe_name = printable_ascii_text(source.name)
-    identifier = f"{printable_ascii_text(package_name)}/{safe_name}" if package_name else safe_name
-
-    if "tools" in fm:
-        tools = fm["tools"]
-        if not isinstance(tools, dict):
-            kind = type(tools).__name__
-            messages.append(
-                f"OpenCode agent '{identifier}' has tools as {kind}; "
-                "OpenCode requires a mapping of tool-name to boolean. "
-                "OpenCode will reject this agent at load time. "
-                "Fix: rewrite the frontmatter as 'tools: {Read: true, Grep: true}'."
-            )
-        else:
-            for key, value in tools.items():
-                if not isinstance(key, str) or not isinstance(value, bool):
-                    messages.append(
-                        f"OpenCode agent '{identifier}' has a non-boolean tool entry "
-                        f"({_ascii_repr(key)}: {_ascii_repr(value)}); OpenCode requires "
-                        "string-keyed boolean values. "
-                        "OpenCode will reject this agent at load time. "
-                        "Fix: set every tool entry to 'true' or 'false' "
-                        "(e.g. 'Read: true')."
-                    )
-                    break
-
-    if "color" in fm:
-        color = fm["color"]
-        if not _is_valid_opencode_color(color):
-            messages.append(
-                f"OpenCode agent '{identifier}' has color={_ascii_repr(color)}; "
-                "OpenCode requires a hex value (e.g. '#aabbcc') or one of "
-                f"{sorted(OPENCODE_THEME_COLORS)}. "
-                "OpenCode will reject this agent at load time. "
-                "Fix: replace the color with a '#rgb' or '#rrggbb' hex literal "
-                "or one of the listed theme names."
-            )
-
-    return messages
+def _is_valid_supported_value(key: str, value: object) -> bool:
+    """Return whether a pass-through field has the OpenCode schema shape."""
+    if key in {"name", "description", "prompt"}:
+        return isinstance(value, str)
+    if key in {"temperature", "top_p"}:
+        return isinstance(value, int | float) and not isinstance(value, bool)
+    if key == "permission":
+        return isinstance(value, dict)
+    if key in {"disable", "hidden"}:
+        return isinstance(value, bool)
+    if key == "steps":
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    return False
 
 
 def _is_valid_opencode_color(value: object) -> bool:

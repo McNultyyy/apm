@@ -1563,6 +1563,21 @@ if [ "$opencode_agent_translator_defs" -ne 1 ] \
     violations=$((violations + 1))
 fi
 
+echo "[*] AC34: rendered agent adoption authority"
+rendered_agent_adopt_owner="src/apm_cli/integration/base_integrator.py"
+rendered_agent_adopt_defs=$(grep -rEc --include='*.py' \
+    '^[[:space:]]*def _check_rendered_adopt_or_skip\(' src/apm_cli \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+rendered_agent_adopt_calls=$(grep -c \
+    'self\._check_rendered_adopt_or_skip(' "$opencode_agent_consumer" || true)
+if [ "$rendered_agent_adopt_defs" -ne 1 ] \
+    || ! grep -q '^    def _check_rendered_adopt_or_skip(' "$rendered_agent_adopt_owner" \
+    || [ "$rendered_agent_adopt_calls" -ne 2 ] \
+    || grep -q 'target_path\.read_bytes()' "$opencode_agent_consumer"; then
+    echo "[x] Rendered agent adoption must route through BaseIntegrator"
+    violations=$((violations + 1))
+fi
+
 if [ "$violations" -gt 0 ]; then
     echo "[x] $violations architecture boundary rule(s) failed"
     exit 1

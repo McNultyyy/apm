@@ -429,6 +429,36 @@ class BaseIntegrator:
             return True, False
         return False, False
 
+    def _check_rendered_adopt_or_skip(
+        self,
+        target_path: Path,
+        rendered_content: str,
+        rel_path: str,
+        managed_files: set[str] | None,
+        force: bool,
+        diagnostics,
+        target_paths: list[Path],
+    ) -> tuple[bool, bool]:
+        """Check adoption and collision for a pre-rendered text artifact.
+
+        Target-specific renderers must call this owner instead of duplicating
+        the rendered-byte identity and collision sequence.
+        """
+        try:
+            if target_path.exists() and not target_path.is_symlink():
+                target_bytes = _read_bytes_no_follow(target_path)
+                rendered_bytes = normalize_crlf_to_lf(rendered_content).encode("utf-8")
+                if target_bytes == rendered_bytes:
+                    target_paths.append(target_path)
+                    return True, True
+        except (_SymlinkRaceError, OSError):
+            pass
+        if self.check_collision(
+            target_path, rel_path, managed_files, force, diagnostics=diagnostics
+        ):
+            return True, False
+        return False, False
+
     # Known integration prefixes that APM is allowed to deploy/remove under.
     # Derived from ``targets.KNOWN_TARGETS`` so adding a target auto-propagates.
     @staticmethod

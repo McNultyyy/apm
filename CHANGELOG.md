@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenCode agents now receive native model IDs and boolean tool maps; unsupported
+  tool capabilities and malformed frontmatter fail closed instead of silently
+  widening permissions or falling back to defaults. (closes #2483, #2488)
+
 ## [0.28.0] - 2026-08-04
 
 ### Added

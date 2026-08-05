@@ -161,13 +161,14 @@ for...
 | `description` | yes | Used by Cascade and Copilot to decide when to surface the agent |
 | `model` | optional | Pinned model the harness should switch to when invoked |
 | `tools` | optional | Whitelist of tools the persona may call |
-| `color` | optional | Display color for harnesses that render it (Copilot, Claude, OpenCode). OpenCode requires a `#rgb`/`#rrggbb` hex literal or one of its theme names; see "Common pitfalls" below |
+| `color` | optional | Display color for harnesses that render it. OpenCode keeps `#rgb`, `#rrggbb`, or a theme name and diagnoses other values |
+| `mode` | optional | OpenCode agent role: `primary`, `subagent`, or `all`; defaults to `subagent` |
 | `handoffs` | optional | List of agent names (or VS Code structured handoff objects) this agent can hand off to |
 
 `model` and `tools` reach Copilot, Claude, Grok Build, and Cursor
 verbatim. OpenCode receives target-native frontmatter: APM resolves models to
 `provider/model`, converts tools to a boolean map, maps portable tool names,
-and drops unsupported tools and keys. Kiro receives `description`, `model`, and `tools` only;
+and fails closed when a tool cannot be represented. Kiro receives `description`, `model`, and `tools` only;
 unknown frontmatter fields (including `name`) are stripped because
 Kiro derives agent identity from the deployed path, not from a `name`
 field. Tools are permission-bearing for Kiro: each value must be one
@@ -188,11 +189,15 @@ CLI has no agents primitive.
 
 For OpenCode, tool lists, comma-separated strings, and boolean maps are
 accepted as portable source. APM maps `search` to `grep`, `execute` and
-`shell` to `bash`, and `agent` to `task`; native names pass through.
+`shell` to `bash`, `agent` to `task`, and `fetch` and `web` to `webfetch`;
+native names pass through. When aliases converge on one native tool, `false`
+wins so translation never re-enables an explicitly disabled capability.
 Unsupported names such as `todo`, `vscode`, and namespaced MCP tools are
-dropped. Bare model IDs and Copilot display names resolve through the
-`github-copilot` provider; an explicit `provider/model` stays unchanged.
-Invalid colors and non-OpenCode keys are dropped.
+rejected before deployment with an actionable diagnostic. Bare model IDs and
+Copilot display names resolve through the `github-copilot` provider; an
+explicit `provider/model` stays unchanged. Invalid YAML also fails closed.
+Invalid optional values and non-OpenCode keys are dropped with a lossy
+translation diagnostic.
 
 ### Body conventions
 

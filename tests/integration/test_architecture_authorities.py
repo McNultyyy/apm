@@ -19,13 +19,18 @@ def test_opencode_agent_translation_has_single_owner() -> None:
     root = Path(__file__).parents[2]
     owner = (root / "src/apm_cli/integration/opencode_frontmatter.py").read_text(encoding="utf-8")
     consumer = (root / "src/apm_cli/integration/agent_integrator.py").read_text(encoding="utf-8")
+    base = (root / "src/apm_cli/integration/base_integrator.py").read_text(encoding="utf-8")
     guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
 
     assert owner.count("def translate_opencode_agent(") == 1
     assert "return translate_opencode_agent(content), links_resolved" in consumer
+    assert base.count("def _check_rendered_adopt_or_skip(") == 1
+    assert consumer.count("self._check_rendered_adopt_or_skip(") == 2
+    assert "target_path.read_bytes()" not in consumer
     assert (
         "OpenCode agent translation must route through integration/opencode_frontmatter.py"
     ) in guard
+    assert "Rendered agent adoption must route through BaseIntegrator" in guard
 
 
 def test_opencode_agent_translation_guard_rejects_parallel_owner(
@@ -2175,17 +2180,17 @@ def test_agent_diagnostic_ascii_guard_rejects_local_reimplementation(
             "node_modules",
         ),
     )
-    consumer = sandbox / "src/apm_cli/integration/opencode_frontmatter.py"
+    consumer = sandbox / "src/apm_cli/integration/agent_integrator.py"
     source = consumer.read_text(encoding="utf-8")
     source = source.replace(
-        "def validate_opencode_frontmatter(",
-        "def _display_safe(value: str) -> str:\n"
-        '    return re.sub(r"[^ -~]", "?", value)\n\n\n'
-        "def validate_opencode_frontmatter(",
+        "    def _warn_opencode_frontmatter(",
+        "    def _display_safe(value: str) -> str:\n"
+        '        return re.sub(r"[^ -~]", "?", value)\n\n'
+        "    def _warn_opencode_frontmatter(",
     )
     source = source.replace(
-        "safe_name = printable_ascii_text(source.name)",
-        "safe_name = printable_ascii_text(source.name)\n    safe_name = _display_safe(source.name)",
+        'f"OpenCode agent {printable_ascii_text(source.name)}: "',
+        'f"OpenCode agent {_display_safe(source.name)}: "',
     )
     consumer.write_text(source, encoding="utf-8")
 

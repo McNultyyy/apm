@@ -15,10 +15,11 @@ import yaml
 
 from apm_cli.integration.base_integrator import BaseIntegrator, IntegrationResult
 from apm_cli.integration.opencode_frontmatter import (
+    OpencodeAgentTranslation,
+    OpencodeAgentTranslationError,
     translate_opencode_agent,
-    validate_opencode_frontmatter,
 )
-from apm_cli.utils.atomic_io import normalize_crlf_to_lf, write_text_lf
+from apm_cli.utils.atomic_io import write_text_lf
 from apm_cli.utils.diagnostics import printable_ascii_text
 from apm_cli.utils.path_security import PathTraversalError, ensure_path_within
 from apm_cli.utils.paths import portable_relpath
@@ -190,20 +191,20 @@ class AgentIntegrator(BaseIntegrator):
                 # target so a pre-placed file with invalid tools cannot be
                 # adopted by matching source bytes.
                 rel_path = portable_relpath(target_path, project_root)
-                if target_path.exists() and not target_path.is_symlink():
-                    try:
-                        existing = target_path.read_bytes()
-                        rendered_bytes = normalize_crlf_to_lf(rendered).encode("utf-8")
-                        if existing == rendered_bytes:
-                            target_paths.append(target_path)
-                            files_adopted += 1
-                            continue
-                    except OSError:
-                        pass
-                if self.check_collision(
-                    target_path, rel_path, managed_files, force, diagnostics=diagnostics
-                ):
-                    files_skipped += 1
+                skip, adopted = self._check_rendered_adopt_or_skip(
+                    target_path,
+                    rendered,
+                    rel_path,
+                    managed_files,
+                    force,
+                    diagnostics,
+                    target_paths,
+                )
+                if skip:
+                    if adopted:
+                        files_adopted += 1
+                    else:
+                        files_skipped += 1
                     continue
 
                 # Safe to materialize: ensure parent dirs exist then write.
@@ -216,42 +217,59 @@ class AgentIntegrator(BaseIntegrator):
                 target_paths.append(target_path)
                 continue
 
-            # Non-kiro path: eager mkdir (existing behavior preserved).
-            if not agents_dir_created:
-                agents_dir.mkdir(parents=True, exist_ok=True)
-                agents_dir_created = True
-
             rel_path = portable_relpath(target_path, project_root)
 
             if mapping.format_id == "opencode_agent":
-                rendered, links_resolved = self._render_opencode_agent(
+                try:
+                    translation, links_resolved = self._render_opencode_agent(
+                        source_file,
+                        target_path,
+                    )
+                except OpencodeAgentTranslationError as exc:
+                    if diagnostics is not None:
+                        diagnostics.error(
+                            message=(
+                                f"OpenCode agent {printable_ascii_text(source_file.name)} "
+                                f"was not deployed: {printable_ascii_text(str(exc))}."
+                            ),
+                            package=printable_ascii_text(package_info.package.name),
+                        )
+                    files_skipped += 1
+                    continue
+                self._warn_opencode_frontmatter(
                     source_file,
-                    target_path,
+                    diagnostics,
+                    package_info.package.name,
+                    translation.notices,
                 )
-                if target_path.exists() and not target_path.is_symlink():
-                    try:
-                        existing = target_path.read_bytes()
-                        rendered_bytes = normalize_crlf_to_lf(rendered).encode("utf-8")
-                        if existing == rendered_bytes:
-                            target_paths.append(target_path)
-                            files_adopted += 1
-                            continue
-                    except OSError:
-                        pass
-                if self.check_collision(
+                skip, adopted = self._check_rendered_adopt_or_skip(
                     target_path,
+                    translation.content,
                     rel_path,
                     managed_files,
                     force,
-                    diagnostics=diagnostics,
-                ):
-                    files_skipped += 1
+                    diagnostics,
+                    target_paths,
+                )
+                if skip:
+                    if adopted:
+                        files_adopted += 1
+                    else:
+                        files_skipped += 1
                     continue
-                write_text_lf(target_path, rendered)
+                if not agents_dir_created:
+                    agents_dir.mkdir(parents=True, exist_ok=True)
+                    agents_dir_created = True
+                write_text_lf(target_path, translation.content)
                 total_links_resolved += links_resolved
                 files_integrated += 1
                 target_paths.append(target_path)
                 continue
+
+            # Verbatim targets preserve the existing eager-directory behavior.
+            if not agents_dir_created:
+                agents_dir.mkdir(parents=True, exist_ok=True)
+                agents_dir_created = True
 
             skip, adopted = self._check_adopt_or_skip(
                 target_path, source_file, rel_path, managed_files, force, diagnostics, target_paths
@@ -350,7 +368,9 @@ class AgentIntegrator(BaseIntegrator):
         write_text_lf(target, content)
         return links_resolved
 
-    def _render_opencode_agent(self, source: Path, target: Path) -> tuple[str, int]:
+    def _render_opencode_agent(
+        self, source: Path, target: Path
+    ) -> tuple[OpencodeAgentTranslation, int]:
         """Resolve links and translate one portable agent for OpenCode."""
         if source.is_symlink():
             raise ValueError(f"Refusing to read symlink source: {source}")
@@ -358,38 +378,27 @@ class AgentIntegrator(BaseIntegrator):
         content, links_resolved = self.resolve_links(content, source, target)
         return translate_opencode_agent(content), links_resolved
 
-    # ------------------------------------------------------------------
-    # OpenCode compatibility validator (retained for external callers)
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _warn_opencode_frontmatter(
         source: Path,
         diagnostics: DiagnosticCollector | None,
         package_name: str,
+        notices: tuple[str, ...],
     ) -> None:
-        """Emit compatibility warnings for raw OpenCode frontmatter."""
+        """Record lossy OpenCode translation notices in the shared collector."""
         if diagnostics is None:
             return
-        if source.is_symlink():
-            return
-        try:
-            content = source.read_text(encoding="utf-8")
-        except OSError:
-            return
-        fm_match = AgentIntegrator._FRONTMATTER_RE.match(content)
-        if not fm_match:
-            return
-        try:
-            fm = load_yaml_str(fm_match.group(1)) or {}
-        except yaml.YAMLError:
-            return
-        if not isinstance(fm, dict):
-            return
-        for message in validate_opencode_frontmatter(fm, source, package_name=package_name):
-            diagnostics.warn(
-                message=message,
+        for notice in notices:
+            diagnostics.lossy_agent_compilation(
+                message=(
+                    f"OpenCode agent {printable_ascii_text(source.name)}: "
+                    f"{printable_ascii_text(notice)}."
+                ),
                 package=printable_ascii_text(package_name),
+                detail=(
+                    "Review the source frontmatter and remove or correct fields "
+                    "that OpenCode cannot represent."
+                ),
             )
 
     # ------------------------------------------------------------------

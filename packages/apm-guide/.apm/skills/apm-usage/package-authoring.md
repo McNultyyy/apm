@@ -434,7 +434,7 @@ frontmatter before deployment:
 
   ```yaml
   # Portable source
-  tools: [read, edit, search, execute, agent, todo, vscode]
+  tools: [read, edit, search, execute, agent]
 
   # Deployed OpenCode frontmatter
   tools:
@@ -446,11 +446,18 @@ frontmatter before deployment:
   ```
 
 - Portable mappings are `search` -> `grep`, `execute`/`shell` -> `bash`, and
-  `agent` -> `task`. Native OpenCode names pass through. Unsupported names,
-  including `todo`, `vscode`, and namespaced MCP tools, are dropped.
+  `agent` -> `task`; `fetch`/`web` -> `webfetch`. Native OpenCode names pass
+  through. If aliases converge on one native tool, `false` wins so an explicit
+  denial cannot be re-enabled.
+- Unsupported names, including `todo`, `vscode`, and namespaced MCP tools,
+  fail closed: APM emits an actionable error and does not deploy that agent.
 - Bare model IDs and Copilot display names resolve to
   `github-copilot/<model-id>`. Explicit `provider/model` values pass through.
-- Unsupported keys and invalid colors are dropped. Valid colors are `#rgb`,
+  For example, `Claude Sonnet 5 (copilot)` becomes
+  `github-copilot/claude-sonnet-5`.
+- `mode` accepts `primary`, `subagent`, or `all` and defaults to `subagent`.
+- Invalid YAML fails closed. Unsupported keys and invalid optional values are
+  dropped with a lossy translation diagnostic. Valid colors are `#rgb`,
   `#rrggbb`, or an OpenCode theme token (`primary`, `secondary`, `accent`,
   `success`, `warning`, `error`, `info`).
 

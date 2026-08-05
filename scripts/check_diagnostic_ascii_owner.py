@@ -3,10 +3,11 @@
 
 ``apm_cli.utils.diagnostics.printable_ascii_text`` owns the normalization
 applied to untrusted package and agent names before they reach diagnostic
-output. The two consumers covered by this boundary must delegate directly:
+output. The AgentIntegrator diagnostic helpers covered by this boundary must
+delegate directly:
 
 * ``AgentIntegrator`` Codex diagnostic rendering; and
-* OpenCode agent frontmatter validation.
+* ``AgentIntegrator`` OpenCode translation diagnostics.
 
 This checker is intentionally narrow. It does not inspect hook event-name or
 SkillSpector output sanitizers because those normalize different values under
@@ -28,14 +29,10 @@ AGENT_CONSUMER = Path("src/apm_cli/integration/agent_integrator.py")
 AGENT_DIAGNOSTIC_FUNCTIONS = {
     "AgentIntegrator._warn_codex_unverified_scope": True,
     "AgentIntegrator._warn_codex_tools_dropped": True,
-    "AgentIntegrator._warn_opencode_frontmatter": False,
+    "AgentIntegrator._warn_opencode_frontmatter": True,
 }
-ALLOWED_IDENTITY_DELEGATES = {
-    "AgentIntegrator._warn_opencode_frontmatter": {"validate_opencode_frontmatter"},
-}
-OPENCODE_CONSUMER = Path("src/apm_cli/integration/opencode_frontmatter.py")
-OPENCODE_FUNCTION = "validate_opencode_frontmatter"
-CONSUMERS = (AGENT_CONSUMER, OPENCODE_CONSUMER)
+ALLOWED_IDENTITY_DELEGATES: dict[str, set[str]] = {}
+CONSUMERS = (AGENT_CONSUMER,)
 RETIRED_SYMBOL = "_ascii_safe_name"
 
 
@@ -118,14 +115,6 @@ def _package_name() -> ast.Name:
     return ast.Name(id="package_name", ctx=ast.Load())
 
 
-def _contains_name(node: ast.AST, name: str) -> bool:
-    """Return whether an expression contains a load of ``name``."""
-    return any(
-        isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id == name
-        for child in ast.walk(node)
-    )
-
-
 def _diagnostic_calls(function: ast.AST) -> list[ast.Call]:
     """Return DiagnosticCollector calls that render one Codex warning."""
     return [
@@ -150,43 +139,6 @@ def _identity_is_directly_owned_in_diagnostic(
         if package_owned and (source_owned or not require_source):
             return True
     return False
-
-
-def _assignments_to(function: ast.AST, name: str) -> list[ast.Assign]:
-    """Return simple assignments to ``name`` in one function scope."""
-    return [
-        node
-        for node in _walk_own_scope(function)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
-    ]
-
-
-def _opencode_identity_flow_is_owned(function: ast.AST) -> bool:
-    """Return whether OpenCode messages derive identity only from the owner."""
-    safe_name_assignments = _assignments_to(function, "safe_name")
-    identifier_assignments = _assignments_to(function, "identifier")
-    if len(safe_name_assignments) != 1 or len(identifier_assignments) != 1:
-        return False
-    if not _is_owner_call(safe_name_assignments[0].value, _source_name()):
-        return False
-    identifier = identifier_assignments[0].value
-    if not any(_is_owner_call(node, _package_name()) for node in ast.walk(identifier)):
-        return False
-    if not _contains_name(identifier, "safe_name"):
-        return False
-    message_appends = [
-        node
-        for node in _walk_own_scope(function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "messages"
-        and node.func.attr == "append"
-    ]
-    return bool(message_appends) and all(
-        _contains_name(call, "identifier") for call in message_appends
-    )
 
 
 def _is_identity(node: ast.AST) -> bool:
@@ -322,11 +274,7 @@ def check(root: Path) -> list[Violation]:
             )
 
         functions = _qualnamed_functions(tree)
-        expected_functions = (
-            AGENT_DIAGNOSTIC_FUNCTIONS.keys()
-            if relative_path == AGENT_CONSUMER
-            else {OPENCODE_FUNCTION}
-        )
+        expected_functions = AGENT_DIAGNOSTIC_FUNCTIONS.keys()
         for qualname in expected_functions:
             function = functions.get(qualname)
             if function is None:
@@ -334,13 +282,9 @@ def check(root: Path) -> list[Violation]:
                     Violation(relative_path, 1, f"required consumer function missing: {qualname}")
                 )
                 continue
-            flow_is_owned = (
-                _identity_is_directly_owned_in_diagnostic(
-                    function,
-                    require_source=AGENT_DIAGNOSTIC_FUNCTIONS[qualname],
-                )
-                if relative_path == AGENT_CONSUMER
-                else _opencode_identity_flow_is_owned(function)
+            flow_is_owned = _identity_is_directly_owned_in_diagnostic(
+                function,
+                require_source=AGENT_DIAGNOSTIC_FUNCTIONS[qualname],
             )
             if not flow_is_owned:
                 violations.append(
@@ -351,19 +295,7 @@ def check(root: Path) -> list[Violation]:
                         f"{OWNER_MODULE}.{OWNER_SYMBOL}",
                     )
                 )
-            output_calls = (
-                _diagnostic_calls(function)
-                if relative_path == AGENT_CONSUMER
-                else [
-                    node
-                    for node in _walk_own_scope(function)
-                    if isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "messages"
-                    and node.func.attr == "append"
-                ]
-            )
+            output_calls = _diagnostic_calls(function)
             for output_call in output_calls:
                 for line in _raw_identity_lines(output_call):
                     violations.append(
