@@ -25,6 +25,22 @@ if TYPE_CHECKING:
     from apm_cli.integration.targets import TargetProfile
     from apm_cli.utils.diagnostics import DiagnosticCollector
 
+# Renamed VSCode Copilot built-in tool names.
+# VSCode Copilot migrated built-in tool identifiers to a namespaced format.
+# Any *.agent.md file deployed to the copilot target has these old names
+# rewritten automatically so the IDE does not emit "Tool or toolset has been
+# renamed" warnings.  Only the tools list in the YAML frontmatter is affected;
+# the source package file is never modified.
+# Ref: https://github.com/microsoft/apm/issues/2465
+GITHUB_AGENT_TOOL_RENAMES: dict[str, str] = {
+    "askQuestions": "vscode/askQuestions",
+    "runInTerminal": "execute/runInTerminal",
+    "getTerminalOutput": "execute/getTerminalOutput",
+    "createFile": "edit/createFile",
+    "fetch": "web/fetch",
+    "listDirectory": "search/listDirectory",
+}
+
 # Kiro capability tags approved for agent 'tools' frontmatter.
 # Source: https://kiro.dev/docs/custom-agents/ (accessed 2026-08-03)
 # Fail closed: any value not in this set blocks deployment of that agent.
@@ -238,6 +254,8 @@ class AgentIntegrator(BaseIntegrator):
                     package_name=package_info.package.name,
                 )
                 links_resolved = 0
+            elif mapping.format_id == "github_agent":
+                links_resolved = self._copy_github_agent(source_file, target_path)
             else:
                 if mapping.format_id == "opencode_agent":
                     self._warn_opencode_frontmatter(
@@ -317,6 +335,68 @@ class AgentIntegrator(BaseIntegrator):
         if source.is_symlink():
             raise ValueError(f"Refusing to read symlink source: {source}")
         content = source.read_text(encoding="utf-8")
+        content, links_resolved = self.resolve_links(content, source, target)
+        write_text_lf(target, content)
+        return links_resolved
+
+    # ------------------------------------------------------------------
+    # GitHub (Copilot) agent transformer -- tool name rewrite
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_github_agent_tool_renames(content: str) -> str:
+        """Rewrite deprecated VSCode built-in tool names in a github_agent file.
+
+        Applies GITHUB_AGENT_TOOL_RENAMES to every entry in the YAML
+        frontmatter ``tools:`` list.  All other frontmatter fields and the
+        entire markdown body are left completely unchanged.  Returns the
+        original *content* unchanged when:
+
+        - the file has no YAML frontmatter
+        - the frontmatter is unparseable
+        - there is no ``tools:`` key
+        - ``tools:`` is null or not a list
+        - no entry in the list matches a known rename
+        """
+        fm_match = AgentIntegrator._FRONTMATTER_RE.match(content)
+        if not fm_match:
+            return content
+        try:
+            fm = load_yaml_str(fm_match.group(1)) or {}
+        except yaml.YAMLError:
+            return content
+        if not isinstance(fm, dict):
+            return content
+        tools_raw = fm.get("tools")
+        if not isinstance(tools_raw, list):
+            return content
+        renamed = [GITHUB_AGENT_TOOL_RENAMES.get(str(t), str(t)) for t in tools_raw]
+        if renamed == [str(t) for t in tools_raw]:
+            return content
+        fm["tools"] = renamed
+        body = content[fm_match.end() :]
+        fm_text = yaml_to_str(fm)
+        return f"---\n{fm_text}---\n{body}"
+
+    def _copy_github_agent(self, source: Path, target: Path) -> int:
+        """Copy a github_agent file, rewriting deprecated tool names.
+
+        Like :meth:`copy_agent` but applies
+        :meth:`_apply_github_agent_tool_renames` before link resolution so
+        that deployed ``*.agent.md`` files use the current VSCode namespaced
+        tool identifiers.
+
+        Args:
+            source: Source ``.agent.md`` file path.
+            target: Destination path under ``.github/agents/``.
+
+        Returns:
+            int: Number of context links resolved.
+        """
+        if source.is_symlink():
+            raise ValueError(f"Refusing to read symlink source: {source}")
+        content = source.read_text(encoding="utf-8")
+        content = self._apply_github_agent_tool_renames(content)
         content, links_resolved = self.resolve_links(content, source, target)
         write_text_lf(target, content)
         return links_resolved
@@ -721,7 +801,7 @@ class AgentIntegrator(BaseIntegrator):
                 ):
                     files_skipped += 1
                     continue
-                links_resolved = self.copy_agent(source_file, target_path)
+                links_resolved = self._copy_github_agent(source_file, target_path)
                 total_links_resolved += links_resolved
                 files_integrated += 1
                 target_paths.append(target_path)

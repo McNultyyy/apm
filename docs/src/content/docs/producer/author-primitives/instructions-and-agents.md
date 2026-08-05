@@ -209,7 +209,7 @@ offending package and field so you can fix the source.
 
 | Target | Output path | Transform |
 |---|---|---|
-| copilot | `.github/agents/<name>.agent.md` | verbatim |
+| copilot | `.github/agents/<name>.agent.md` | deprecated VSCode built-in tool names renamed to namespaced form; content otherwise verbatim |
 | claude | `.claude/agents/<name>.md` | verbatim |
 | grok-build | `.grok/agents/<name>.md` | verbatim |
 | cursor | `.cursor/agents/<name>.md` | verbatim |
@@ -273,6 +273,16 @@ dedicated persona.
   info`). `apm install -t opencode` will warn at install time when
   it detects either shape; the file still deploys but OpenCode will
   refuse to load it.
+- **Old unnamespaced VSCode built-in tool names in a Copilot-targeted
+  agent.** VSCode Copilot renamed its built-in tools to a namespaced
+  format (e.g. `fetch` became `web/fetch`, `runInTerminal` became
+  `execute/runInTerminal`). APM automatically rewrites the six known
+  old names when deploying to the Copilot target, so you do not need
+  to update existing source files. If you author new agents, prefer
+  the current namespaced names to be explicit:
+  `vscode/askQuestions`, `execute/runInTerminal`,
+  `execute/getTerminalOutput`, `edit/createFile`, `web/fetch`,
+  `search/listDirectory`.
 - **Agent body that re-states global instructions.** Agents inherit
   the workspace's compiled context. Restate only what the persona
   needs to *override* or *add*; do not duplicate `python-style`
