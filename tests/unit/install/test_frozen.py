@@ -135,3 +135,46 @@ class TestEnforceFrozen:
             InstallService.enforce_frozen(req)
 
         assert any("stale-mcp" in reason for reason in exc_info.value.reasons)
+
+    def test_repo_root_claude_skill_with_mcp_state_accepted(self, tmp_path: Path):
+        """Regression guard for #2443: repo-root claude_skill + MCP must not fail.
+
+        A repo-root ``claude_skill`` dependency (e.g. ``makinux/adversarial-panel``)
+        has no ``apm.yml`` by design.  When the project also declares MCP servers,
+        ``enforce_frozen`` should not report the missing manifest as lockfile drift.
+        """
+        from apm_cli.integration.mcp_config_view import CurrentMcpConfigView
+
+        _write_apm_yml(tmp_path)
+
+        locked_skill = LockedDependency(
+            repo_url="https://github.com/makinux/adversarial-panel",
+            resolved_ref="main",
+            resolved_commit="a" * 40,
+            package_type="claude_skill",
+            depth=1,
+        )
+        _write_lockfile(tmp_path, [locked_skill])
+
+        lock = LockFile.read(tmp_path / "apm.lock.yaml")
+        assert lock is not None
+        lock.mcp_servers = ["deepwiki"]
+        lock.mcp_configs = {"deepwiki": {"name": "deepwiki"}}
+        lock.save(tmp_path / "apm.lock.yaml")
+
+        dep = DependencyReference(repo_url="https://github.com/makinux/adversarial-panel")
+        req = _make_request(project_dir=tmp_path, manifest_deps=[dep])
+
+        mcp_dep = MagicMock()
+        mcp_dep.name = "deepwiki"
+        req.apm_package.get_all_mcp_dependencies.return_value = [mcp_dep]
+
+        current = CurrentMcpConfigView(
+            dependencies=(),
+            configs={"deepwiki": {"name": "deepwiki"}},
+            provenance={},
+            problems=(),
+        )
+
+        with patch.object(CurrentMcpConfigView, "derive", return_value=current):
+            InstallService.enforce_frozen(req)

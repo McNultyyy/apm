@@ -214,20 +214,31 @@ def _allows_missing_manifest(
     if dependency.package_type == PackageType.SKILL_BUNDLE.value:
         return True
 
+    # A ``claude_skill`` legitimately ships no ``apm.yml`` by design --
+    # whether the dependency is a repo-root reference (``owner/repo``) or a
+    # virtual subdirectory (``owner/repo/path``).  The lockfile records
+    # ``package_type: claude_skill`` for both shapes, and
+    # ``detect_package_type`` classifies them identically via cascade rule 3
+    # (root ``SKILL.md``, no ``apm.yml``).  Gate on the locked package type
+    # rather than on the virtual-type so repo-root skills are not rejected.
+    if dependency.package_type == PackageType.CLAUDE_SKILL.value:
+        # ``apm audit --ci`` may run without materialised ``apm_modules/``:
+        # the drift replay uses a throwaway scratch dir, and a setup-only CI
+        # job never populates the real modules tree.  When the package
+        # directory is absent, fall back to the frozen lockfile
+        # classification.  Once the modules ARE materialised the strict shape
+        # probe still runs and guards against a mislabelled package.
+        if not package_dir.exists():
+            return True
+        package_type, _ = detect_package_type(package_dir)
+        return package_type is PackageType.CLAUDE_SKILL
+
     dependency_ref = dependency.to_dependency_ref()
     if not dependency_ref.is_virtual_subdirectory():
         return False
 
-    # ``apm audit --ci`` runs without materialising ``apm_modules/``: the drift
-    # replay uses a throwaway scratch dir, and a setup-only CI job (install the
-    # CLI, then audit -- no ``apm install``) never populates the real modules
-    # tree.  When the package directory is absent we cannot probe the on-disk
-    # shape, so fall back to the frozen lockfile classification -- a virtual
-    # ``claude_skill`` legitimately ships no ``apm.yml`` by design.  Once the
-    # modules ARE materialised the strict shape probe below still runs and
-    # guards against a mislabeled or malformed installed package.
     if not package_dir.exists():
-        return dependency.package_type == PackageType.CLAUDE_SKILL.value
+        return False
 
     package_type, _ = detect_package_type(package_dir)
     return (
