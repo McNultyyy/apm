@@ -354,3 +354,20 @@ class TestValidateCommand:
         result = runner.invoke(marketplace, ["validate", "acme"])
         assert result.exit_code == 1
         assert "plugins" in result.output.lower()
+
+    @patch("apm_cli.marketplace.client.fetch_marketplace_raw")
+    @patch("apm_cli.marketplace.registry.get_marketplace_by_name")
+    def test_non_dict_root_exits_1(self, mock_get, mock_fetch_raw, runner):
+        """A non-dict root (list, string) must be caught without raising AttributeError."""
+        from apm_cli.commands.marketplace import marketplace
+
+        mock_get.return_value = MarketplaceSource(name="acme", owner="acme-org", repo="plugins")
+        mock_fetch_raw.return_value = [{"name": "a", "source": "owner/a"}]
+        result = runner.invoke(marketplace, ["validate", "acme"])
+        assert result.exit_code == 1
+        assert "Structure" in result.output or "root" in result.output.lower()
+        assert (
+            "object" in result.output.lower()
+            or "dict" in result.output.lower()
+            or "list" in result.output.lower()
+        )

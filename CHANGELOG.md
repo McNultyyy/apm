@@ -31,13 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `apm marketplace validate` now fails with a clear structural error when
-  `marketplace.json` contains a malformed `plugins` field (e.g. a non-list
-  value), instead of silently accepting it as a valid empty manifest. A raw-JSON
-  structural pre-check runs before the permissive parser, surfacing type
-  violations that the parser would otherwise coerce to safe defaults. The
-  permissive runtime parser used by install and search flows is unchanged.
-  (closes #2424)
+- `apm marketplace validate` now rejects structurally invalid `marketplace.json` files (e.g. `plugins` is not a list) instead of silently reporting a false-positive clean result. (#2498)
 - `apm init` and install-time auto-bootstrap now reject empty or
   whitespace-only project names, falling back to `my-project` at a filesystem
   root. APM no longer writes an `apm.yml` that every later install, lock, or

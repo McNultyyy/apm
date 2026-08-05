@@ -38,6 +38,20 @@ def validate(name, check_refs, verbose):
         # Step 2: structural pre-check on the raw dict
         structural_result = validate_raw_marketplace_structure(raw_data)
 
+        # If structural check fails, render the error and exit immediately --
+        # parse_marketplace_json requires a dict and would raise on a non-dict root.
+        if not structural_result.passed:
+            logger.blank_line()
+            logger.progress("Validation Results:", symbol="info")
+            for e in structural_result.errors:
+                logger.error(f"  {structural_result.check_name}: {e}", symbol="error")
+            logger.blank_line()
+            logger.progress(
+                f"Summary: 0 passed, 0 warnings, {len(structural_result.errors)} errors",
+                symbol="info",
+            )
+            sys.exit(1)
+
         # Step 3: permissive parse (may coerce malformed fields to defaults)
         manifest = parse_marketplace_json(raw_data, source.name)
 
