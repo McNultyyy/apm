@@ -16,7 +16,10 @@ OPENCODE_THEME_COLORS = frozenset(
 
 # Hex color regex: #RGB or #RRGGBB, case-insensitive.
 _HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+_FRONTMATTER_RE = re.compile(
+    r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n)?",
+    re.DOTALL,
+)
 _MODEL_PROVIDER_RE = re.compile(r"^(.*?)\s*\(([^()]+)\)\s*$")
 
 _OPENCODE_FRONTMATTER_KEYS = (
@@ -132,9 +135,9 @@ def translate_opencode_agent(content: str) -> OpencodeAgentTranslation:
     elif "color" in metadata:
         notices.append("dropped invalid 'color' value")
 
-    body = content[match.end() :]
+    body = content[match.end() :].lstrip("\r\n")
     rendered_frontmatter = yaml_to_str(translated, sort_keys=False).rstrip()
-    rendered = f"---\n{rendered_frontmatter}\n---\n\n{body.lstrip()}"
+    rendered = f"---\n{rendered_frontmatter}\n---\n\n{body}"
     return OpencodeAgentTranslation(rendered, tuple(notices))
 
 

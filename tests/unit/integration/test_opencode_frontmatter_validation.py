@@ -52,12 +52,12 @@ class TestOpencodeInstallTranslation:
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def _write_agent(self, frontmatter: str) -> Path:
+    def _write_agent(self, frontmatter: str, body: str = "# Demo\n") -> Path:
         pkg = self.project_root / "package"
         agents_dir = pkg / ".apm" / "agents"
         agents_dir.mkdir(parents=True)
         agent_path = agents_dir / "demo.agent.md"
-        agent_path.write_text(f"---\n{frontmatter}\n---\n\n# Demo\n")
+        agent_path.write_text(f"---\n{frontmatter}\n---\n\n{body}")
         return pkg
 
     def test_tools_as_list_translates_without_warning(self):
@@ -113,6 +113,28 @@ class TestOpencodeInstallTranslation:
             },
         }
         assert deployed.content == "# Demo"
+
+    def test_crlf_frontmatter_is_translated(self):
+        pkg = self._write_agent("tools: [read]\n")
+        source = pkg / ".apm" / "agents" / "demo.agent.md"
+        source.write_bytes(source.read_bytes().replace(b"\n", b"\r\n"))
+
+        self.integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["opencode"], _make_package_info(pkg), self.project_root
+        )
+
+        deployed = frontmatter.load(self.project_root / ".opencode" / "agents" / "demo.md")
+        assert deployed.metadata["tools"] == {"read": True}
+
+    def test_body_leading_indentation_is_preserved(self):
+        pkg = self._write_agent("tools: [read]\n", body="    indented code\n")
+
+        self.integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["opencode"], _make_package_info(pkg), self.project_root
+        )
+
+        deployed = self.project_root / ".opencode" / "agents" / "demo.md"
+        assert deployed.read_text(encoding="utf-8").endswith("\n\n    indented code\n")
 
     @pytest.mark.parametrize(
         "tools",
