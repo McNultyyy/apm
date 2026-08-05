@@ -224,6 +224,48 @@ class TestTryAdoptIdenticalDeployMode:
         assert adopted == [target]
 
 
+class TestRenderedAdoptDeployMode:
+    """Pins explicit LF behavior for pre-rendered text artifacts."""
+
+    def test_byte_preserving_mode_adopts_raw_crlf(self, tmp_path: Path) -> None:
+        target = tmp_path / "target.md"
+        target.write_bytes(b"# Agent\r\nbody\r\n")
+        adopted: list[Path] = []
+
+        skip, was_adopted = BaseIntegrator()._check_rendered_adopt_or_skip(
+            target,
+            "# Agent\r\nbody\r\n",
+            "target.md",
+            None,
+            False,
+            None,
+            adopted,
+            lf_normalized_deploy=False,
+        )
+
+        assert (skip, was_adopted) == (True, True)
+        assert adopted == [target]
+
+    def test_lf_normalized_mode_rejects_stale_crlf_target(self, tmp_path: Path) -> None:
+        target = tmp_path / "target.md"
+        target.write_bytes(b"# Agent\r\nbody\r\n")
+        adopted: list[Path] = []
+
+        skip, was_adopted = BaseIntegrator()._check_rendered_adopt_or_skip(
+            target,
+            "# Agent\r\nbody\r\n",
+            "target.md",
+            None,
+            True,
+            None,
+            adopted,
+            lf_normalized_deploy=True,
+        )
+
+        assert (skip, was_adopted) == (False, False)
+        assert adopted == []
+
+
 # ---------------------------------------------------------------------------
 # Instruction integrator -- the user's reproducer (zava-storefront)
 # ---------------------------------------------------------------------------

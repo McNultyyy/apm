@@ -199,6 +199,7 @@ class AgentIntegrator(BaseIntegrator):
                     force,
                     diagnostics,
                     target_paths,
+                    lf_normalized_deploy=self._LF_NORMALIZED_DEPLOY,
                 )
                 if skip:
                     if adopted:
@@ -250,6 +251,7 @@ class AgentIntegrator(BaseIntegrator):
                     force,
                     diagnostics,
                     target_paths,
+                    lf_normalized_deploy=self._LF_NORMALIZED_DEPLOY,
                 )
                 if skip:
                     if adopted:
@@ -373,7 +375,7 @@ class AgentIntegrator(BaseIntegrator):
     ) -> tuple[OpencodeAgentTranslation, int]:
         """Resolve links and translate one portable agent for OpenCode."""
         if source.is_symlink():
-            raise ValueError(f"Refusing to read symlink source: {source}")
+            raise OpencodeAgentTranslationError(f"Refusing to read symlink source: {source}")
         content = source.read_text(encoding="utf-8")
         content, links_resolved = self.resolve_links(content, source, target)
         return translate_opencode_agent(content), links_resolved

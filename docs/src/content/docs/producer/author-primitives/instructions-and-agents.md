@@ -272,9 +272,9 @@ dedicated persona.
   Gemini folds context into `GEMINI.md`. If a persona must reach those
   targets, author it as a skill under `.apm/skills/<name>/SKILL.md`.
 - **Assuming every tool has an OpenCode equivalent.** APM converts portable
-  tool declarations to OpenCode's boolean map and drops unsupported names.
-  Check the mapping above when a restricted agent depends on a target-specific
-  tool.
+  tool declarations to OpenCode's boolean map. If any name has no approved
+  mapping, APM emits an actionable error and does not deploy that agent. Check
+  the mapping above when a restricted agent depends on a target-specific tool.
 - **Agent body that re-states global instructions.** Agents inherit
   the workspace's compiled context. Restate only what the persona
   needs to *override* or *add*; do not duplicate `python-style`

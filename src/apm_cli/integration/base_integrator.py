@@ -438,6 +438,8 @@ class BaseIntegrator:
         force: bool,
         diagnostics,
         target_paths: list[Path],
+        *,
+        lf_normalized_deploy: bool,
     ) -> tuple[bool, bool]:
         """Check adoption and collision for a pre-rendered text artifact.
 
@@ -447,7 +449,12 @@ class BaseIntegrator:
         try:
             if target_path.exists() and not target_path.is_symlink():
                 target_bytes = _read_bytes_no_follow(target_path)
-                rendered_bytes = normalize_crlf_to_lf(rendered_content).encode("utf-8")
+                deployed_content = (
+                    normalize_crlf_to_lf(rendered_content)
+                    if lf_normalized_deploy
+                    else rendered_content
+                )
+                rendered_bytes = deployed_content.encode("utf-8")
                 if target_bytes == rendered_bytes:
                     target_paths.append(target_path)
                     return True, True

@@ -165,6 +165,74 @@ class TestOpencodeInstallTranslation:
         assert len(messages) == 1
         assert "dropped invalid 'model' value" in messages[0]
 
+    @pytest.mark.parametrize(
+        ("field", "yaml_value", "expected"),
+        [
+            ("prompt", "Review changes", "Review changes"),
+            ("temperature", "0.4", 0.4),
+            ("top_p", "0.8", 0.8),
+            ("permission", "{read: allow}", {"read": "allow"}),
+            ("disable", "true", True),
+            ("hidden", "false", False),
+            ("steps", "5", 5),
+        ],
+    )
+    def test_supported_optional_fields_preserve_valid_shapes(
+        self, field: str, yaml_value: str, expected: object
+    ):
+        pkg = self._write_agent(f"{field}: {yaml_value}\n")
+        pkg_info = _make_package_info(pkg)
+        diagnostics = DiagnosticCollector()
+
+        self.integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["opencode"], pkg_info, self.project_root, diagnostics=diagnostics
+        )
+
+        deployed = frontmatter.load(self.project_root / ".opencode" / "agents" / "demo.md")
+        assert deployed.metadata[field] == expected
+        assert diagnostics.has_diagnostics is False
+
+    @pytest.mark.parametrize(
+        ("field", "yaml_value"),
+        [
+            ("prompt", "[not, text]"),
+            ("temperature", "true"),
+            ("top_p", "not-a-number"),
+            ("permission", "allow"),
+            ("disable", '"yes"'),
+            ("hidden", "1"),
+            ("steps", "0"),
+        ],
+    )
+    def test_invalid_optional_field_shapes_are_diagnosed(self, field: str, yaml_value: str):
+        pkg = self._write_agent(f"{field}: {yaml_value}\n")
+        pkg_info = _make_package_info(pkg)
+        diagnostics = DiagnosticCollector()
+
+        self.integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["opencode"], pkg_info, self.project_root, diagnostics=diagnostics
+        )
+
+        deployed = frontmatter.load(self.project_root / ".opencode" / "agents" / "demo.md")
+        assert field not in deployed.metadata
+        messages = _messages(diagnostics, "agent_lossy_compilation")
+        assert len(messages) == 1
+        assert f"dropped invalid '{field}' value" in messages[0]
+
+    @pytest.mark.parametrize(
+        ("source_mode", "expected"), [("primary", "primary"), ("bad", "subagent")]
+    )
+    def test_mode_translation(self, source_mode: str, expected: str):
+        pkg = self._write_agent(f"mode: {source_mode}\n")
+        pkg_info = _make_package_info(pkg)
+
+        self.integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["opencode"], pkg_info, self.project_root
+        )
+
+        deployed = frontmatter.load(self.project_root / ".opencode" / "agents" / "demo.md")
+        assert deployed.metadata["mode"] == expected
+
     def test_tools_as_dict_preserves_false(self):
         pkg = self._write_agent("tools:\n  Read: true\n  Grep: false\n")
         pkg_info = _make_package_info(pkg)

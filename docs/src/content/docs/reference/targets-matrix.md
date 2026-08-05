@@ -212,7 +212,10 @@ OpenCode.
 - **Deploy directory.** `.opencode/` at project scope; `~/.config/opencode/` at user scope.
 - **Supported primitives.** agents, commands, skills, mcp.
 - **File conventions.**
-  - agents: `.opencode/agents/<name>.md`
+  - agents: `.opencode/agents/<name>.md`; APM translates portable model,
+    tools, mode, color, and supported fields into OpenCode frontmatter.
+    Unsupported tool names or invalid YAML fail closed and do not deploy the
+    agent. See [Agent workflows](../producer/author-primitives/instructions-and-agents/#agents).
   - commands: `.opencode/commands/<name>.md`
   - skills: `.agents/skills/<name>/SKILL.md`
 - **Caveat.** OpenCode has no hooks concept; the `hooks` primitive is silently skipped for this target.

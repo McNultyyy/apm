@@ -102,7 +102,9 @@ Notes per target:
 - **codex** -- Codex CLI. Agents and hooks use TOML; skills use the cross-tool `.agents/` directory.
 - **gemini** -- Gemini CLI. Commands are TOML. Hooks merge into `.gemini/settings.json`. No native agents or instructions primitives -- both arrive via compiled context files.
 - **antigravity** -- Google Antigravity CLI (`agy`), successor to Gemini CLI. Explicit-only target (`--target antigravity`); the `.agents/` root is shared, so it is never auto-detected and is not part of `--target all`. Instructions deploy as rules under `.agents/rules/`. Skills use `.agents/skills/`. Hooks use Antigravity's native `.agents/hooks.json` schema. MCP servers write to a dedicated `.agents/mcp_config.json`. No commands primitive (legacy Gemini commands convert to skills upstream).
-- **opencode** -- OpenCode. No hooks support.
+- **opencode** -- OpenCode. Agent model, tools, mode, color, and supported
+  fields compile to native frontmatter; unsupported tool names fail closed.
+  No hooks support.
 - **windsurf** -- Windsurf / Cascade. No native agents primitive -- Cascade auto-invokes any `SKILL.md` by its `description:` frontmatter, so personas ship as skills. Workflows are the harness's name for commands.
 - **kiro** -- Kiro IDE/CLI v3. Instructions become steering files, skills stay as `SKILL.md` folders, hooks are individual JSON files, MCP lands in `.kiro/settings/mcp.json`, and agents deploy to `.kiro/agents/<stem>.md` with frontmatter filtered to `description`, `model`, and `tools` only.
 
@@ -133,7 +135,10 @@ How to read a cell:
 - `prompts / claude = compiled` -- APM transforms `.apm/prompts/<n>.prompt.md` into `.claude/commands/<n>.md`. The prompt becomes a `/command`.
 - `agents / gemini = unsupported` -- Gemini CLI has no agents primitive; APM does not deliver `.agent.md` files to it. Their content still reaches Gemini through the compiled `GEMINI.md` if referenced from instructions.
 - `agents / antigravity = unsupported` -- Antigravity CLI has no agents primitive; their content reaches Antigravity through the compiled `AGENTS.md`.
-- `agents / opencode = compiled` -- APM maps portable model, tool, mode, color, and supported frontmatter fields into OpenCode's native agent schema.
+- `agents / opencode = compiled` -- APM maps portable model, tool, mode, color,
+  and supported frontmatter fields into OpenCode's native agent schema;
+  unsupported tool names fail closed. See
+  [targets-matrix](/apm/reference/targets-matrix/#opencode).
 - `agents / kiro = compiled` -- APM writes `.kiro/agents/<relative-stem>.md`; frontmatter is filtered to `description`, `model`, and `tools` (unsupported tool values fail the deploy). See [targets-matrix](/apm/reference/targets-matrix/#kiro) for the approved tool set.
 - `instructions / antigravity = native` -- APM deploys instructions as plain-markdown rules under `.agents/rules/`.
 - `commands / copilot = unsupported` -- Copilot has no commands primitive; the same source `.prompt.md` reaches Copilot as a native prompt instead.
