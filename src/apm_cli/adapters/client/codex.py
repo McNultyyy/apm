@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
 
+from ...install.mcp.registry import _is_local_or_metadata_host
 from ...registry.client import SimpleRegistryClient
 from ...registry.integration import RegistryIntegration
 from ...utils.atomic_io import atomic_write_text
@@ -263,11 +264,12 @@ class CodexClientAdapter(MCPClientAdapter):
                 )
                 return None
 
-            scheme = urlparse(remote_url).scheme.lower()
-            if scheme != "https":
+            parsed_remote = urlparse(remote_url)
+            scheme = parsed_remote.scheme.lower()
+            if scheme != "https" and not _is_local_or_metadata_host(parsed_remote.hostname):
                 _rich_warning(
                     f"Skipping MCP server '{server_name}' for Codex CLI: remote URL "
-                    f"must use https:// (got {scheme or 'no scheme'}).",
+                    f"must use https:// for non-local hosts (got {scheme or 'no scheme'}).",
                     symbol="warning",
                 )
                 return None
