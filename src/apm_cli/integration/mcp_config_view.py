@@ -214,6 +214,19 @@ def _allows_missing_manifest(
     if dependency.package_type == PackageType.SKILL_BUNDLE.value:
         return True
 
+    # A git- or registry-sourced apm_package dep whose directory is absent
+    # is in a cold-cache state: the package has not been fetched yet.
+    # ``apm install --frozen`` (and ``apm audit --ci``) will hydrate it from
+    # the lock pins, so the absent manifest is not drift -- it is simply
+    # pending installation.  Local apm_package deps must always exist (they
+    # are path-anchored to the developer's filesystem) and are NOT exempted.
+    if (
+        not package_dir.exists()
+        and dependency.package_type == PackageType.APM_PACKAGE.value
+        and dependency.source != "local"
+    ):
+        return True
+
     dependency_ref = dependency.to_dependency_ref()
     if not dependency_ref.is_virtual_subdirectory():
         return False

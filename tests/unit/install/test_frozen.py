@@ -135,3 +135,109 @@ class TestEnforceFrozen:
             InstallService.enforce_frozen(req)
 
         assert any("stale-mcp" in reason for reason in exc_info.value.reasons)
+
+
+class TestEnforceFrozenColdCache:
+    """Regression tests for #2456: --frozen on a cold cache with git apm_package deps."""
+
+    def _make_git_apm_package_dep(self) -> LockedDependency:
+        return LockedDependency(
+            repo_url="owner/some-pkg",
+            resolved_ref="v1.0.0",
+            resolved_commit="a" * 40,
+            package_type="apm_package",
+            depth=1,
+        )
+
+    def test_cold_cache_git_apm_package_dep_passes(self, tmp_path: Path) -> None:
+        """--frozen passes on a cold cache when a git apm_package dep dir is absent.
+
+        Before the fix this raised FrozenInstallError with a McpSourceProblem
+        because _collect_locked_dependencies could not read the absent apm.yml.
+        """
+        _write_apm_yml(tmp_path)
+        dep = self._make_git_apm_package_dep()
+        _write_lockfile(tmp_path, [dep])
+
+        # Lockfile has MCP state (root-declared) to trigger the MCP check path.
+        lock = LockFile.read(tmp_path / "apm.lock.yaml")
+        assert lock is not None
+        lock.mcp_servers = ["root-mcp"]
+        lock.mcp_configs = {"root-mcp": {"name": "root-mcp"}}
+        lock.save(tmp_path / "apm.lock.yaml")
+
+        manifest_dep = DependencyReference(repo_url="owner/some-pkg")
+        req = _make_request(project_dir=tmp_path, manifest_deps=[manifest_dep])
+        # Root manifest declares the MCP server directly.
+        from apm_cli.models.dependency.mcp import MCPDependency
+
+        req.apm_package.get_all_mcp_dependencies.return_value = [MCPDependency(name="root-mcp")]
+
+        # Must not raise: the absent apm_package dep dir is a cold-cache artifact.
+        InstallService.enforce_frozen(req)
+
+    def test_cold_cache_git_apm_package_with_own_mcp_passes(self, tmp_path: Path) -> None:
+        """--frozen passes when the absent apm_package dep itself declared MCP.
+
+        The dep's MCP servers are stored in lockfile.mcp_configs and will be
+        hydrated by the frozen install.  They must not appear as lock_only drift.
+        """
+        _write_apm_yml(tmp_path)
+        dep = self._make_git_apm_package_dep()
+        dep_name = dep.to_dependency_ref().get_install_path(tmp_path / "apm_modules").name
+        _write_lockfile(tmp_path, [dep])
+
+        lock = LockFile.read(tmp_path / "apm.lock.yaml")
+        assert lock is not None
+        lock.mcp_servers = ["pkg-mcp"]
+        lock.mcp_configs = {"pkg-mcp": {"name": "pkg-mcp"}}
+        # Provenance marks the server as contributed by the absent package.
+        lock.mcp_config_provenance = {"pkg-mcp": dep_name}
+        lock.save(tmp_path / "apm.lock.yaml")
+
+        manifest_dep = DependencyReference(repo_url="owner/some-pkg")
+        req = _make_request(project_dir=tmp_path, manifest_deps=[manifest_dep])
+        req.apm_package.get_all_mcp_dependencies.return_value = []
+
+        # Must not raise: pkg-mcp is exclusively from the absent dep (cold cache).
+        InstallService.enforce_frozen(req)
+
+    def test_cold_cache_does_not_mask_real_mcp_drift_from_installed_dep(
+        self, tmp_path: Path
+    ) -> None:
+        """Real MCP drift from an INSTALLED dep is still caught on cold cache.
+
+        The cold-cache exemption only covers absent packages; installed packages
+        with stale MCP in the lockfile must still fail.
+        """
+        from apm_cli.integration.mcp_config_view import CurrentMcpConfigView
+
+        _write_apm_yml(tmp_path)
+        absent_dep = self._make_git_apm_package_dep()
+        _write_lockfile(tmp_path, [absent_dep])
+
+        lock = LockFile.read(tmp_path / "apm.lock.yaml")
+        assert lock is not None
+        # stale-mcp has no provenance entry -> cannot be attributed to absent dep.
+        lock.mcp_servers = ["stale-mcp"]
+        lock.mcp_configs = {"stale-mcp": {"name": "stale-mcp"}}
+        lock.mcp_config_provenance = {}
+        lock.save(tmp_path / "apm.lock.yaml")
+
+        manifest_dep = DependencyReference(repo_url="owner/some-pkg")
+        req = _make_request(project_dir=tmp_path, manifest_deps=[manifest_dep])
+        req.apm_package.get_all_mcp_dependencies.return_value = []
+        current = CurrentMcpConfigView(
+            dependencies=(),
+            configs={},
+            provenance={},
+            problems=(),
+        )
+
+        with (
+            patch.object(CurrentMcpConfigView, "derive", return_value=current),
+            pytest.raises(FrozenInstallError, match="out of sync") as exc_info,
+        ):
+            InstallService.enforce_frozen(req)
+
+        assert any("stale-mcp" in reason for reason in exc_info.value.reasons)
