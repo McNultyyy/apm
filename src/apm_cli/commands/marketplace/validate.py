@@ -21,14 +21,25 @@ def validate(name, check_refs, verbose):
     """Validate the manifest of a registered marketplace."""
     logger = CommandLogger("marketplace-validate", verbose=verbose)
     try:
-        from ...marketplace.client import fetch_marketplace
+        from ...marketplace.client import fetch_marketplace_raw
+        from ...marketplace.models import parse_marketplace_json
         from ...marketplace.registry import get_marketplace_by_name
-        from ...marketplace.validator import validate_marketplace
+        from ...marketplace.validator import (
+            validate_marketplace,
+            validate_raw_marketplace_structure,
+        )
 
         source = get_marketplace_by_name(name)
         logger.start(f"Validating marketplace '{name}'...", symbol="gear")
 
-        manifest = fetch_marketplace(source, force_refresh=True)
+        # Step 1: fetch raw JSON dict (no permissive parsing yet)
+        raw_data = fetch_marketplace_raw(source, force_refresh=True)
+
+        # Step 2: structural pre-check on the raw dict
+        structural_result = validate_raw_marketplace_structure(raw_data)
+
+        # Step 3: permissive parse (may coerce malformed fields to defaults)
+        manifest = parse_marketplace_json(raw_data, source.name)
 
         logger.progress(
             f"Found {len(manifest.plugins)} plugins",
@@ -41,8 +52,8 @@ def validate(name, check_refs, verbose):
                 source_type = "dict" if isinstance(p.source, dict) else "string"
                 logger.verbose_detail(f"    {p.name}: source type: {source_type}")
 
-        # Run validation
-        results = validate_marketplace(manifest)
+        # Step 4: business-rule validation on the parsed manifest
+        business_results = validate_marketplace(manifest)
 
         # Check-refs placeholder
         if check_refs:
@@ -51,7 +62,8 @@ def validate(name, check_refs, verbose):
                 symbol="warning",
             )
 
-        # Render results
+        # Render results (structural check first, then business rules)
+        results = [structural_result, *business_results]
         passed = 0
         warning_count = 0
         error_count = 0
