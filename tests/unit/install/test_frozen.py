@@ -241,3 +241,55 @@ class TestEnforceFrozenColdCache:
             InstallService.enforce_frozen(req)
 
         assert any("stale-mcp" in reason for reason in exc_info.value.reasons)
+
+    def test_co_owned_server_not_exempted_by_cold_cache(self, tmp_path: Path) -> None:
+        """A server co-owned by an absent dep AND another owner is NOT cold-cache exempt.
+
+        The issubset guard ensures only servers whose EVERY owner is absent are
+        augmented. A co-owned server must remain subject to live comparison so
+        that real drift introduced by the non-absent co-owner is not silently
+        dropped. This regression-traps the issubset check in
+        _absent_apm_package_mcp_configs.
+        """
+        from apm_cli.integration.mcp_config_view import CurrentMcpConfigView
+
+        _write_apm_yml(tmp_path)
+        dep = self._make_git_apm_package_dep()
+        dep_name = dep.to_dependency_ref().get_install_path(tmp_path / "apm_modules").name
+        _write_lockfile(tmp_path, [dep])
+
+        lock = LockFile.read(tmp_path / "apm.lock.yaml")
+        assert lock is not None
+        # server-a: exclusively owned by absent dep -> should be augmented (no drift)
+        # server-b: co-owned by absent dep + another owner -> NOT augmented
+        lock.mcp_servers = ["server-a", "server-b"]
+        lock.mcp_configs = {
+            "server-a": {"name": "server-a"},
+            "server-b": {"name": "server-b"},
+        }
+        lock.mcp_config_provenance = {
+            "server-a": dep_name,
+            "server-b": [dep_name, "some-other-present-owner"],
+        }
+        lock.save(tmp_path / "apm.lock.yaml")
+
+        manifest_dep = DependencyReference(repo_url="owner/some-pkg")
+        req = _make_request(project_dir=tmp_path, manifest_deps=[manifest_dep])
+        req.apm_package.get_all_mcp_dependencies.return_value = []
+        current = CurrentMcpConfigView(
+            dependencies=(),
+            configs={},
+            provenance={},
+            problems=(),
+        )
+
+        with (
+            patch.object(CurrentMcpConfigView, "derive", return_value=current),
+            pytest.raises(FrozenInstallError, match="out of sync") as exc_info,
+        ):
+            InstallService.enforce_frozen(req)
+
+        # server-b must appear as lock_only drift (it was NOT exempted)
+        assert any("server-b" in reason for reason in exc_info.value.reasons)
+        # server-a is exclusively absent and should NOT produce a drift reason
+        assert not any("server-a" in reason for reason in exc_info.value.reasons)
