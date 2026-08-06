@@ -1556,3 +1556,28 @@ class TestGithubAgentToolRenames:
                 f"Old YAML item '- {old}' still present in deployed file"
             )
             assert new in deployed, f"New name {new!r} missing in deployed file"
+
+    def test_non_string_tool_entries_pass_through_unchanged(self):
+        """Non-string entries in the tools list are preserved without coercion.
+
+        The isinstance(t, str) guard means mapping nodes, sequences, and other
+        non-string YAML values must survive the rename pass intact, even when
+        they appear alongside renamed string entries.
+        """
+        content = (
+            "---\n"
+            "description: Mixed tools\n"
+            "tools:\n"
+            "  - askQuestions\n"
+            "  - {name: customTool, description: My tool}\n"
+            "  - fetch\n"
+            "---\n"
+            "Body.\n"
+        )
+        result = AgentIntegrator._apply_github_agent_tool_renames(content)
+        # String entries that match the rename map are rewritten.
+        assert "vscode/askQuestions" in result
+        assert "web/fetch" in result
+        # Non-string mapping entry must survive -- it is not stringified.
+        assert "name: customTool" in result
+        assert "description: My tool" in result

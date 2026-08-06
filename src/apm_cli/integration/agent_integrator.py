@@ -255,7 +255,12 @@ class AgentIntegrator(BaseIntegrator):
                 )
                 links_resolved = 0
             elif mapping.format_id == "github_agent":
-                links_resolved = self._copy_github_agent(source_file, target_path)
+                links_resolved = self._copy_github_agent(
+                    source_file,
+                    target_path,
+                    diagnostics=diagnostics,
+                    package_name=package_info.package.name,
+                )
             else:
                 if mapping.format_id == "opencode_agent":
                     self._warn_opencode_frontmatter(
@@ -388,7 +393,13 @@ class AgentIntegrator(BaseIntegrator):
         fm_text = yaml_to_str(fm)
         return f"---\n{fm_text}---\n{body}"
 
-    def _copy_github_agent(self, source: Path, target: Path) -> int:
+    def _copy_github_agent(
+        self,
+        source: Path,
+        target: Path,
+        diagnostics: DiagnosticCollector | None = None,
+        package_name: str = "",
+    ) -> int:
         """Copy a github_agent file, rewriting deprecated tool names.
 
         Like :meth:`copy_agent` but applies
@@ -396,9 +407,14 @@ class AgentIntegrator(BaseIntegrator):
         that deployed ``*.agent.md`` files use the current VSCode namespaced
         tool identifiers.
 
+        When ``diagnostics`` is supplied and renames occur, an info-level
+        diagnostic is emitted naming the file and the count of rewrites.
+
         Args:
             source: Source ``.agent.md`` file path.
             target: Destination path under ``.github/agents/``.
+            diagnostics: Optional collector for user-visible messages.
+            package_name: Package name for diagnostic context.
 
         Returns:
             int: Number of context links resolved.
@@ -406,8 +422,17 @@ class AgentIntegrator(BaseIntegrator):
         if source.is_symlink():
             raise ValueError(f"Refusing to read symlink source: {source}")
         content = source.read_text(encoding="utf-8")
-        content = self._apply_github_agent_tool_renames(content)
-        content, links_resolved = self.resolve_links(content, source, target)
+        renamed = self._apply_github_agent_tool_renames(content)
+        if renamed is not content and diagnostics is not None:
+            count = sum(1 for old in GITHUB_AGENT_TOOL_RENAMES if old in content)
+            diagnostics.info(
+                message=(
+                    f"{source.name}: rewrote {count} deprecated"
+                    f" VSCode tool name(s) to namespaced form"
+                ),
+                package=printable_ascii_text(package_name),
+            )
+        content, links_resolved = self.resolve_links(renamed, source, target)
         write_text_lf(target, content)
         return links_resolved
 
@@ -811,7 +836,12 @@ class AgentIntegrator(BaseIntegrator):
                 ):
                     files_skipped += 1
                     continue
-                links_resolved = self._copy_github_agent(source_file, target_path)
+                links_resolved = self._copy_github_agent(
+                    source_file,
+                    target_path,
+                    diagnostics=diagnostics,
+                    package_name=package_info.package.name,
+                )
                 total_links_resolved += links_resolved
                 files_integrated += 1
                 target_paths.append(target_path)
