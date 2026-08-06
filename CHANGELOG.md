@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `apm install --frozen` no longer rejects repo-root `claude_skill`
+  dependencies (e.g. `owner/repo` without a virtual path) that legitimately
+  ship no `apm.yml`. The `_allows_missing_manifest` helper now checks the
+  locked package type before the virtual-subdirectory gate, consistent with
+  how `skill_bundle` is handled. (by @sergio-sisternes-epam, closes #2443)
+
 ## [0.28.0] - 2026-08-04
 
 ### Added
