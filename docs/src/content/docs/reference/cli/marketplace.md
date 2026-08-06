@@ -171,7 +171,7 @@ Unregister a marketplace.
 
 ### `apm marketplace validate NAME`
 
-Validate the manifest of a registered marketplace against the schema.
+Validate the manifest of a registered marketplace against the schema. The command runs a two-layer check: first a structural pre-check that rejects a malformed `marketplace.json` root (e.g. `plugins` is not a list or the root is not an object), then the full business-rules validation pass.
 
 ### `apm marketplace init`
 
