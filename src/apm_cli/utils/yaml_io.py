@@ -104,40 +104,45 @@ class _BoundedSafeLoader(yaml.SafeLoader):
         possible.  Anchor-free documents are pure trees whose node objects are
         never shared, so this returns False for them.
 
-        The traversal uses two sets:
+        The traversal is iterative (no Python recursion) so it is safe for
+        deeply nested anchor-free documents that would otherwise hit the
+        default 1000-frame recursion limit.  It uses two sets:
 
-        * ``stack`` -- node IDs currently on the active recursion path.  A
-          hit here means a back-edge (cycle / self-referential anchor).
-        * ``seen`` -- node IDs already fully visited from a prior path.  A
-          hit here means a cross-edge (classic alias, reachable from two
-          different parents).
+        * ``active`` -- node IDs currently on the active DFS path (pre-order
+          entered, post-order not yet exited).  A hit here means a back-edge
+          (cycle / self-referential anchor).
+        * ``seen`` -- node IDs fully visited from a previous DFS path.  A hit
+          here means a cross-edge (classic alias reachable from two parents).
 
-        Both cases mean shared nodes are present; we return True immediately.
+        Both cases indicate shared nodes; we return True immediately.
         """
         seen: set[int] = set()
-        stack: set[int] = set()
-
-        def visit(node: Any) -> bool:
+        active: set[int] = set()
+        # Work stack entries: (node, entering).
+        #   entering=True  -> first visit; check for alias, push exit + children.
+        #   entering=False -> post-visit; move node from active to seen.
+        work: list[tuple[yaml.nodes.Node, bool]] = [(root, True)]
+        while work:
+            node, entering = work.pop()
             nid = id(node)
-            if nid in stack or nid in seen:
-                return True
-            stack.add(nid)
-            found = False
-            if isinstance(node, yaml.nodes.MappingNode):
-                for key_node, value_node in node.value:
-                    if visit(key_node) or visit(value_node):
-                        found = True
-                        break
-            elif isinstance(node, yaml.nodes.SequenceNode):
-                for child in node.value:
-                    if visit(child):
-                        found = True
-                        break
-            stack.discard(nid)
-            seen.add(nid)
-            return found
-
-        return visit(root)
+            if entering:
+                if nid in active or nid in seen:
+                    return True
+                active.add(nid)
+                # Schedule post-visit before children so it fires after them.
+                work.append((node, False))
+                if isinstance(node, yaml.nodes.MappingNode):
+                    # Push in reverse so leftmost key is processed first.
+                    for key_node, value_node in reversed(node.value):
+                        work.append((value_node, True))
+                        work.append((key_node, True))
+                elif isinstance(node, yaml.nodes.SequenceNode):
+                    for child in reversed(node.value):
+                        work.append((child, True))
+            else:
+                active.discard(nid)
+                seen.add(nid)
+        return False
 
     def _guard_expansion(self, root: Any) -> None:
         # Two-budget alias-expansion guard (issue #2389):
