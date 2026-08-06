@@ -661,8 +661,11 @@ class TestMarketplaceAdd:
     def test_add_ssh_protocol_url_parsed_as_git(self, runner: CliRunner, tmp_path: Path) -> None:
         """ssh:// URLs survive the full CLI wiring and are classified as kind=git.
 
-        Regression: before fix #2464, ssh:// was silently misparsed as shorthand,
-        treating 'ssh:' as the owner and producing https://github.com/ssh:/... .
+        Regression trap for #2464: before the fix, ssh:// was silently misparsed
+        as shorthand, treating 'ssh:' as the owner and producing
+        https://github.com/ssh:/git@gitea.example.com:7999/org/repo.git.
+        The original ssh:// URL must be preserved verbatim in the MarketplaceSource
+        handed to add_marketplace -- proving the ssh:// branch fired end-to-end.
         """
         manifest = _fake_manifest("repo")
         host_info = MagicMock()
@@ -681,7 +684,7 @@ class TestMarketplaceAdd:
                     "apm_cli.marketplace.client.fetch_marketplace",
                     return_value=manifest,
                 ),
-                patch("apm_cli.marketplace.registry.add_marketplace"),
+                patch("apm_cli.marketplace.registry.add_marketplace") as mock_add,
             ):
                 result = runner.invoke(
                     cli,
@@ -691,13 +694,15 @@ class TestMarketplaceAdd:
                         "ssh://git@gitea.example.com:7999/org/repo.git",
                     ],
                 )
-        # Parser must not silently misparse; non-zero means the URL itself
-        # was rejected (acceptable only if an upstream guard fires before
-        # the mocked path). Assert at minimum the old broken behaviour is gone:
-        # the command must NOT error with "github" in its output (which would
-        # mean ssh: was misread as the owner and github.com was assumed).
-        assert "github.com/ssh:" not in result.output
-        assert "https://github.com/ssh:" not in result.output
+        assert result.exit_code == 0, f"Expected success, got {result.exit_code}: {result.output}"
+        assert mock_add.called, "add_marketplace was not called"
+        # The ssh:// branch returns the URL untouched; the shorthand fallback
+        # would have produced https://github.com/ssh:/... -- assert fix fired.
+        registered_url = mock_add.call_args[0][0].url
+        assert registered_url.startswith("ssh://"), (
+            f"Expected url starting with 'ssh://', got: {registered_url!r}. "
+            "Shorthand fallback (pre-fix #2464 behaviour) may have run instead."
+        )
 
 
 # ===========================================================================
