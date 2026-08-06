@@ -94,7 +94,7 @@ class _BoundedSafeLoader(yaml.SafeLoader):
         )
 
     @staticmethod
-    def _has_aliases(root: Any) -> bool:
+    def _has_aliases(root: yaml.nodes.Node) -> bool:
         """Return True if the composed node graph contains any shared nodes.
 
         PyYAML represents every ``*alias`` reference as a pointer to the same
