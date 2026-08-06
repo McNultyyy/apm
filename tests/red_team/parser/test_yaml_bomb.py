@@ -182,16 +182,21 @@ def test_merge_key_bomb_still_rejected(tmp_path: Path):
 
     A merge-key chain (``<<: [*a, *a]`` at each level) uses aliases AND the
     ``<<`` merge key, so both the alias check and the merge-entry guard engage.
-    The merge-entry guard fires first and must raise ``yaml.YAMLError``.
-    This verifies the two-budget refactor did not break the orthogonal
-    ``flatten_mapping`` / merge-entry guard path.
+    The level count is chosen so that the per-node expansion weight stays under
+    the 5M alias-expansion budget (levels=17 yields ~2.6M combined weight) while
+    the doubling merge entries (2**17 = 131,072 > 100,000) trigger the
+    merge-entry budget first.  This verifies the two-budget refactor did not
+    break the orthogonal ``flatten_mapping`` / merge-entry guard path.
     """
     import yaml
 
     from apm_cli.utils.yaml_io import load_yaml
 
-    # 30 levels of doubling merge: 2**30 > 1_000_000_000 total entries.
-    levels = 30
+    # 17 levels of doubling merge: 2**17 = 131_072 > _MAX_MERGE_ENTRIES (100_000).
+    # Combined expansion weight is ~2.6M -- below the 5M alias-expansion cap --
+    # so the merge-entry budget fires first and the alias-expansion guard is a
+    # no-op for this case.
+    levels = 17
     lines = ["a0: &a0\n  x: 1\n"]
     prev = "a0"
     for i in range(1, levels + 1):
@@ -204,4 +209,7 @@ def test_merge_key_bomb_still_rejected(tmp_path: Path):
     assert finished, "load_yaml hung on merge-key bomb"
     assert isinstance(exc, yaml.YAMLError), (
         f"merge-key bomb must be rejected with yaml.YAMLError, got {exc!r}"
+    )
+    assert "merge-key expansion exceeded the safe budget" in str(exc), (
+        f"merge-entry guard must fire first, not alias-expansion guard; got {exc!r}"
     )
