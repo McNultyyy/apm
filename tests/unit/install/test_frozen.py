@@ -293,3 +293,50 @@ class TestEnforceFrozenColdCache:
         assert any("server-b" in reason for reason in exc_info.value.reasons)
         # server-a is exclusively absent and should NOT produce a drift reason
         assert not any("server-a" in reason for reason in exc_info.value.reasons)
+
+    def test_cold_cache_mcp_restoration_emits_verbose_log(self, tmp_path: Path) -> None:
+        """enforce_frozen emits a verbose_detail log when cold-cache MCP servers are restored (DX-3).
+
+        This regression-traps the request.logger.verbose_detail() call added in
+        _absent_apm_package_mcp_configs augmentation path. If the call is removed,
+        the assertion on verbose_messages fails.
+        """
+        from apm_cli.core.command_logger import InstallLogger
+
+        class _RecordingInstallLogger(InstallLogger):
+            def __init__(self) -> None:
+                super().__init__(verbose=True)
+                self.verbose_messages: list[str] = []
+
+            def verbose_detail(self, message: str) -> None:
+                self.verbose_messages.append(message)
+
+        _write_apm_yml(tmp_path)
+        dep = self._make_git_apm_package_dep()
+        dep_name = dep.to_dependency_ref().get_install_path(tmp_path / "apm_modules").name
+        _write_lockfile(tmp_path, [dep])
+
+        lock = LockFile.read(tmp_path / "apm.lock.yaml")
+        assert lock is not None
+        lock.mcp_servers = ["pkg-mcp"]
+        lock.mcp_configs = {"pkg-mcp": {"name": "pkg-mcp"}}
+        lock.mcp_config_provenance = {"pkg-mcp": dep_name}
+        lock.save(tmp_path / "apm.lock.yaml")
+
+        manifest_dep = DependencyReference(repo_url="owner/some-pkg")
+        recording_logger = _RecordingInstallLogger()
+        pkg = MagicMock()
+        pkg.package_path = tmp_path / "apm.yml"
+        pkg.get_apm_dependencies.return_value = [manifest_dep]
+        pkg.get_dev_apm_dependencies.return_value = []
+        pkg.get_all_mcp_dependencies.return_value = []
+        req = InstallRequest(apm_package=pkg, frozen=True, logger=recording_logger)
+
+        InstallService.enforce_frozen(req)
+
+        cold_cache_logs = [
+            m for m in recording_logger.verbose_messages if "cold-cache" in m.lower()
+        ]
+        assert len(cold_cache_logs) >= 1, (
+            f"Expected at least one cold-cache verbose log from enforce_frozen; got: {recording_logger.verbose_messages}"
+        )

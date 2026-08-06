@@ -209,6 +209,7 @@ def _package_manifest_path(
 def _allows_missing_manifest(
     dependency: LockedDependency,
     package_dir: Path,
+    logger: _McpViewLogger | None = None,
 ) -> bool:
     """Return whether the package contract permits an absent apm.yml."""
     if dependency.package_type == PackageType.SKILL_BUNDLE.value:
@@ -225,6 +226,12 @@ def _allows_missing_manifest(
         and dependency.package_type == PackageType.APM_PACKAGE.value
         and dependency.source != "local"
     ):
+        if logger is not None:
+            dep_label = dependency.name or package_dir.name
+            logger.verbose_detail(
+                f"Skipping MCP check for '{dep_label}' -- "
+                "package dir absent (cold cache; will hydrate from lock pins)"
+            )
         return True
 
     dependency_ref = dependency.to_dependency_ref()
@@ -299,7 +306,7 @@ def _collect_locked_dependencies(
             continue
 
         if not manifest_path.exists():
-            if _allows_missing_manifest(dependency, manifest_path.parent):
+            if _allows_missing_manifest(dependency, manifest_path.parent, logger):
                 continue
             problems.append(
                 McpSourceProblem(

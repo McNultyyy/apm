@@ -317,6 +317,12 @@ class InstallService:
             # the derived current state with those stored configs so the comparison
             # produces no false lock_only entries for cold-cache hydration targets.
             cold_cache_mcp = _absent_apm_package_mcp_configs(lockfile, modules_dir)
+            if cold_cache_mcp and request.logger is not None:
+                request.logger.verbose_detail(
+                    f"Restoring {len(cold_cache_mcp)} cold-cache MCP server(s) "
+                    "from lockfile for absent git apm_package dep(s); "
+                    "frozen check will hydrate these after the structural check."
+                )
             effective_configs: dict = {**cold_cache_mcp, **current_mcp.configs}
             config_diff = McpConfigDiff.between(effective_configs, lockfile.mcp_configs)
             if current_mcp.problems:
