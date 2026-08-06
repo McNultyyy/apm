@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import ipaddress
 
+__all__ = ["is_local_or_metadata_host"]
+
 
 def is_local_or_metadata_host(host: str | None) -> bool:
     """Return True for loopback, link-local, RFC 1918, or cloud-metadata IPs.
