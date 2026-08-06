@@ -129,22 +129,3 @@ def test_unrestricted_user_scope_preserves_runtime_detection(_saved, tmp_path: P
     assert decision.value is None
     assert decision.source == "auto-detect"
     assert decision.canonical_targets is None
-
-
-# -- #2485: agent-skills is not MCP-capable; must be excluded from runtime_targets ---
-
-
-def test_mixed_codex_agent_skills_runtime_targets_excludes_agent_skills() -> None:
-    """runtime_targets for [codex, agent-skills] must only contain codex (#2485)."""
-    from apm_cli.core.target_detection import EffectiveTargetDecision
-
-    decision = EffectiveTargetDecision(["codex", "agent-skills"], source="apm.yml")
-    assert decision.runtime_targets == ("codex",)
-
-
-def test_agent_skills_only_runtime_targets_is_empty() -> None:
-    """runtime_targets for [agent-skills] alone must be an empty tuple (#2485)."""
-    from apm_cli.core.target_detection import EffectiveTargetDecision
-
-    decision = EffectiveTargetDecision(["agent-skills"], source="apm.yml")
-    assert decision.runtime_targets == ()

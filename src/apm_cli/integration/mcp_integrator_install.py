@@ -499,20 +499,6 @@ def _resolve_target_runtimes(
         target_runtimes = list(
             target_decision.runtime_targets_for_scope(user_scope=user_scope) or ()
         )
-        # If runtime_targets is empty but canonical_targets is non-empty, every
-        # selected target is non-MCP-capable (e.g. agent-skills only). This is a
-        # hard error: MCP deps are present but no target can accept them (#2485).
-        if not target_runtimes and target_decision.canonical_targets:
-            targets_csv = ", ".join(sorted(target_decision.canonical_targets))
-            source = target_decision.source or "unknown"
-            label = "declared" if source == "apm.yml" else "selected"
-            message = (
-                f"No MCP-capable target in the {label} target set ({targets_csv}). "
-                "Add an MCP-capable target (e.g., codex, copilot, claude) to install "
-                "MCP dependencies."
-            )
-            logger.error(message)
-            raise InstallFailureAlreadyRendered(message)
         if target_decision.source == "apm.yml":
             selection_source = _TargetSelectionSource.MANIFEST
         elif target_decision.source.startswith("auto-detect"):
@@ -561,25 +547,6 @@ def _resolve_target_runtimes(
             # developers with different harnesses installed, instead of each
             # `apm install` "stealing" MCP ownership toward whatever the current
             # machine happens to have (issue #2298).
-            #
-            # If projection left an empty list, every declared target is
-            # non-MCP-capable (#2485).  Fail with an actionable message.
-            if not declared_targets:
-                raw = (
-                    (apm_config.get("targets") or apm_config.get("target") or [])
-                    if apm_config
-                    else []
-                )
-                if isinstance(raw, str):
-                    raw = [raw]
-                targets_csv = ", ".join(sorted(str(t) for t in raw)) or "<unknown>"
-                message = (
-                    f"No MCP-capable target in the declared target set ({targets_csv}). "
-                    "Add an MCP-capable target (e.g., codex, copilot, claude) to install "
-                    "MCP dependencies."
-                )
-                logger.error(message)
-                raise InstallFailureAlreadyRendered(message)
             target_runtimes = declared_targets
             selection_source = _TargetSelectionSource.MANIFEST
             logger.verbose_detail(
@@ -644,31 +611,37 @@ def _resolve_target_runtimes(
             else:
                 selection_source = _TargetSelectionSource.DISCOVERY
 
-    # Not every accepted target can host MCP servers: `grok-build` writes
-    # native .grok configuration but has no MCP client adapter.  Drop
-    # non-MCP-capable runtimes here so that expanding `--target all` does
-    # not hard-fail the install on a runtime that cannot take MCP config.
-    # ClientFactory is the single source of truth for MCP capability.
+    # ClientFactory is the single source of truth for MCP capability (#2485).
+    # Non-MCP targets (e.g. agent-skills, grok-build) have no client adapter;
+    # silently dropping them when MCP-capable targets remain preserves correct
+    # installs for mixed-target projects. When every selected target is non-MCP-
+    # capable the caller must be told explicitly -- a silent skip would leave MCP
+    # dependencies permanently uninstalled with no indication why.
     # Direct `--runtime` calls bypass this: the adapter layer owns the
     # warning/error behavior for legacy runtime strings.
     if selection_source is not _TargetSelectionSource.RUNTIME:
         from apm_cli.factory import ClientFactory as _McpCF
 
-        mcp_capable = _McpCF.supported_clients()
-        non_mcp = [rt for rt in target_runtimes if rt not in mcp_capable]
+        mcp_capable_set = _McpCF.supported_clients()
+        non_mcp = [rt for rt in target_runtimes if rt not in mcp_capable_set]
         if non_mcp:
-            target_runtimes = [rt for rt in target_runtimes if rt in mcp_capable]
+            target_runtimes = [rt for rt in target_runtimes if rt in mcp_capable_set]
             logger.progress(f"Skipped targets without MCP support: {', '.join(sorted(non_mcp))}")
         if not target_runtimes and non_mcp:
-            logger.warning(
-                "No selected target supports MCP -- skipping MCP configuration. "
-                f"Targets without an MCP client: {', '.join(sorted(non_mcp))}. "
-                "Re-run with an MCP-capable target (for example "
-                "`--target copilot`) to install MCP servers."
+            # Every selected target lacks an MCP client adapter; fail with an
+            # actionable message so the user knows exactly what to change (#2485).
+            targets_csv = ", ".join(sorted(non_mcp))
+            _src = (target_decision.source if target_decision is not None else None) or "unknown"
+            _label = "declared" if _src == "apm.yml" else "selected"
+            message = (
+                f"No MCP-capable target in the {_label} target set ({targets_csv}). "
+                "Add an MCP-capable target (e.g., codex, copilot, claude) to install "
+                "MCP dependencies."
             )
-            return None
+            logger.error(message)
+            raise InstallFailureAlreadyRendered(message)
 
-    # Exclusion narrows every selected source, including explicit CLI choices.
+        # Exclusion narrows every selected source, including explicit CLI choices.
     # Apply it before progress output so the message names the narrowed set.
     if exclude:
         exclusions = {exclude}

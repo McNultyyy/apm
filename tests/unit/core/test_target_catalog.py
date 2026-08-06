@@ -398,7 +398,6 @@ def _capability(
     in_all: bool = False,
     experimental_flag: str | None = None,
     mcp_only: bool = False,
-    mcp_capable: bool = True,
     primitive_profile: str | None = "profile",
     runtimes: tuple[str, ...] = (),
 ) -> TargetCapability:
@@ -411,7 +410,6 @@ def _capability(
         explicit_only=False,
         experimental_flag=experimental_flag,
         mcp_only=mcp_only,
-        mcp_capable=mcp_capable,
         primitive_profile=primitive_profile,
         compile_family=None,
         runtimes=runtimes,

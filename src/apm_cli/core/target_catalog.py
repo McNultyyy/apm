@@ -18,7 +18,6 @@ class TargetCapability:
     explicit_only: bool
     experimental_flag: str | None
     mcp_only: bool
-    mcp_capable: bool
     primitive_profile: str | None
     compile_family: str | None
     runtimes: tuple[str, ...]
@@ -37,7 +36,6 @@ def _capability(
     explicit_only: bool = False,
     experimental_flag: str | None = None,
     mcp_only: bool = False,
-    mcp_capable: bool = True,
     primitive_profile: str | None = None,
     compile_family: str | None = None,
     runtimes: tuple[str, ...] = (),
@@ -51,7 +49,6 @@ def _capability(
         explicit_only=explicit_only,
         experimental_flag=experimental_flag,
         mcp_only=mcp_only,
-        mcp_capable=mcp_capable,
         primitive_profile=primitive_profile,
         compile_family=compile_family,
         runtimes=runtimes,
@@ -154,7 +151,6 @@ TARGET_CAPABILITIES: Mapping[str, TargetCapability] = _build_target_catalog(
             "grok-build",
             "xAI Grok Build native .grok configuration",
             in_all=True,
-            mcp_capable=False,
             primitive_profile="grok-build",
             compile_family="agents",
         ),
@@ -163,7 +159,6 @@ TARGET_CAPABILITIES: Mapping[str, TargetCapability] = _build_target_catalog(
             "xAI Grok Cloud native .grok/skills configuration",
             explicit_only=True,
             experimental_flag="grok_cloud",
-            mcp_capable=False,
             primitive_profile="grok-cloud",
         ),
         _capability(
@@ -192,14 +187,12 @@ TARGET_CAPABILITIES: Mapping[str, TargetCapability] = _build_target_catalog(
             "agent-skills",
             "Cross-client native .agents skills configuration",
             explicit_only=True,
-            mcp_capable=False,
             primitive_profile="agent-skills",
         ),
         _capability(
             "openclaw",
             "OpenClaw native skills configuration",
             experimental_flag="openclaw",
-            mcp_capable=False,
             primitive_profile="openclaw",
         ),
         _capability(
@@ -213,14 +206,12 @@ TARGET_CAPABILITIES: Mapping[str, TargetCapability] = _build_target_catalog(
             "copilot-cowork",
             "Microsoft 365 Copilot Cowork native skills configuration",
             experimental_flag="copilot_cowork",
-            mcp_capable=False,
             primitive_profile="copilot-cowork",
         ),
         _capability(
             "copilot-app",
             "GitHub Copilot desktop app native workflow configuration",
             experimental_flag="copilot_app",
-            mcp_capable=False,
             primitive_profile="copilot-app",
         ),
         _capability(
