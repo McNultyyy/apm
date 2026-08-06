@@ -173,6 +173,15 @@ def test_ssh_protocol_url_github_single_segment_raises() -> None:
         _parse_marketplace_source("ssh://git@github.com/repo.git", host_flag=None)
 
 
+def test_ssh_protocol_url_path_traversal_rejected() -> None:
+    """validate_path_segments must reject traversal markers in ssh:// URL paths."""
+    with pytest.raises(ValueError, match=r"traversal"):
+        _parse_marketplace_source(
+            "ssh://git@gitea.example.com/org/../../../etc/passwd",
+            host_flag=None,
+        )
+
+
 def test_https_ado_url_classified_as_git() -> None:
     """ADO is no longer rejected at the parser layer."""
     url, kind, host = _parse_marketplace_source(

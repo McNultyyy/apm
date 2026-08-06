@@ -10,11 +10,12 @@ import builtins
 import json
 import logging
 import re
+import shlex
 import sys
 import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 import click
 
@@ -272,8 +273,6 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
     Raises ``ValueError`` on malformed input (single-segment, HTTP, empty,
     or path-traversal sequences in any segment).
     """
-    from urllib.parse import urlparse
-
     from ...core.auth import AuthResolver
     from ...utils.github_host import is_valid_fqdn
 
@@ -311,8 +310,6 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
 
     # --- ssh:// protocol URL (ssh://git@host/org/repo.git or with port) ----
     if lowered.startswith("ssh://"):
-        from urllib.parse import unquote as _unquote
-
         # SECURITY: reject percent-encoded userinfo before urlparse decodes it.
         # Same guard as DependencyReference._parse_ssh_protocol_url.
         # Use re.IGNORECASE so the guard fires for SSH://, Ssh://, etc.
@@ -326,7 +323,7 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
         embedded_host = (parsed.hostname or "").strip().lower()
         if not embedded_host:
             raise ValueError(f"ssh:// URL is missing a host: '{raw}'")
-        path_segments = [s for s in _unquote(parsed.path or "").split("/") if s]
+        path_segments = [s for s in unquote(parsed.path or "").split("/") if s]
         for seg in path_segments:
             validate_path_segments(seg, context="marketplace SSH URL path", reject_empty=True)
         if not path_segments:
@@ -339,12 +336,10 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
             # (kind == "git") MAY legitimately have a single segment.
             raise ValueError(f"Invalid format: '{raw}'. Expected 'OWNER/REPO' in the URL path.")
         if host_flag and host_flag.strip().lower() != embedded_host:
-            import shlex as _shlex
-
             raise ValueError(
                 f"Conflicting host: --host '{host_flag}' does not match "
                 f"'{embedded_host}' in '{raw}'.\n"
-                f"To fix: drop --host and run: apm marketplace add {_shlex.quote(raw)}"
+                f"To fix: drop --host and run: apm marketplace add {shlex.quote(raw)}"
             )
         return raw, kind, embedded_host
 
@@ -355,9 +350,7 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
         if not embedded_host:
             raise ValueError(f"HTTPS URL is missing a host: '{raw}'")
         # Validate path segments for traversal markers.
-        from urllib.parse import unquote as _unquote
-
-        path_segments = [s for s in _unquote(parsed.path or "").split("/") if s]
+        path_segments = [s for s in unquote(parsed.path or "").split("/") if s]
         for seg in path_segments:
             validate_path_segments(seg, context="marketplace URL path", reject_empty=True)
         if not path_segments:
@@ -371,19 +364,15 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
             # (e.g. self-hosted ``https://gitea.example.com/repo``).
             raise ValueError(f"Invalid format: '{raw}'. Expected 'OWNER/REPO' in the URL path.")
         if host_flag and host_flag.strip().lower() != embedded_host:
-            import shlex as _shlex
-
             raise ValueError(
                 f"Conflicting host: --host '{host_flag}' does not match "
                 f"'{embedded_host}' in '{raw}'.\n"
-                f"To fix: drop --host and run: apm marketplace add {_shlex.quote(raw)}"
+                f"To fix: drop --host and run: apm marketplace add {shlex.quote(raw)}"
             )
         return raw, kind, embedded_host
 
     # --- Shorthand (OWNER/REPO or HOST/OWNER/.../REPO) --------------------
-    from urllib.parse import unquote as _unquote
-
-    raw_decoded = _unquote(raw)
+    raw_decoded = unquote(raw)
     segments = [seg for seg in raw_decoded.split("/") if seg]
     if len(segments) < 2:
         raise ValueError(
@@ -412,12 +401,10 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
     validate_path_segments(repo_name, context="marketplace repo name", reject_empty=True)
 
     if embedded_host and host_flag and host_flag.strip().lower() != embedded_host:
-        import shlex as _shlex
-
         raise ValueError(
             f"Conflicting host: --host '{host_flag}' does not match "
             f"'{embedded_host}' in '{raw}'.\n"
-            f"To fix: drop --host and run: apm marketplace add {_shlex.quote(raw)}"
+            f"To fix: drop --host and run: apm marketplace add {shlex.quote(raw)}"
         )
 
     from ...utils.github_host import default_host
@@ -649,10 +636,8 @@ def add(source, name, ref, branch, host, verbose):
             if host_info.kind not in _TRUSTED_MARKETPLACE_HOST_KINDS:
                 # Should not happen because _host_kind_to_fetcher_kind already
                 # mapped non-trusted kinds to "git", but defend in depth.
-                import shlex as _shlex
-
-                quoted_repo = _shlex.quote(source)
-                quoted_host = _shlex.quote(resolved_host or "")
+                quoted_repo = shlex.quote(source)
+                quoted_host = shlex.quote(resolved_host or "")
                 logger.error(
                     _marketplace_add_unsupported_host_error(
                         resolved_host or "", quoted_repo, quoted_host, host_info.kind
@@ -864,8 +849,6 @@ def _default_alias_from_url(url: str) -> str:
     path-segment. For ``file://`` URLs the alias falls back to the
     final filesystem segment.
     """
-    from urllib.parse import urlparse
-
     parsed = urlparse(url) if "://" in url else None
     if parsed and parsed.path:
         tail = parsed.path.rstrip("/").rsplit("/", 1)[-1]
