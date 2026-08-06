@@ -266,6 +266,8 @@ class CodexClientAdapter(MCPClientAdapter):
 
             parsed_remote = urlparse(remote_url)
             scheme = parsed_remote.scheme.lower()
+            # _is_local_or_metadata_host covers loopback, link-local, RFC 1918
+            # private ranges, and cloud-metadata IPs -- not just strict loopback.
             if scheme != "https" and not _is_local_or_metadata_host(parsed_remote.hostname):
                 _rich_warning(
                     f"Skipping MCP server '{server_name}' for Codex CLI: remote URL "
