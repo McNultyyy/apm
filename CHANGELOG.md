@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `apm marketplace validate` now rejects structurally invalid `marketplace.json` files (e.g. `plugins` is not a list) instead of silently reporting a false-positive clean result. (#2498)
+- `apm install` now re-downloads an aliased dependency after its `ref:` changes
+  in `apm.yml`. Previously the pinned-ref and already-resolved cache-reuse
+  shortcuts skipped the fetch, so `apm_modules/<alias>/` and every primitive
+  deployed from it stayed on the old revision. (#2484)
+- `apm install --target all` no longer aborts on targets that have no MCP
+  client, such as `grok-build`. Non-MCP targets are skipped with a note instead
+  of raising `Unsupported client type`. (#2484)
 - `apm init` and install-time auto-bootstrap now reject empty or
   whitespace-only project names, falling back to `my-project` at a filesystem
   root. APM no longer writes an `apm.yml` that every later install, lock, or
