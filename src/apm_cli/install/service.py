@@ -320,8 +320,7 @@ class InstallService:
             if cold_cache_mcp and request.logger is not None:
                 request.logger.verbose_detail(
                     f"Restoring {len(cold_cache_mcp)} cold-cache MCP server(s) "
-                    "from lockfile for absent git apm_package dep(s); "
-                    "frozen check will hydrate these after the structural check."
+                    "from lockfile; frozen check will hydrate after structural check."
                 )
             effective_configs: dict = {**cold_cache_mcp, **current_mcp.configs}
             config_diff = McpConfigDiff.between(effective_configs, lockfile.mcp_configs)
