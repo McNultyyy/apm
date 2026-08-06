@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ship no `apm.yml`. The `_allows_missing_manifest` helper now checks the
   locked package type before the virtual-subdirectory gate, consistent with
   how `skill_bundle` is handled. (by @sergio-sisternes-epam, closes #2443)
+- Multi-target `apm compile` now avoids repeating expensive project analysis
+  for each target, making multi-target runs scale like single-target runs
+  without changing generated output. (closes #2482)
 
 ## [0.28.0] - 2026-08-04
 
@@ -39,6 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `apm install` now re-downloads an aliased dependency after its `ref:` changes
+  in `apm.yml`. Previously the pinned-ref and already-resolved cache-reuse
+  shortcuts skipped the fetch, so `apm_modules/<alias>/` and every primitive
+  deployed from it stayed on the old revision. (#2484)
+- `apm install --target all` no longer aborts on targets that have no MCP
+  client, such as `grok-build`. Non-MCP targets are skipped with a note instead
+  of raising `Unsupported client type`. (#2484)
+- `apm outdated` no longer exits 1 when the Rich progress renderer fails. The
+  command now owns its own `Console` instead of borrowing Rich's process-global
+  singleton, and falls back to plain-text progress if rendering still raises.
+  (#2507)
 - `apm init` and install-time auto-bootstrap now reject empty or
   whitespace-only project names, falling back to `my-project` at a filesystem
   root. APM no longer writes an `apm.yml` that every later install, lock, or
