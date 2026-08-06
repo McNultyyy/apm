@@ -323,6 +323,13 @@ def _parse_marketplace_source(source: str, host_flag: str | None) -> tuple[str, 
         embedded_host = (parsed.hostname or "").strip().lower()
         if not embedded_host:
             raise ValueError(f"ssh:// URL is missing a host: '{raw}'")
+        # SECURITY: reject dash-prefix hostnames that could inject SSH options
+        # when passed to git subprocess (e.g. '-oProxyCommand=...'). Defense-in-
+        # depth: git 2.38+ also blocks this, but we guard at the parse layer.
+        if embedded_host.startswith("-"):
+            raise ValueError(
+                f"Invalid host in ssh:// URL: '{embedded_host}'. Hostnames must not start with '-'."
+            )
         path_segments = [s for s in unquote(parsed.path or "").split("/") if s]
         for seg in path_segments:
             validate_path_segments(seg, context="marketplace SSH URL path", reject_empty=True)

@@ -182,6 +182,15 @@ def test_ssh_protocol_url_path_traversal_rejected() -> None:
         )
 
 
+def test_ssh_protocol_url_dash_prefix_host_rejected() -> None:
+    """Hostnames starting with '-' are rejected to prevent SSH option injection."""
+    with pytest.raises(ValueError, match=r"must not start with"):
+        _parse_marketplace_source(
+            "ssh://git@-oProxyCommand%3Devil/org/repo.git",
+            host_flag=None,
+        )
+
+
 def test_https_ado_url_classified_as_git() -> None:
     """ADO is no longer rejected at the parser layer."""
     url, kind, host = _parse_marketplace_source(

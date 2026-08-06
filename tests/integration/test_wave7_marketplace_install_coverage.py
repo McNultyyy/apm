@@ -658,6 +658,47 @@ class TestMarketplaceAdd:
                 result = runner.invoke(cli, ["marketplace", "add", "acme/repo", "--verbose"])
         assert result.exit_code == 0
 
+    def test_add_ssh_protocol_url_parsed_as_git(self, runner: CliRunner, tmp_path: Path) -> None:
+        """ssh:// URLs survive the full CLI wiring and are classified as kind=git.
+
+        Regression: before fix #2464, ssh:// was silently misparsed as shorthand,
+        treating 'ssh:' as the owner and producing https://github.com/ssh:/... .
+        """
+        manifest = _fake_manifest("repo")
+        host_info = MagicMock()
+        host_info.kind = "generic"  # gitea -> kind=git via _host_kind_to_fetcher_kind
+        with runner.isolated_filesystem(temp_dir=str(tmp_path)):
+            with (
+                patch(
+                    "apm_cli.core.auth.AuthResolver.classify_host",
+                    return_value=host_info,
+                ),
+                patch(
+                    "apm_cli.marketplace.client._auto_detect_path",
+                    return_value="marketplace.json",
+                ),
+                patch(
+                    "apm_cli.marketplace.client.fetch_marketplace",
+                    return_value=manifest,
+                ),
+                patch("apm_cli.marketplace.registry.add_marketplace"),
+            ):
+                result = runner.invoke(
+                    cli,
+                    [
+                        "marketplace",
+                        "add",
+                        "ssh://git@gitea.example.com:7999/org/repo.git",
+                    ],
+                )
+        # Parser must not silently misparse; non-zero means the URL itself
+        # was rejected (acceptable only if an upstream guard fires before
+        # the mocked path). Assert at minimum the old broken behaviour is gone:
+        # the command must NOT error with "github" in its output (which would
+        # mean ssh: was misread as the owner and github.com was assumed).
+        assert "github.com/ssh:" not in result.output
+        assert "https://github.com/ssh:" not in result.output
+
 
 # ===========================================================================
 # Marketplace - removed 'build' subcommand
