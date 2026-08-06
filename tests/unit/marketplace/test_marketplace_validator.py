@@ -158,7 +158,7 @@ class TestValidateRawMarketplaceStructure:
         data = {"plugins": "not-an-array"}
         result = validate_raw_marketplace_structure(data)
         assert result.passed is False
-        assert any("plugins" in e and "list" in e for e in result.errors)
+        assert any("plugins" in e and "array" in e for e in result.errors)
 
     def test_plugins_dict_fails(self):
         data = {"plugins": {"name": "a"}}
@@ -341,7 +341,7 @@ class TestValidateCommand:
         result = runner.invoke(marketplace, ["validate", "acme"])
         assert result.exit_code == 1
         assert "plugins" in result.output.lower()
-        assert "list" in result.output.lower() or "Structure" in result.output
+        assert "array" in result.output.lower() or "Structure" in result.output
 
     @patch("apm_cli.marketplace.client.fetch_marketplace_raw")
     @patch("apm_cli.marketplace.registry.get_marketplace_by_name")

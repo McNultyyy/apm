@@ -23,6 +23,22 @@ from typing import Any
 
 from .models import MarketplaceManifest, MarketplacePlugin
 
+_PYTHON_TO_JSON_TYPE: dict[str, str] = {
+    "str": "string",
+    "int": "number",
+    "float": "number",
+    "bool": "boolean",
+    "NoneType": "null",
+    "list": "array",
+    "dict": "object",
+}
+
+
+def _json_type_name(value: Any) -> str:
+    """Return the JSON-schema type name for a Python value."""
+    python_name = type(value).__name__
+    return _PYTHON_TO_JSON_TYPE.get(python_name, python_name)
+
 
 @dataclass
 class ValidationResult:
@@ -51,12 +67,12 @@ def validate_raw_marketplace_structure(data: Any) -> ValidationResult:
     errors: list[str] = []
 
     if not isinstance(data, dict):
-        errors.append(f"marketplace.json root must be an object, got {type(data).__name__!r}")
+        errors.append(f"marketplace.json root must be an object, got {_json_type_name(data)!r}")
         return ValidationResult(check_name="Structure", passed=False, errors=errors)
 
     raw_plugins = data.get("plugins", [])
     if not isinstance(raw_plugins, list):
-        errors.append(f"'plugins' field must be a list, got {type(raw_plugins).__name__!r}")
+        errors.append(f"'plugins' field must be an array, got {_json_type_name(raw_plugins)!r}")
 
     return ValidationResult(
         check_name="Structure",

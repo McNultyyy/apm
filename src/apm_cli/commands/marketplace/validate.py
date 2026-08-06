@@ -35,48 +35,38 @@ def validate(name, check_refs, verbose):
         # Step 1: fetch raw JSON dict (no permissive parsing yet)
         raw_data = fetch_marketplace_raw(source, force_refresh=True)
 
-        # Step 2: structural pre-check on the raw dict
+        # Step 2: structural pre-check on the raw dict (before permissive parse)
         structural_result = validate_raw_marketplace_structure(raw_data)
+        business_results: list = []
 
-        # If structural check fails, render the error and exit immediately --
-        # parse_marketplace_json requires a dict and would raise on a non-dict root.
-        if not structural_result.passed:
-            logger.blank_line()
-            logger.progress("Validation Results:", symbol="info")
-            for e in structural_result.errors:
-                logger.error(f"  {structural_result.check_name}: {e}", symbol="error")
-            logger.blank_line()
+        # Step 3: if structural check passed, permissive parse + business-rule validation
+        # parse_marketplace_json requires a dict and would raise on a non-dict root,
+        # so skip it entirely when the structural check already caught the problem.
+        if structural_result.passed:
+            manifest = parse_marketplace_json(raw_data, source.name)
+
             logger.progress(
-                f"Summary: 0 passed, 0 warnings, {len(structural_result.errors)} errors",
+                f"Found {len(manifest.plugins)} plugins",
                 symbol="info",
             )
-            sys.exit(1)
 
-        # Step 3: permissive parse (may coerce malformed fields to defaults)
-        manifest = parse_marketplace_json(raw_data, source.name)
+            # Verbose: per-plugin details
+            if verbose:
+                for p in manifest.plugins:
+                    source_type = "dict" if isinstance(p.source, dict) else "string"
+                    logger.verbose_detail(f"    {p.name}: source type: {source_type}")
 
-        logger.progress(
-            f"Found {len(manifest.plugins)} plugins",
-            symbol="info",
-        )
+            # Step 4: business-rule validation on the parsed manifest
+            business_results = validate_marketplace(manifest)
 
-        # Verbose: per-plugin details
-        if verbose:
-            for p in manifest.plugins:
-                source_type = "dict" if isinstance(p.source, dict) else "string"
-                logger.verbose_detail(f"    {p.name}: source type: {source_type}")
+            # Check-refs placeholder
+            if check_refs:
+                logger.warning(
+                    "Ref checking not yet implemented -- skipping ref reachability checks",
+                    symbol="warning",
+                )
 
-        # Step 4: business-rule validation on the parsed manifest
-        business_results = validate_marketplace(manifest)
-
-        # Check-refs placeholder
-        if check_refs:
-            logger.warning(
-                "Ref checking not yet implemented -- skipping ref reachability checks",
-                symbol="warning",
-            )
-
-        # Render results (structural check first, then business rules)
+        # Render results through the shared loop (structural check first, then business rules)
         results = [structural_result, *business_results]
         passed = 0
         warning_count = 0
