@@ -117,6 +117,34 @@ class TestAgentIntegrator:
         target_content = target.read_text()
         assert target_content == source_content
 
+    def test_copy_agent_pre_transform_applied_before_link_resolution(self):
+        """pre_transform receives the raw file content and its output is linked."""
+        source = self.project_root / "source.agent.md"
+        target = self.project_root / "target.agent.md"
+        source.write_text("MARKER content")
+
+        calls: list[str] = []
+
+        def recorder(content: str) -> str:
+            calls.append(content)
+            return content.replace("MARKER", "REPLACED")
+
+        self.integrator.copy_agent(source, target, pre_transform=recorder)
+
+        assert calls == ["MARKER content"], "pre_transform was not called with raw content"
+        assert target.read_text() == "REPLACED content"
+
+    def test_copy_agent_without_pre_transform_is_verbatim(self):
+        """copy_agent with no pre_transform is backward-compatible verbatim copy."""
+        source = self.project_root / "source.agent.md"
+        target = self.project_root / "target.agent.md"
+        content = "# Agent\n\nContent."
+        source.write_text(content)
+
+        self.integrator.copy_agent(source, target)
+
+        assert target.read_text() == content
+
     def test_get_target_filename_agent_format(self):
         """Test target filename generation with clean naming for .agent.md."""
         source = Path("/package/security.agent.md")

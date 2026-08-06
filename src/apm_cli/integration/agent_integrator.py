@@ -22,6 +22,8 @@ from apm_cli.utils.paths import portable_relpath
 from apm_cli.utils.yaml_io import load_yaml_str, yaml_to_str
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from apm_cli.integration.targets import TargetProfile
     from apm_cli.utils.diagnostics import DiagnosticCollector
 
@@ -327,19 +329,30 @@ class AgentIntegrator(BaseIntegrator):
             KNOWN_TARGETS["copilot"],
         )
 
-    def copy_agent(self, source: Path, target: Path) -> int:
-        """Copy agent file verbatim, resolving context links.
+    def copy_agent(
+        self,
+        source: Path,
+        target: Path,
+        pre_transform: Callable[[str], str] | None = None,
+    ) -> int:
+        """Copy agent file, resolving context links.
 
         Args:
-            source: Source file path
-            target: Target file path
+            source: Source file path.
+            target: Target file path.
+            pre_transform: Optional callable applied to the raw file content
+                before link resolution.  Use this to inject format-specific
+                transforms (e.g. tool-name rewriting) without duplicating the
+                read/resolve/write body in each format helper.
 
         Returns:
-            int: Number of links resolved
+            int: Number of links resolved.
         """
         if source.is_symlink():
             raise ValueError(f"Refusing to read symlink source: {source}")
         content = source.read_text(encoding="utf-8")
+        if pre_transform is not None:
+            content = pre_transform(content)
         content, links_resolved = self.resolve_links(content, source, target)
         write_text_lf(target, content)
         return links_resolved
@@ -402,10 +415,9 @@ class AgentIntegrator(BaseIntegrator):
     ) -> int:
         """Copy a github_agent file, rewriting deprecated tool names.
 
-        Like :meth:`copy_agent` but applies
-        :meth:`_apply_github_agent_tool_renames` before link resolution so
-        that deployed ``*.agent.md`` files use the current VSCode namespaced
-        tool identifiers.
+        Delegates the read/resolve/write pipeline to :meth:`copy_agent` via
+        its ``pre_transform`` hook so that security checks (symlink guard) and
+        link resolution live in exactly one place.
 
         When ``diagnostics`` is supplied and renames occur, an info-level
         diagnostic is emitted naming the file and the count of rewrites.
@@ -419,21 +431,23 @@ class AgentIntegrator(BaseIntegrator):
         Returns:
             int: Number of context links resolved.
         """
-        if source.is_symlink():
-            raise ValueError(f"Refusing to read symlink source: {source}")
-        content = source.read_text(encoding="utf-8")
-        renamed = self._apply_github_agent_tool_renames(content)
-        if renamed is not content and diagnostics is not None:
-            count = sum(1 for old in GITHUB_AGENT_TOOL_RENAMES if old in content)
+        rename_count: list[int] = [0]
+
+        def _transform(content: str) -> str:
+            renamed = self._apply_github_agent_tool_renames(content)
+            if renamed is not content:
+                rename_count[0] = sum(1 for old in GITHUB_AGENT_TOOL_RENAMES if old in content)
+            return renamed
+
+        links_resolved = self.copy_agent(source, target, pre_transform=_transform)
+        if rename_count[0] and diagnostics is not None:
             diagnostics.info(
                 message=(
-                    f"{printable_ascii_text(source.name)}: rewrote {count} deprecated"
+                    f"{printable_ascii_text(source.name)}: rewrote {rename_count[0]} deprecated"
                     f" VSCode tool name(s) to namespaced form"
                 ),
                 package=printable_ascii_text(package_name),
             )
-        content, links_resolved = self.resolve_links(renamed, source, target)
-        write_text_lf(target, content)
         return links_resolved
 
     # ------------------------------------------------------------------
