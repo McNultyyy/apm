@@ -427,7 +427,7 @@ class AgentIntegrator(BaseIntegrator):
             count = sum(1 for old in GITHUB_AGENT_TOOL_RENAMES if old in content)
             diagnostics.info(
                 message=(
-                    f"{source.name}: rewrote {count} deprecated"
+                    f"{printable_ascii_text(source.name)}: rewrote {count} deprecated"
                     f" VSCode tool name(s) to namespaced form"
                 ),
                 package=printable_ascii_text(package_name),
