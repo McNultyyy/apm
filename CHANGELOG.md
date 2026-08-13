@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BREAKING
+
+- BREAKING: `apm pack` and `apm plugin init` now default to Agent Plugins v1. Repack current bundles with `apm pack`; keep the historical Claude layout only with `--claude-plugin`; keep `--format apm` only for legacy bundle consumers. `apm install` still requires plugin-format bundles. In CI, run `apm pack --check-versions --check-clean` and `apm audit --ci`. Migration warnings stay on for 0.29.0-0.33.x and are removed in 0.34.0. See [Agent Plugins v1 migration](https://microsoft.github.io/apm/getting-started/agent-plugins-v1-migration/).
+
 ### Fixed
 
 - Multi-target `apm compile` now avoids repeating expensive project analysis
