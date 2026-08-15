@@ -42,6 +42,18 @@ Each file is a JSON document keyed by lifecycle event. APM accepts the
 Claude (`PreToolUse`, `PostToolUse`) and Copilot (`preToolUse`,
 `postToolUse`) shapes; events are renamed per target during merge.
 
+### Session lifecycle event aliases
+
+| Source aliases | Copilot native key | Claude native key |
+|----------------|---------------------|-------------------|
+| `SessionStart`, `sessionStart` | `sessionStart` | `SessionStart` |
+| `Stop`, `AgentStop`, `agentStop` | `agentStop` | `Stop` |
+
+Event names absent from this table are preserved unchanged. Only an unmapped
+camelCase or PascalCase name that conflicts with the target convention emits
+an install warning. All-lowercase names such as `stop` pass through silently;
+`stop` is not a native Copilot or Claude event and will not fire.
+
 ```json
 {
   "hooks": {
@@ -96,11 +108,47 @@ available at runtime:
 - JavaScript and TypeScript hook bundles get a minimal `package.json`
   sidecar with the nearest source package's Node `type`; packages
   without an explicit `type` deploy as `commonjs`, and shell-only
-  bundles do not get a sidecar.
+  bundles do not get a sidecar. **Exception -- Copilot and VS Code:**
+  APM does not write the sidecar into project `.github/hooks/scripts/`
+  or user `~/.copilot/hooks/scripts/` because Copilot's hook loader scans
+  those directories recursively and rejects any JSON file that lacks a
+  `hooks` key. APM also omits nested JSON bundle assets for these targets;
+  keep hook runtime configuration in a non-JSON format. For ES module scripts targeting
+  Copilot or VS Code, use the `.mjs` file extension -- Node.js
+  recognises it without a `package.json`.
 
-For multi-target packages, prefer simple hook filenames plus consumer
-per-dependency `targets:` in `dependencies.apm` to limit reach. If the
-same manifest stem is mirrored in both `hooks/` and `.apm/hooks/`, APM
+Use simple hook filenames. APM computes their reach as:
+
+```text
+effective hook targets =
+  project active targets
+  INTERSECT consumer per-dependency targets (when set)
+  INTERSECT package targets (when restrictive)
+```
+
+Every selector is a filter. A package declaration only narrows the
+consumer-authorized active set; it never activates a target or expands
+dependency reach. Omitting package `target:` / `targets:`, or using the
+legacy `all` value, adds no package restriction; `all` is not expanded
+into an additional target set at this gate.
+
+For example, this package can write hooks only to Claude:
+
+```yaml
+name: claude-hooks
+version: "1.0.0"
+target: claude
+```
+
+`target:` accepts scalar, CSV, and list spellings, including aliases such
+as `vscode` (normalized to `copilot`). `targets:` accepts a scalar or list
+of canonical names. Unknown names, both keys together, and an empty
+or null `targets:` value fail validation. A null singular `target:` is
+treated as omission for legacy compatibility; an empty string or list fails
+validation. Both keys conflict even when either value is null. Consumers
+can narrow one dependency further with object-form `targets:`.
+
+If the same manifest stem is mirrored in both `hooks/` and `.apm/hooks/`, APM
 integrates the `.apm/hooks/` copy once per target.
 
 :::note
@@ -111,19 +159,16 @@ the target vocabulary in
 :::
 
 :::caution[Deprecated]
-Hook filename routing (`*-<harness>-hooks.json`) is deprecated. Ship one
-hook manifest; consumers scope harness reach with the per-dependency
-`targets:` field. The filename router still works during the deprecation
-window and warns at install time. If both are present, `targets:` narrows the
-active harness set and filename routing still applies within that set.
+Hook filename routing (`*-<harness>-hooks.json`) is deprecated and warns
+at install time. When renaming `my-pkg-codex-hooks.json` to generic
+`hooks.json`, preserve package intent with `target: codex` in the package's
+own `apm.yml`. Consumer per-dependency `targets:` may narrow that scope
+further, but cannot expand it.
 
-Before: name the manifest `my-pkg-codex-hooks.json`. After: keep
-`hooks.json` generic and let the consumer set `targets: [codex]`.
-Combined deprecated stems such as `claude-codex-hooks.json` route to every
-named target token during the migration window.
-Stems with target tokens outside the trailing target suffix (for example
-`codex-launch-hooks.json`) fall back to universal or suffix routing and print a
-warning naming the ignored token.
+During migration, suffix routing still filters within the effective target
+set. Multi-target stems such as `claude-codex-hooks.json` match each named
+target. Ambiguous stems such as `codex-launch-hooks.json` use universal
+fallback and warn that the apparent target token was ignored.
 :::
 
 Supported targets and where the integrator writes:
@@ -132,6 +177,7 @@ Supported targets and where the integrator writes:
 |----------|---------------------------------------|----------------------|
 | copilot  | `.github/hooks/<pkg>-<name>.json`     | one file per hook    |
 | claude   | `.claude/settings.json`               | merged into settings |
+| grok-build | -- not supported --                 | silently skipped     |
 | cursor   | `.cursor/hooks.json`                  | merged               |
 | gemini   | `.gemini/settings.json`               | merged               |
 | codex    | `.codex/hooks.json`                   | merged               |
@@ -197,12 +243,13 @@ Supported targets and output paths:
 
 | Target   | Output                           | Format                |
 |----------|----------------------------------|-----------------------|
+| copilot  | -- not a command --              | ships as a prompt     |
 | claude   | `.claude/commands/<name>.md`     | native markdown       |
+| grok-build | `.grok/commands/<name>.md`      | shared command transform |
 | cursor   | `.cursor/commands/<name>.md`     | claude-format subset  |
 | opencode | `.opencode/commands/<name>.md`   | opencode markdown     |
 | gemini   | `.gemini/commands/<name>.toml`   | TOML                  |
 | windsurf | `.windsurf/workflows/<name>.md`  | called "workflows"    |
-| copilot  | -- not a command --              | ships as a prompt     |
 | codex    | -- not supported --              | silently skipped      |
 
 Verified against `src/apm_cli/integration/targets.py` and
@@ -219,8 +266,11 @@ agent a procedure" fits a skill -- and reaches every harness.
 
 ## Pitfalls
 
-- **Hook event names.** Author in Claude or Copilot conventions only.
-  The integrator renames; arbitrary event names will not be mapped.
+- **Hook event names.** Use the documented
+  [session lifecycle aliases](#session-lifecycle-event-aliases). Unknown names
+  are preserved. An install warning appears only when an unmapped name starts
+  with a capital letter or starts lowercase and contains a later capital
+  letter, and that casing conflicts with the target convention.
 - **Cursor command frontmatter loss.** Cursor reuses the Claude
   command transformer today, so any prompt-only metadata is dropped
   with a diagnostic. Keep Cursor commands to the preserved key set.
@@ -230,9 +280,11 @@ agent a procedure" fits a skill -- and reaches every harness.
 - **Hook script path resolution.** `apm install -g` (user-scope)
   rewrites `${PLUGIN_ROOT}` and relative `./` references to absolute
   paths so Claude Code and Copilot CLI can execute scripts regardless
-  of the working directory. Project-scope `apm install` (no `-g`)
-  keeps `command` paths repo-relative so checked-in configs stay portable
-  across clones, contributors, and CI. Either way, if a referenced script
+  of the working directory. Project-scope `apm install` (no `-g`) keeps
+  non-Claude command paths repo-relative. Claude project hooks use
+  `CLAUDE_PROJECT_DIR` (or `$env:CLAUDE_PROJECT_DIR` for PowerShell) so
+  checked-in settings remain portable while hooks can run from outside the
+  project directory. Either way, if a referenced script
   is missing at install time the installer emits a warning -- in
   user-scope the unexpanded variable is rewritten to the absolute
   source path so the hook fails loudly at runtime; in project-scope

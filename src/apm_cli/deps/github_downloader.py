@@ -293,10 +293,32 @@ class GitHubPackageDownloader:
         """
         from .git_auth_env import GitAuthEnvBuilder
 
-        git_env = GitAuthEnvBuilder.subprocess_env_dict(self.git_env)
+        if (
+            self.auth_resolver.uses_public_github_anonymous_first(
+                dep_ref.host or default_host(),
+                port=dep_ref.port,
+                host_type=dep_ref.host_type,
+            )
+            is True
+            and not dep_ref.is_insecure
+        ):
+            return self.auth_resolver.build_public_github_anonymous_git_env(
+                base_env=self.git_env,
+            )
+
+        auth_ctx = self._resolve_dep_auth_ctx(dep_ref)
+        base_env = (
+            self.auth_resolver.git_env_for_context(
+                auth_ctx,
+                base_env=self.git_env,
+            )
+            if auth_ctx is not None
+            else self.git_env
+        )
+        git_env = GitAuthEnvBuilder.subprocess_env_dict(base_env)
         if dep_ref.is_insecure:
-            git_env = GitAuthEnvBuilder.noninteractive_env(
-                git_env,
+            git_env = self.auth_resolver.build_noninteractive_git_env(
+                base_env=git_env,
                 preserve_config_isolation=True,
                 suppress_credential_helpers=True,
             )
@@ -500,10 +522,8 @@ class GitHubPackageDownloader:
 
         Delegates to :class:`GitAuthEnvBuilder.noninteractive_env`.
         """
-        from .git_auth_env import GitAuthEnvBuilder
-
-        return GitAuthEnvBuilder.noninteractive_env(
-            self.git_env,
+        return self.auth_resolver.build_noninteractive_git_env(
+            base_env=self.git_env,
             preserve_config_isolation=preserve_config_isolation,
             suppress_credential_helpers=suppress_credential_helpers,
         )
@@ -1090,14 +1110,118 @@ class GitHubPackageDownloader:
         try:
             temp_clone_path.mkdir(parents=True, exist_ok=True)
 
+            public_github_anonymous_first = (
+                not dep_ref.is_insecure
+                and self.auth_resolver.uses_public_github_anonymous_first(
+                    dep_ref.host or default_host(),
+                    port=dep_ref.port,
+                    host_type=dep_ref.host_type,
+                )
+                is True
+            )
+            if public_github_anonymous_first:
+                anonymous_url = self._build_repo_url(
+                    dep_ref.repo_url,
+                    use_ssh=False,
+                    dep_ref=dep_ref,
+                    token="",
+                )
+                setup_env = self.auth_resolver.build_public_github_anonymous_git_env(
+                    base_env=self.git_env,
+                )
+                setup_cmds = [
+                    ["git", "init"],
+                    ["git", "remote", "add", "origin", anonymous_url],
+                    ["git", "sparse-checkout", "init", "--cone"],
+                    ["git", "sparse-checkout", "set", subdir_path],
+                ]
+                for cmd in setup_cmds:
+                    result = subprocess.run(
+                        cmd,
+                        cwd=str(temp_clone_path),
+                        env=setup_env,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        timeout=120,
+                    )
+                    if result.returncode != 0:
+                        return False
+
+                def _fetch(token: str | None, git_env: dict[str, str]) -> None:
+                    if token is not None:
+                        authenticated_url = self._build_repo_url(
+                            dep_ref.repo_url,
+                            use_ssh=False,
+                            dep_ref=dep_ref,
+                            token=token or "",
+                        )
+                        remote_result = subprocess.run(
+                            ["git", "remote", "set-url", "origin", authenticated_url],
+                            cwd=str(temp_clone_path),
+                            env=git_env,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            timeout=120,
+                        )
+                        if remote_result.returncode != 0:
+                            raise subprocess.CalledProcessError(
+                                remote_result.returncode,
+                                remote_result.args,
+                                output=remote_result.stdout,
+                                stderr=remote_result.stderr,
+                            )
+                    fetch_result = subprocess.run(
+                        ["git", "fetch", "origin", ref or "HEAD", "--depth=1"],
+                        cwd=str(temp_clone_path),
+                        env=git_env,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        timeout=120,
+                    )
+                    if fetch_result.returncode != 0:
+                        raise subprocess.CalledProcessError(
+                            fetch_result.returncode,
+                            fetch_result.args,
+                            output=fetch_result.stdout,
+                            stderr=fetch_result.stderr,
+                        )
+
+                org = dep_ref.repo_url.split("/", 1)[0]
+                self.auth_resolver.try_with_fallback(
+                    dep_ref.host or default_host(),
+                    _fetch,
+                    org=org,
+                    port=dep_ref.port,
+                    path=dep_ref.repo_url,
+                    host_type=dep_ref.host_type,
+                    unauth_first=True,
+                    base_env=self.git_env,
+                )
+                checkout_result = subprocess.run(
+                    ["git", "checkout", "FETCH_HEAD"],
+                    cwd=str(temp_clone_path),
+                    env=setup_env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=120,
+                )
+                return checkout_result.returncode == 0
+
             # Resolve per-dependency auth via AuthResolver.
             dep_auth_ctx = self._resolve_dep_auth_ctx(dep_ref)
             dep_token = dep_auth_ctx.token if dep_auth_ctx else self.github_token
             dep_auth_scheme = dep_auth_ctx.auth_scheme if dep_auth_ctx else "basic"
 
-            # For ADO bearer, use the AuthContext git_env with header injection
-            if dep_auth_scheme == "bearer" and dep_auth_ctx is not None:
-                env = {**os.environ, **(dep_auth_ctx.git_env or {})}
+            # Use the per-dependency AuthContext env for every classified host.
+            if dep_auth_ctx is not None:
+                env = self.auth_resolver.git_env_for_context(
+                    dep_auth_ctx,
+                    base_env=self.git_env,
+                )
             else:
                 env = {**os.environ, **(self.git_env or {})}
             auth_url = self._build_repo_url(

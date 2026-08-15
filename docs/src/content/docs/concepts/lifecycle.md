@@ -30,7 +30,13 @@ Scaffolds a new APM project in the current directory.
 
 `apm init` writes an `apm.yml` manifest with sensible defaults for `name`, `author`, and `description`, plus empty dependency and script blocks. It records selected targets in `targets:`; author `.apm/` primitives yourself and run `apm install` or `apm compile` to create target output directories.
 
-Targets are picked in priority order. An explicit `--target copilot,claude` flag wins. Otherwise an interactive checklist runs. Otherwise APM scans the working tree for signal directories (`.github/`, `.claude/`, `.cursor/`, `.opencode/`, `.codex/`, `.gemini/`, `.windsurf/`, `.kiro/`) and pre-checks every harness it finds. With `-y` and no flag, all detected harnesses are written into `apm.yml`. See [primitives and targets](/apm/concepts/primitives-and-targets/) for what each target actually receives.
+Targets are picked in priority order. An explicit `--target copilot,claude`
+flag wins. Otherwise an interactive checklist runs. Otherwise APM scans the
+working tree for recognized
+[filesystem signals](../../reference/cli/targets/#detection-signals) and
+pre-checks every harness it finds. With `-y` and no flag, all detected
+harnesses are written into `apm.yml`. See [primitives and
+targets](../primitives-and-targets/) for what each target receives.
 
 **Common surprises**
 
@@ -84,14 +90,19 @@ context files such as `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md`. `apm run`
 still compiles any `.prompt.md` files referenced by a script immediately
 before execution.
 
-The `--target` flag accepts a comma-separated list (`copilot,claude,cursor,opencode,codex,gemini,windsurf,kiro,agent-skills`) or `all`. `--dry-run` prints placement decisions without writing files. `--validate` checks primitive frontmatter and structure without producing output. `--watch` re-runs compilation on every change.
+The `--target` flag accepts comma-separated catalog values; stable examples
+include `copilot`, `claude`, and `grok-build`. `--all` selects the default
+stable set. `--dry-run` prints placement decisions without writing files.
+`--validate` checks primitive frontmatter and structure without producing
+output. `--watch` re-runs compilation on every change.
 
 **Common surprises**
 
 - Running `apm compile` does not re-run the security scan. The scan happens at install time. If you hand-edit primitives between installs, run `apm audit` to scan them.
 - `--clean` removes orphaned `AGENTS.md` files from previous compilations. Without it, removed primitives can leave stale output behind.
 
-**Read more:** [`apm compile` reference](/apm/reference/cli/compile/), [compilation guide](/apm/producer/compile/).
+**Read more:** [`apm compile` reference](../../reference/cli/compile/),
+[compilation guide](../../producer/compile/).
 
 ## 4. RUN
 
@@ -139,7 +150,7 @@ apm audit --file <path>    # standalone: scan an arbitrary file
 
 **Local mode** (`apm audit`, optionally with `--strip` or `--file <path>`) scans installed primitives -- or any file you point at -- for hidden Unicode and reports findings as text, JSON, SARIF, or markdown. With `--strip`, it removes hidden characters in place, preserving emoji and whitespace. Use `--dry-run` to preview the strip.
 
-**CI mode** (`apm audit --ci`) runs the eight baseline consistency checks in order: `lockfile-exists`, `ref-consistency`, `deployed-files-present`, `no-orphaned-packages`, `skill-subset-consistency`, `config-consistency`, `content-integrity`, and `includes-consent`. After those pass, it performs an install-replay drift check. APM rebuilds the deployed context in a scratch directory and diffs it against your working tree, catching hand-edits to `apm_modules/` or generated files before they ship. Pass `--no-drift` to skip the replay in performance-constrained loops; pass `--no-fail-fast` to run all checks even after a failure. With `--policy <source>` it also evaluates org policy against the lockfile.
+**CI mode** (`apm audit --ci`) runs the nine baseline consistency checks in order: `lockfile-exists`, `ref-consistency`, `deployment-ledger-owners`, `deployed-files-present`, `no-orphaned-packages`, `skill-subset-consistency`, `config-consistency`, `content-integrity`, and `includes-consent`. After those pass, it performs an install-replay drift check. APM rebuilds the deployed context in a scratch directory and diffs it against your working tree, catching hand-edits to `apm_modules/` or generated files before they ship. When `apm_modules/` is absent but the lockfile is present, `--ci` self-hydrates a lock-pinned scratch install first instead of reporting a green drift skip. Pass `--no-drift` to skip the replay in performance-constrained loops; pass `--no-fail-fast` to run all checks even after a failure. With `--policy <source>` it also evaluates org policy against the lockfile.
 
 **Common surprises**
 

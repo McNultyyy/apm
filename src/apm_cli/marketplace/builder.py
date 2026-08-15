@@ -58,6 +58,7 @@ from .output_profiles import (
     CODEX_MARKETPLACE_OUTPUT,
     DEFAULT_MARKETPLACE_OUTPUT,
     MarketplaceOutputProfile,
+    resolve_effective_output_path,
 )
 from .ref_resolver import RefResolver
 from .semver import SemVer, parse_semver, satisfies_range
@@ -107,7 +108,7 @@ class ResolvedPackage:
     """A package entry after ref resolution."""
 
     name: str
-    source_repo: str  # "owner/repo" only
+    source_repo: str  # repository path without an optional host
     subdir: str | None  # APM-only (used to compose the output ``source`` object)
     ref: str  # resolved tag name, e.g. "v1.2.0"
     sha: str  # 40-char git SHA
@@ -116,6 +117,9 @@ class ResolvedPackage:
     is_prerelease: bool  # True if the resolved ref was a prerelease semver
     host: str | None = None  # non-default git host parsed from apm.yml source
     source_url: str | None = None  # canonical URL for sourceBase-composed entries
+    # Propagated to marketplace.json so consumer range resolution and
+    # diagnostics use the producer's convention without re-reading apm.yml.
+    effective_tag_pattern: str = ""
 
 
 @dataclass(frozen=True)
@@ -414,11 +418,21 @@ class MarketplaceBuilder:
     def _get_resolver(self) -> RefResolver:
         if self._resolver is None:
             self._ensure_auth()
+            auth = self._resolve_auth_for_host(self._host)
+            harden = getattr(
+                self._auth_resolver,
+                "hardened_git_env_for_context",
+                None,
+            )
             self._resolver = RefResolver(
                 timeout_seconds=self._options.timeout_seconds,
                 offline=self._options.offline,
                 host=self._host,
-                token=self._github_token,
+                token=auth.token if auth else self._github_token,
+                auth_scheme=getattr(auth, "auth_scheme", "basic"),
+                git_env=(harden(auth) if auth is not None and callable(harden) else None),
+                auth_resolver=self._auth_resolver,
+                auth_target=self._host,
             )
         return self._resolver
 
@@ -453,6 +467,11 @@ class MarketplaceBuilder:
             if cached is not None:
                 return cached
             auth = self._resolve_auth_for_host(resolved_host, org=org)
+            harden = getattr(
+                self._auth_resolver,
+                "hardened_git_env_for_context",
+                None,
+            )
             logger.debug(
                 "Creating per-host RefResolver for %s (org=%s, token=%s)",
                 resolved_host,
@@ -464,7 +483,10 @@ class MarketplaceBuilder:
                 offline=self._options.offline,
                 host=resolved_host,
                 token=auth.token if auth else None,
-                auth_scheme=auth.auth_scheme if auth else "basic",
+                auth_scheme=getattr(auth, "auth_scheme", "basic"),
+                git_env=(harden(auth) if auth is not None and callable(harden) else None),
+                auth_resolver=self._auth_resolver,
+                auth_target=resolved_host,
             )
             self._host_resolvers[key] = resolver
             return resolver
@@ -511,13 +533,18 @@ class MarketplaceBuilder:
     # -- output path --------------------------------------------------------
 
     def _output_path(self) -> Path:
-        if self._options.output_override is not None:
-            return self._options.output_override
         yml = self._load_yml()
-        output_path = self._project_root / yml.claude.output
-        # Containment guard -- reject output paths that escape the project root.
-        ensure_path_within(output_path, self._project_root)
-        return output_path
+        overrides = (
+            {DEFAULT_MARKETPLACE_OUTPUT.name: self._options.output_override}
+            if self._options.output_override is not None
+            else None
+        )
+        return resolve_effective_output_path(
+            yml,
+            DEFAULT_MARKETPLACE_OUTPUT,
+            self._project_root,
+            overrides,
+        )
 
     def _mapper_for_profile(self, profile: MarketplaceOutputProfile):
         mapper = MARKETPLACE_OUTPUT_MAPPERS.get(profile.mapper)
@@ -611,6 +638,7 @@ class MarketplaceBuilder:
                 owner_repo,
                 source_host=source_host,
                 source_url=source_url,
+                effective_tag_pattern=entry.tag_pattern or yml.build.tag_pattern,
             )
         # version range resolution
         return self._resolve_version_range(
@@ -630,6 +658,7 @@ class MarketplaceBuilder:
         *,
         source_host: str | None = None,
         source_url: str | None = None,
+        effective_tag_pattern: str = "",
     ) -> ResolvedPackage:
         """Resolve an entry with an explicit ``ref:`` field."""
         ref_text = entry.ref
@@ -649,6 +678,7 @@ class MarketplaceBuilder:
                 is_prerelease=sv.is_prerelease if sv else False,
                 host=self._resolved_output_host(source_host=source_host, source_url=source_url),
                 source_url=source_url,
+                effective_tag_pattern=effective_tag_pattern,
             )
 
         refs = resolver.list_remote_refs(owner_repo)
@@ -682,6 +712,7 @@ class MarketplaceBuilder:
                 is_prerelease=sv.is_prerelease if sv else False,
                 host=self._resolved_output_host(source_host=source_host, source_url=source_url),
                 source_url=source_url,
+                effective_tag_pattern=effective_tag_pattern,
             )
 
         # Try as full refname
@@ -703,6 +734,7 @@ class MarketplaceBuilder:
                 is_prerelease=sv.is_prerelease if sv else False,
                 host=self._resolved_output_host(source_host=source_host, source_url=source_url),
                 source_url=source_url,
+                effective_tag_pattern=effective_tag_pattern,
             )
 
         # Try as branch name
@@ -721,6 +753,7 @@ class MarketplaceBuilder:
                 is_prerelease=False,
                 host=self._resolved_output_host(source_host=source_host, source_url=source_url),
                 source_url=source_url,
+                effective_tag_pattern=effective_tag_pattern,
             )
 
         # HEAD special case
@@ -784,6 +817,7 @@ class MarketplaceBuilder:
             is_prerelease=best_sv.is_prerelease,
             host=self._resolved_output_host(source_host=source_host, source_url=source_url),
             source_url=source_url,
+            effective_tag_pattern=pattern,
         )
 
     # -- concurrent resolution ----------------------------------------------
@@ -1162,8 +1196,11 @@ class MarketplaceBuilder:
     ) -> tuple[Path, tuple[str, ...]]:
         """Write the configured Codex marketplace output using resolved packages."""
         yml = self._load_yml()
-        output_path = self._project_root / yml.codex.output
-        ensure_path_within(output_path, self._project_root)
+        output_path = resolve_effective_output_path(
+            yml,
+            CODEX_MARKETPLACE_OUTPUT,
+            self._project_root,
+        )
         output = self.write_output(CODEX_MARKETPLACE_OUTPUT, resolved, output_path)
         return output.output_path, output.warnings
 

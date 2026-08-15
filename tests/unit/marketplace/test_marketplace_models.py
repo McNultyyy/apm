@@ -22,6 +22,14 @@ class TestMarketplaceSource:
         assert src.branch == "main"
         assert src.path == "marketplace.json"
 
+    def test_explicit_url_port_is_preserved(self):
+        src = MarketplaceSource(
+            name="ado-server",
+            url=("https://ado.example.test:8443/DefaultCollection/Platform/_git/catalog"),
+        )
+        assert src.host == "ado.example.test"
+        assert src.port == 8443
+
     def test_frozen(self):
         src = MarketplaceSource(name="x", owner="o", repo="r")
         with pytest.raises(AttributeError):
@@ -195,6 +203,44 @@ class TestParseMarketplaceJson:
         assert p.source["type"] == "github"
         assert p.source["repo"] == "owner/plugin-repo"
         assert p.source_marketplace == "claude-mkt"
+
+    def test_claude_format_validates_tag_pattern(self):
+        data = {
+            "name": "Claude Plugins",
+            "plugins": [
+                {
+                    "name": "my-plugin",
+                    "source": {
+                        "type": "github",
+                        "repo": "owner/plugin-repo",
+                        "tag_pattern": "{name}/{version}",
+                    },
+                }
+            ],
+        }
+        manifest = parse_marketplace_json(data, "claude-mkt")
+        assert manifest.plugins[0].tag_pattern == "{name}/{version}"
+
+    @pytest.mark.parametrize(
+        "tag_pattern",
+        ["", "release-{name}", "v{version}-{version}", "release-{channel}-{version}"],
+    )
+    def test_claude_format_rejects_invalid_tag_pattern(self, tag_pattern):
+        data = {
+            "name": "Claude Plugins",
+            "plugins": [
+                {
+                    "name": "my-plugin",
+                    "source": {
+                        "type": "github",
+                        "repo": "owner/plugin-repo",
+                        "tag_pattern": tag_pattern,
+                    },
+                }
+            ],
+        }
+        with pytest.raises(ValueError, match=r"source\.tag_pattern"):
+            parse_marketplace_json(data, "claude-mkt")
 
     def test_claude_format_relative(self):
         data = {

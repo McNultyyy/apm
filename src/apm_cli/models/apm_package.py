@@ -300,7 +300,7 @@ class APMPackage:
     target: str | list[str] | None = (
         None  # Singular 'target:' field (legacy/CSV form). May coexist with `targets`
         # being None in apm.yml, but never both populated -- ConflictingTargetsError
-        # is raised at install time. Read by callers that only need a single value.
+        # is raised while parsing. Read by callers that only need a single value.
     )
     targets: list[str] | None = (
         None  # Plural 'targets:' field (canonical YAML-list form, #1335). Stored raw
@@ -561,17 +561,8 @@ class APMPackage:
         target_value = None
         targets_value: list[str] | None = None
         if "targets" in data and "target" in data:
-            target_value = parse_target_field(
-                data.get("target"),
-                source_path=apm_yml_path,
-            )
-            raw_targets = data.get("targets")
-            targets_value = (
-                [str(item).strip() for item in raw_targets if str(item).strip()]
-                if isinstance(raw_targets, list)
-                else [str(raw_targets).strip()]
-            )
-            canonical_targets = ()
+            parse_targets_field(data)
+            raise AssertionError("unreachable: conflicting target keys were accepted")
         elif "targets" in data:
             parsed_targets = parse_targets_field(data)
             targets_value = parsed_targets or None
@@ -701,16 +692,22 @@ def canonical_package_targets(package: object) -> tuple[str, ...]:
 
 
 def canonical_package_target_config(package: object) -> dict[str, object]:
-    """Project canonical targets into the compatibility config shape."""
+    """Project canonical targets into the compatibility config shape.
+
+    Conflicting singular and plural fields remain present so the canonical
+    parser can reject the authoring error before any MCP write.
+    """
+    plural = getattr(package, "targets", None)
+    singular = getattr(package, "target", None)
+    if isinstance(plural, list) and isinstance(singular, (str, list)):
+        return {"target": singular, "targets": list(plural)}
     canonical = canonical_package_targets(package)
     if not canonical:
         return {}
     if isinstance(package, APMPackage):
         return {"targets": list(canonical)}
-    plural = getattr(package, "targets", None)
     if isinstance(plural, list):
         return {"targets": list(canonical)}
-    singular = getattr(package, "target", None)
     if isinstance(singular, str) and len(canonical) == 1:
         return {"target": singular}
     return {"targets": list(canonical)}

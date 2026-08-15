@@ -22,6 +22,7 @@ from .models import CheckResult, CIAuditResult
 
 if TYPE_CHECKING:
     from ..deps.lockfile import LockFile
+    from ..install.audit_replay import PreparedCiAuditReplay
     from ..install.drift import DriftFinding
 
 _logger = logging.getLogger(__name__)
@@ -277,16 +278,28 @@ def _check_skill_subset_consistency(
 def _check_config_consistency(
     manifest: APMPackage,
     lock: LockFile,
+    *,
+    prepared_replay: PreparedCiAuditReplay | None = None,
+    prepared_replay_error: str | None = None,
 ) -> CheckResult:
     """Verify MCP server configs match lockfile baseline."""
     from ..constants import APM_MODULES_DIR
     from ..integration.mcp_config_view import CurrentMcpConfigView
 
     project_root = manifest.package_path or Path.cwd()
+    if prepared_replay_error is not None:
+        return CheckResult(
+            name="config-consistency",
+            passed=False,
+            message=f"config-consistency replay failed: {prepared_replay_error}",
+            details=[prepared_replay_error],
+        )
     view = CurrentMcpConfigView.derive(
         manifest,
         lock,
-        project_root / APM_MODULES_DIR,
+        prepared_replay.modules_root
+        if prepared_replay is not None
+        else project_root / APM_MODULES_DIR,
         trust_transitive_self_defined=True,
     )
     stored_configs = lock.mcp_configs or {}
@@ -338,7 +351,10 @@ def _check_content_integrity(
 
     Two signals are evaluated:
       * Critical hidden Unicode (steganographic markers) via the file
-        scanner.
+        scanner, over every file under the deploy trees the project's
+        targets govern -- NOT only the files the lockfile records, since
+        this signal needs no recorded baseline (see
+        ``scan_deployed_trees``).
       * SHA-256 drift between the on-disk content and the canonical deployment
         ledger hash recorded at install time.
       * Missing canonical ownership metadata for a legacy deployed-file hash.
@@ -349,10 +365,17 @@ def _check_content_integrity(
     and lockfile entries without a recorded hash (e.g. directories) are
     skipped silently.
     """
-    from ..security.file_scanner import scan_lockfile_packages
+    from ..security.file_scanner import scan_project_files
     from ..utils.content_hash import compute_file_hash
 
-    findings_by_file, _files_scanned = scan_lockfile_packages(project_root)
+    # Reuse the already-parsed lock and union its recorded paths with the
+    # independently governed deploy-tree scope. The scanner owns exact path
+    # accounting and preserves lockfile findings outside resolved targets.
+    findings_by_file, _files_scanned = scan_project_files(
+        project_root,
+        lockfile=lock,
+        include_deployed_trees=True,
+    )
 
     # Only critical findings fail this check
     critical_files: list[str] = []
@@ -510,6 +533,7 @@ def _check_drift(
     targets: Sequence[str] | None = None,
     cache_only: bool = True,
     verbose: bool = False,
+    prepared_replay: PreparedCiAuditReplay | None = None,
 ) -> tuple[CheckResult, list[DriftFinding]]:
     """Replay the install in a scratch dir and diff against the project.
 
@@ -536,54 +560,66 @@ def _check_drift(
     from ..integration.targets import resolve_targets
 
     logger = CheckLogger(verbose=verbose)
-    config = ReplayConfig(
-        project_root=project_root,
-        lockfile_path=get_lockfile_path(project_root),
-        targets=frozenset(targets) if targets else None,
-        cache_only=cache_only,
-    )
+    if prepared_replay is None:
+        config = ReplayConfig(
+            project_root=project_root,
+            lockfile_path=get_lockfile_path(project_root),
+            targets=frozenset(targets) if targets else None,
+            cache_only=cache_only,
+        )
 
-    try:
-        scratch = run_replay(config, logger)
-    except LocalResolutionError as exc:
-        return (
-            CheckResult(
-                name="drift",
-                passed=False,
-                message=(
-                    f"drift replay failed: corrupt local dependency graph in the "
-                    f"lockfile ({exc}). Fix the resolved_by chain or re-run 'apm install'."
+        try:
+            scratch = run_replay(config, logger)
+        except LocalResolutionError as exc:
+            return (
+                CheckResult(
+                    name="drift",
+                    passed=False,
+                    message=(
+                        f"drift replay failed: corrupt local dependency graph in the "
+                        f"lockfile ({exc}). Fix the resolved_by chain or re-run 'apm install'."
+                    ),
                 ),
-            ),
-            [],
-        )
-    except CacheMissError:
-        return (
-            CheckResult(
-                name="drift",
-                passed=True,
-                message=(
-                    f"{DRIFT_SKIP_PREFIX}: install cache not populated "
-                    "(run 'apm install' first or pass --no-drift)"
+                [],
+            )
+        except CacheMissError:
+            return (
+                CheckResult(
+                    name="drift",
+                    passed=True,
+                    message=(
+                        f"{DRIFT_SKIP_PREFIX}: install cache not populated "
+                        "(run 'apm install' first or pass --no-drift)"
+                    ),
                 ),
-            ),
-            [],
-        )
-    except NotImplementedError as exc:
-        return (
-            CheckResult(
-                name="drift",
-                passed=False,
-                message=f"drift replay unsupported: {exc}",
-            ),
-            [],
-        )
+                [],
+            )
+        except NotImplementedError as exc:
+            return (
+                CheckResult(
+                    name="drift",
+                    passed=False,
+                    message=f"drift replay unsupported: {exc}",
+                ),
+                [],
+            )
+        resolved_targets = resolve_targets(project_root)
+        tracked_files = None
+    else:
+        scratch = prepared_replay.scratch_root
+        resolved_targets = list(prepared_replay.targets)
+        tracked_files = prepared_replay.tracked_files
 
     logger.diff_start()
-    resolved_targets = resolve_targets(project_root)
     if targets:
         resolved_targets = [t for t in resolved_targets if t.name in set(targets)]
-    findings = diff_scratch_against_project(scratch, project_root, lockfile, resolved_targets)
+    findings = diff_scratch_against_project(
+        scratch,
+        project_root,
+        lockfile,
+        resolved_targets,
+        tracked_files=tracked_files,
+    )
 
     if not findings:
         logger.clean()
@@ -618,6 +654,8 @@ def run_baseline_checks(
     *,
     fail_fast: bool = True,
     ci_mode: bool = False,
+    prepared_replay: PreparedCiAuditReplay | None = None,
+    prepared_replay_error: str | None = None,
 ) -> CIAuditResult:
     """Run all baseline CI checks against a project directory.
 
@@ -713,7 +751,14 @@ def run_baseline_checks(
         return result
 
     # Check 7: Config consistency (MCP)
-    if _run(_check_config_consistency(manifest, lock)):
+    if _run(
+        _check_config_consistency(
+            manifest,
+            lock,
+            prepared_replay=prepared_replay,
+            prepared_replay_error=prepared_replay_error,
+        )
+    ):
         return result
 
     # Check 8: Content integrity

@@ -45,11 +45,54 @@ check_pattern \
     src/apm_cli/bundle/packer.py \
     src/apm_cli/install/mcp/integration.py \
     src/apm_cli/commands/uninstall/engine.py
+effective_target_owner="src/apm_cli/core/target_detection.py"
+effective_target_definition_count=$(grep -Ec \
+    '^def resolve_effective_target_decision\(' "$effective_target_owner" || true)
+effective_target_raw_count=$(grep -Ec \
+    'explicit_target=ctx\.target( or ctx\.runtime)?([,)]|$)' \
+    src/apm_cli/commands/install.py || true)
+effective_target_service_count=$(grep -Fc \
+    'target_decision=target_decision' \
+    src/apm_cli/install/service_integration.py || true)
+effective_target_context_hits=$(grep -En \
+    'target_context=\([^)]*ctx\.target' src/apm_cli/commands/install.py 2>/dev/null || true)
+if [ "$effective_target_definition_count" -ne 1 ] \
+    || ! grep -q 'target_decision = resolve_effective_target_decision(' \
+        src/apm_cli/install/pipeline.py \
+    || ! grep -q 'ctx.target_decision = install_result.target_decision' \
+        src/apm_cli/commands/install.py \
+    || ! grep -q 'target_decision=ctx.target_decision' \
+        src/apm_cli/commands/install.py \
+    || [ "$effective_target_service_count" -lt 2 ] \
+    || ! grep -q 'target_decision = getattr(result, "target_decision", None)' \
+        src/apm_cli/commands/update.py \
+    || [ "$effective_target_raw_count" -ne 1 ] \
+    || [ -n "$effective_target_context_hits" ]; then
+    echo "[x] Package, MCP, and LSP phases must share EffectiveTargetDecision"
+    [ -n "$effective_target_context_hits" ] && echo "$effective_target_context_hits"
+    violations=$((violations + 1))
+fi
 check_pattern \
     "Install orchestration must not branch on native locator target names" \
     'name == "copilot-(app|cowork)"|name in \{.*copilot-(app|cowork)' \
     src/apm_cli/install/deployed_paths.py \
     src/apm_cli/install/manifest_reconcile.py
+experimental_hint_owner="src/apm_cli/install/target_hints.py"
+experimental_hint_definition_count=$(grep -Ec \
+    '^def emit_disabled_experimental_target_hint\(' "$experimental_hint_owner" || true)
+experimental_hint_duplicate_hits=$(
+    grep -rEn --include='*.py' \
+        'requires an experimental flag' \
+        src/apm_cli \
+        | grep -Fv "${experimental_hint_owner}:" \
+        || true
+)
+if [ "$experimental_hint_definition_count" -ne 1 ] \
+    || [ -n "$experimental_hint_duplicate_hits" ]; then
+    echo "[x] Experimental target hints must route through install/target_hints.py"
+    [ -n "$experimental_hint_duplicate_hits" ] && echo "$experimental_hint_duplicate_hits"
+    violations=$((violations + 1))
+fi
 
 echo "[*] AC2: validate-before-mutate boundaries"
 compiled_write_hits=$(
@@ -63,6 +106,23 @@ compiled_write_hits=$(
 if [ -n "$compiled_write_hits" ]; then
     echo "[x] Compiled output writes must use CompiledOutputWriter"
     echo "$compiled_write_hits"
+    violations=$((violations + 1))
+fi
+distributed_compiler="src/apm_cli/compilation/distributed_compiler.py"
+nested_worktree_walk_count=$(grep -Fc \
+    'for directory, child_dirs, files in os.walk(self.base_dir, followlinks=False):' \
+    "$distributed_compiler" || true)
+nested_worktree_boundary_count=$(grep -Fc \
+    '(directory_path / ".git").is_file()' \
+    "$distributed_compiler" || true)
+nested_worktree_prune_count=$(grep -Fc 'child_dirs.clear()' "$distributed_compiler" || true)
+nested_worktree_rglob_hits=$(grep -En 'rglob\("AGENTS\.md"\)' "$distributed_compiler" || true)
+if [ "$nested_worktree_walk_count" -ne 1 ] \
+    || [ "$nested_worktree_boundary_count" -ne 1 ] \
+    || [ "$nested_worktree_prune_count" -ne 1 ] \
+    || [ -n "$nested_worktree_rglob_hits" ]; then
+    echo "[x] Nested worktree cleanup must prune .git-file roots"
+    [ -n "$nested_worktree_rglob_hits" ] && echo "$nested_worktree_rglob_hits"
     violations=$((violations + 1))
 fi
 hook_file="src/apm_cli/integration/hook_integrator.py"
@@ -91,6 +151,34 @@ if [ "$hook_scope_owner_count" -ne 1 ] \
     || [ -n "$hook_scope_duplicate_hits" ]; then
     echo "[x] Hook rewrite scope must route through HookIntegrator"
     [ -n "$hook_scope_duplicate_hits" ] && echo "$hook_scope_duplicate_hits"
+    violations=$((violations + 1))
+fi
+hook_project_dir_owner_count=$(grep -Fc '"CLAUDE_PROJECT_DIR"' "$hook_file" || true)
+hook_project_dir_duplicate_hits=$(
+    grep -REn --include='*.py' '"CLAUDE_PROJECT_DIR"' src/apm_cli \
+        | grep -v "^${hook_file}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if [ "$hook_project_dir_owner_count" -ne 1 ] \
+    || [ -n "$hook_project_dir_duplicate_hits" ]; then
+    echo "[x] Claude project hook paths must be owned by HookIntegrator"
+    [ -n "$hook_project_dir_duplicate_hits" ] && echo "$hook_project_dir_duplicate_hits"
+    violations=$((violations + 1))
+fi
+hook_event_map_owner_count=$(grep -Ec \
+    '^_HOOK_EVENT_MAP[[:space:]]*[:=]' "$hook_file" || true)
+hook_event_map_duplicate_hits=$(
+    grep -REn --include='*.py' \
+        '^_HOOK_EVENT_MAP[[:space:]]*[:=]' \
+        src/apm_cli \
+        | grep -v "^${hook_file}:" \
+        || true
+)
+if [ "$hook_event_map_owner_count" -ne 1 ] \
+    || [ -n "$hook_event_map_duplicate_hits" ]; then
+    echo "[x] Native hook event mapping must have one HookIntegrator owner"
+    [ -n "$hook_event_map_duplicate_hits" ] && echo "$hook_event_map_duplicate_hits"
     violations=$((violations + 1))
 fi
 check_pattern \
@@ -253,6 +341,35 @@ if ! grep -q '^def should_force_ref_recheck(' "$ref_recheck_owner" \
     echo "[x] Existing-path ref rechecks must use drift.py::should_force_ref_recheck"
     violations=$((violations + 1))
 fi
+ref_freshness_owner="src/apm_cli/deps/tiered_ref_resolver.py"
+ref_freshness_consumers=(
+    src/apm_cli/install/phases/resolve.py
+    src/apm_cli/install/helpers/ref_seed.py
+    src/apm_cli/commands/outdated.py
+)
+ref_freshness_duplicate_hits=$(
+    grep -rEn --include='*.py' \
+        'ctx\.update_refs[[:space:]]+or[[:space:]]+ctx\.refresh|def [[:alnum:]_]*ref_freshness|class [[:alnum:]_]*RefFreshness' \
+        src/apm_cli \
+        | grep -v "^${ref_freshness_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if ! grep -q '^class RefFreshnessPolicy(Enum):' "$ref_freshness_owner" \
+    || ! grep -q '^def ref_freshness_policy_for_install(' "$ref_freshness_owner" \
+    || ! grep -q '^    if freshness_policy\.allows_bare_cache:' \
+        "$ref_freshness_owner" \
+    || ! grep -q 'ref_freshness_policy_for_install(ctx)' "${ref_freshness_consumers[0]}" \
+    || ! grep -q 'ref_freshness_policy_for_install(ctx)' "${ref_freshness_consumers[1]}" \
+    || ! grep -q 'freshness_policy=RefFreshnessPolicy.CURRENT_REMOTE' \
+        "${ref_freshness_consumers[2]}" \
+    || grep -rEq --include='*.py' --exclude='tiered_ref_resolver.py' \
+        'L2BareRevParse' src/apm_cli \
+    || [ -n "$ref_freshness_duplicate_hits" ]; then
+    echo "[x] Git ref freshness must route through RefFreshnessPolicy"
+    [ -n "$ref_freshness_duplicate_hits" ] && echo "$ref_freshness_duplicate_hits"
+    violations=$((violations + 1))
+fi
 cleanup_claim_owner="src/apm_cli/install/phases/cleanup.py"
 cleanup_claim_output=$(python3 scripts/check_cleanup_claim_owner.py "$cleanup_claim_owner" 2>&1)
 cleanup_claim_status=$?
@@ -270,6 +387,18 @@ if [ "$shared_target_status" -ne 0 ]; then
     echo "$shared_target_output"
     violations=$((violations + 1))
 fi
+merge_hook_membership_body=$(awk '
+    /^def merge_hook_config_paths\(/ {flag=1}
+    flag && /^def / && !/^def merge_hook_config_paths\(/ {exit}
+    flag {print}
+' src/apm_cli/install/manifest_reconcile.py)
+if ! printf '%s\n' "$merge_hook_membership_body" | grep -q '_MERGE_HOOK_TARGETS' \
+    || ! printf '%s\n' "$merge_hook_membership_body" | grep -q '_APM_HOOKS_SIDECAR' \
+    || printf '%s\n' "$merge_hook_membership_body" \
+        | grep -Eq 'settings\.json|hooks\.json|apm-hooks\.json'; then
+    echo "[x] Drift hook membership exemptions must derive from HookIntegrator registries"
+    violations=$((violations + 1))
+fi
 check_pattern \
     "Resolver queue dedup must preserve ref constraints" \
     'queued_keys.*get_unique_key|get_unique_key.*queued_keys' \
@@ -278,6 +407,31 @@ if ! grep -A12 'if source == "local"' src/apm_cli/models/dependency/identity.py 
     | grep -q 'anchored_local_path' \
     || ! grep -q 'declaring_parent' src/apm_cli/deps/lockfile.py; then
     echo "[x] Local identity must use its anchor and persist declaring-parent provenance"
+    violations=$((violations + 1))
+fi
+uninstall_selection_owner="src/apm_cli/models/dependency/selection.py"
+uninstall_selection_consumer="src/apm_cli/commands/uninstall/engine.py"
+uninstall_selection_owner_count=$(grep -Ec \
+    '^def select_manifest_dependency\(' "$uninstall_selection_owner" || true)
+uninstall_selection_consumer_count=$(grep -Ec \
+    '^[[:space:]]*selection = select_manifest_dependency\(' \
+    "$uninstall_selection_consumer" || true)
+uninstall_selection_parallel_hits=$(grep -En \
+    'for dep_entry in current_deps|dep_ref\.get_identity\(\) == pkg_identity' \
+    "$uninstall_selection_consumer" || true)
+uninstall_selection_ast_output=$(python3 scripts/check_uninstall_selection_owner.py 2>&1)
+uninstall_selection_ast_status=$?
+if [ "$uninstall_selection_owner_count" -ne 1 ] \
+    || [ "$uninstall_selection_consumer_count" -ne 1 ] \
+    || ! grep -q 'dependency = parse_dependency_entry(entry)' \
+        "$uninstall_selection_owner" \
+    || [ -n "$uninstall_selection_parallel_hits" ] \
+    || [ "$uninstall_selection_ast_status" -ne 0 ]; then
+    echo "[x] Uninstall selection must route through dependency/selection.py"
+    [ -n "$uninstall_selection_parallel_hits" ] \
+        && echo "$uninstall_selection_parallel_hits"
+    [ "$uninstall_selection_ast_status" -ne 0 ] \
+        && echo "$uninstall_selection_ast_output"
     violations=$((violations + 1))
 fi
 check_pattern \
@@ -351,6 +505,23 @@ if ! echo "$run_replay_body" | grep -q 'integrate_package_primitives(' \
     echo "[x] Audit replay must preserve locked skill subset intent"
     violations=$((violations + 1))
 fi
+audit_ci_gate_body=$(awk '
+    /^def _audit_ci_gate\(/ {flag=1}
+    flag && /^def / && !/^def _audit_ci_gate\(/ {exit}
+    flag {print}
+' src/apm_cli/commands/audit.py)
+config_consistency_body=$(awk '
+    /^def _check_config_consistency\(/ {flag=1}
+    flag && /^def / && !/^def _check_config_consistency\(/ {exit}
+    flag {print}
+' src/apm_cli/policy/ci_checks.py)
+if ! grep -q '^def prepare_ci_audit_replay(' src/apm_cli/install/audit_replay.py \
+    || ! printf '%s\n' "$audit_ci_gate_body" | grep -q 'prepare_ci_audit_replay' \
+    || printf '%s\n' "$audit_ci_gate_body" | grep -q 'run_replay(' \
+    || ! printf '%s\n' "$config_consistency_body" | grep -q 'prepared_replay\.modules_root'; then
+    echo "[x] CI audit scratch materialization must route through install/audit_replay.py"
+    violations=$((violations + 1))
+fi
 local_bundle_marker_hits=$(
     grep -rEn --include='*.py' \
         "_LOCAL_BUNDLE_OWNER|active_owner.*[\"']local-bundle[\"']|[\"']local-bundle[\"'].*active_owner|owners.*[\"']local-bundle[\"']" \
@@ -366,6 +537,48 @@ if ! grep -q 'DeploymentLedgerCodec.record_local_bundle_files' \
     || [ -n "$local_bundle_marker_hits" ]; then
     echo "[x] Local-bundle replay provenance must route through DeploymentLedgerCodec"
     [ -n "$local_bundle_marker_hits" ] && echo "$local_bundle_marker_hits"
+    violations=$((violations + 1))
+fi
+drift_membership_body=$(awk '
+    /^def _collect_tracked_files\(/ {flag=1}
+    flag && /^def / && !/^def _collect_tracked_files\(/ {exit}
+    flag {print}
+' src/apm_cli/install/drift.py)
+drift_hash_shape_body=$(awk '
+    /^def _collect_hashed_files\(/ {flag=1}
+    flag && /^def / && !/^def _collect_hashed_files\(/ {exit}
+    flag {print}
+' src/apm_cli/install/drift.py)
+if ! printf '%s\n' "$drift_membership_body" \
+        | grep -q 'DeploymentLedgerCodec.legacy_deployed_file_claims' \
+    || ! printf '%s\n' "$drift_hash_shape_body" \
+        | grep -q 'DeploymentLedgerCodec.legacy_deployed_file_hash_paths' \
+    || printf '%s\n%s\n' "$drift_membership_body" "$drift_hash_shape_body" \
+        | grep -Eq 'lockfile\.dependencies|local_deployed_files|deployed_file_hashes'; then
+    echo "[x] Drift deployment membership must route through DeploymentLedgerCodec"
+    violations=$((violations + 1))
+fi
+scanner_membership_body=$(awk '
+    /^def scan_lockfile_packages\(/ {flag=1}
+    flag && /^def / && !/^def scan_lockfile_packages\(/ {exit}
+    flag {print}
+' src/apm_cli/security/file_scanner.py)
+if ! printf '%s\n' "$scanner_membership_body" \
+        | grep -q 'DeploymentLedgerCodec.legacy_deployed_file_claims' \
+    || printf '%s\n' "$scanner_membership_body" \
+        | grep -Eq 'lock\.dependencies|dep\.deployed_files'; then
+    echo "[x] Hidden-Unicode membership must route through DeploymentLedgerCodec"
+    violations=$((violations + 1))
+fi
+membership_owner_body=$(awk '
+    /^    def legacy_deployed_file_claims\(/ {flag=1}
+    flag && /^    def / && !/legacy_deployed_file_claims/ {exit}
+    flag {print}
+' src/apm_cli/core/deployment_ledger.py)
+if ! printf '%s\n' "$membership_owner_body" | grep -q 'dependency\.deployed_files' \
+    || ! printf '%s\n' "$membership_owner_body" | grep -q 'lockfile\.local_deployed_files' \
+    || printf '%s\n' "$membership_owner_body" | grep -q 'from_lockfile'; then
+    echo "[x] Legacy deployed-file membership projection belongs to DeploymentLedgerCodec"
     violations=$((violations + 1))
 fi
 update_plan_ref_body=$(awk '
@@ -422,6 +635,12 @@ if ! grep -q 'detect_output_mode' src/apm_cli/cli.py \
 fi
 if ! grep -q '_clear_git_auth_env(env)' src/apm_cli/core/auth.py; then
     echo "[x] AuthResolver must scrub inherited Git authorization state"
+    violations=$((violations + 1))
+fi
+if ! grep -q '"repo_ref": _redact_policy_ref(repo_ref)' src/apm_cli/policy/discovery.py \
+    || ! grep -q '"chain_refs": \[_redact_policy_ref(ref) for ref in persisted_chain_refs\]' \
+        src/apm_cli/policy/discovery.py; then
+    echo "[x] Policy cache metadata must redact URL credentials at its canonical writer"
     violations=$((violations + 1))
 fi
 check_pattern \
@@ -514,6 +733,19 @@ if ! printf '%s\n' "$packed_source_body" \
     || [ -n "$packed_source_parallel_hits" ]; then
     echo "[x] Packed marketplace sources must use DependencyReference.parse_from_dict"
     [ -n "$packed_source_parallel_hits" ] && echo "$packed_source_parallel_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC10b: local marketplace audit resolution authority"
+if ! grep -Fq 'resolve_local_plugin_path(' src/apm_cli/marketplace/audit.py \
+    || grep -Fq '_resolve_local_relative_source' src/apm_cli/marketplace/audit.py \
+    || ! grep -Fq 'relative_target="apm.yml"' src/apm_cli/marketplace/audit.py \
+    || ! awk '
+        /^def resolve_local_plugin_path\(/ {flag=1}
+        flag && /^def / && !/^def resolve_local_plugin_path\(/ {exit}
+        flag {print}
+    ' src/apm_cli/marketplace/resolver.py | grep -Fq 'ensure_path_within('; then
+    echo "[x] Local marketplace audit paths must use resolve_local_plugin_path"
     violations=$((violations + 1))
 fi
 
@@ -633,6 +865,27 @@ if [ "$target_instruction_contraction_status" -ne 0 ]; then
     violations=$((violations + 1))
 fi
 
+echo "[*] AC15b: effective package target authorization authority"
+package_target_output=$(python3 scripts/check_package_target_authority.py --root "$ROOT" 2>&1)
+package_target_status=$?
+if [ "$package_target_status" -ne 0 ]; then
+    echo "[x] Effective package target authorization must route through install/target_filter.py"
+    echo "$package_target_output"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC15c: merged-hook ownership marker authority"
+hook_ownership_owner="src/apm_cli/integration/hook_ownership.py"
+hook_ownership_consumer="src/apm_cli/integration/hook_integrator.py"
+if ! grep -q '^def dependency_hook_source_marker(' "$hook_ownership_owner" \
+    || ! grep -q '^def dependency_hook_sources(' "$hook_ownership_owner" \
+    || ! grep -q 'from apm_cli.integration.hook_ownership import (' \
+        "$hook_ownership_consumer" \
+    || grep -q '^    def _dependency_hook_source' "$hook_ownership_consumer"; then
+    echo "[x] Merged-hook ownership markers must route through integration/hook_ownership.py"
+    violations=$((violations + 1))
+fi
+
 echo "[*] AC16: post-uninstall reachability owner authority"
 if ! grep -Eq 'reachability\.compute_forward_reachable_keys|from \.\.\.deps\.reachability import|from apm_cli\.deps\.reachability import' \
     src/apm_cli/commands/uninstall/engine.py; then
@@ -675,6 +928,612 @@ deployment_owner_status=$?
 if [ "$deployment_owner_status" -ne 0 ]; then
     echo "[x] Deployment ownership must route through DeploymentLedgerCodec"
     echo "$deployment_owner_output"
+    violations=$((violations + 1))
+fi
+if ! grep -q '^_LEGACY_USER_TARGET_PREFIXES = {' src/apm_cli/core/deployment_ledger.py \
+    || ! grep -q '".copilot/": "copilot"' src/apm_cli/core/deployment_ledger.py \
+    || ! grep -q '^    def legacy_scope(' src/apm_cli/core/deployment_ledger.py \
+    || ! grep -q \
+        'scope=DeploymentLedgerCodec.legacy_scope(path)' \
+        src/apm_cli/install/manifest_reconcile.py \
+    || ! grep -q \
+        'if targets is None and user_scope and t.user_root_dir is not None:' \
+        src/apm_cli/integration/targets.py; then
+    echo "[x] Legacy user deployment scope must route through DeploymentLedgerCodec"
+    violations=$((violations + 1))
+fi
+
+deployment_state_output=$(python3 scripts/check_deployment_state_mutations.py \
+    src/apm_cli 2>&1)
+deployment_state_status=$?
+if [ "$deployment_state_status" -ne 0 ]; then
+    echo "[x] Deployment compatibility state must mutate only through canonical owners"
+    echo "$deployment_state_output"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC19: git-subprocess auth-header injection authority"
+# #2368: build_authorization_header_git_env / build_ado_bearer_git_env return
+# an overlay with a hardcoded GIT_CONFIG_COUNT="1". Dict-merging that overlay
+# onto an env that already carries indexed GIT_CONFIG_* entries resets the
+# count and clobbers index 0, silently dropping inherited git hardening
+# (safe.bareRepository, http.sslCAInfo, credential.interactive). The single
+# owner for injecting an Authorization header into a git-subprocess env is
+# set_authorization_header_git_env / set_ado_bearer_git_env (in-place
+# rewrite); dict-merging the build_* overlay onto a populated env is the
+# exact defect those setters exist to prevent from recurring.
+auth_header_dictmerge_hits=$(
+    grep -rEn --include='*.py' \
+        '\.update\(\s*build_(authorization_header_git_env|ado_bearer_git_env)\(|\{\*\*[A-Za-z_][A-Za-z0-9_.]*,\s*\*\*build_(authorization_header_git_env|ado_bearer_git_env)\(' \
+        src/apm_cli \
+        | grep -vE ':[0-9]+:[[:space:]]*#' \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if [ -n "$auth_header_dictmerge_hits" ]; then
+    echo "[x] Git-subprocess Authorization-header injection must use set_authorization_header_git_env / set_ado_bearer_git_env (in-place); dict-merging the build_* overlay onto a populated env re-introduces the #2368 clobber bug"
+    echo "$auth_header_dictmerge_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC20: public github.com anonymous-first auth authority"
+public_github_auth_owner="src/apm_cli/core/auth.py"
+public_github_auth_duplicate_defs=$(
+    grep -rEn --include='*.py' \
+        '^[[:space:]]*def uses_public_github_anonymous_first\(' \
+        src/apm_cli \
+        | grep -v "^${public_github_auth_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+public_github_auth_consumers="
+src/apm_cli/deps/clone_engine.py
+src/apm_cli/deps/download_strategies.py
+src/apm_cli/deps/git_reference_resolver.py
+src/apm_cli/deps/github_downloader.py
+src/apm_cli/deps/github_downloader_validation.py
+"
+public_github_auth_missing_consumers=""
+for consumer in $public_github_auth_consumers; do
+    if ! grep -q 'uses_public_github_anonymous_first(' "$consumer"; then
+        public_github_auth_missing_consumers="${public_github_auth_missing_consumers}
+${consumer}"
+    fi
+done
+noninteractive_git_env_bypasses=$(
+    grep -rEn --include='*.py' \
+        'GitAuthEnvBuilder\.noninteractive_env\(' \
+        src/apm_cli \
+        | grep -v '^src/apm_cli/core/auth.py:' \
+        | grep -v '^src/apm_cli/deps/git_auth_env.py:' \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if ! grep -q '^    def uses_public_github_anonymous_first(' "$public_github_auth_owner" \
+    || ! grep -q '^    def build_public_github_anonymous_git_env(' "$public_github_auth_owner" \
+    || ! grep -q '^    def build_noninteractive_git_env(' "$public_github_auth_owner" \
+    || ! grep -q 'lazy_public_github' "$public_github_auth_owner" \
+    || [ -n "$public_github_auth_duplicate_defs" ] \
+    || [ -n "$public_github_auth_missing_consumers" ] \
+    || [ -n "$noninteractive_git_env_bypasses" ]; then
+    echo "[x] Public and noninteractive Git environments must stay owned by AuthResolver"
+    [ -n "$public_github_auth_duplicate_defs" ] && echo "$public_github_auth_duplicate_defs"
+    [ -n "$public_github_auth_missing_consumers" ] \
+        && echo "Missing owner routing:${public_github_auth_missing_consumers}"
+    [ -n "$noninteractive_git_env_bypasses" ] && echo "$noninteractive_git_env_bypasses"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC21: MCP manifest target precedence authority"
+mcp_manifest_adapter=$(
+    awk '
+        /^def _declared_manifest_target_runtimes\(/ { capture = 1 }
+        /^def _resolve_target_runtimes\(/ { capture = 0 }
+        capture { print }
+    ' src/apm_cli/integration/mcp_integrator_install.py
+)
+mcp_target_resolver=$(
+    awk '
+        /^def _resolve_target_runtimes\(/ { capture = 1 }
+        /^def _install_self_defined_deps\(/ { capture = 0 }
+        capture { print }
+    ' src/apm_cli/integration/mcp_integrator_install.py
+)
+mcp_manifest_selection_line=$(
+    grep -n '_declared_manifest_target_runtimes(apm_config)' \
+        <<<"$mcp_target_resolver" \
+        | head -1 \
+        | cut -d: -f1
+)
+mcp_discovery_line=$(
+    grep -n '_discover_installed_runtimes(' \
+        <<<"$mcp_target_resolver" \
+        | head -1 \
+        | cut -d: -f1
+)
+mcp_integration_validation=$(
+    awk '
+        /^def run_mcp_integration\(/ { capture = 1 }
+        capture { print }
+    ' src/apm_cli/install/mcp/integration.py
+)
+mcp_validation_line=$(
+    grep -n 'parse_targets_field(mcp_apm_config)' \
+        <<<"$mcp_integration_validation" \
+        | head -1 \
+        | cut -d: -f1
+)
+mcp_install_line=$(
+    grep -n 'MCPIntegrator.install(' \
+        <<<"$mcp_integration_validation" \
+        | head -1 \
+        | cut -d: -f1
+)
+mcp_target_projection=$(
+    awk '
+        /^def canonical_package_target_config\(/ { capture = 1 }
+        /^def package_target_selection\(/ { capture = 0 }
+        capture { print }
+    ' src/apm_cli/models/apm_package.py
+)
+if ! grep -q 'parse_targets_field(apm_config)' <<<"$mcp_manifest_adapter" \
+    || grep -Eq \
+        'TARGET_CAPABILITIES|CANONICAL_TARGETS|KNOWN_TARGETS|\[[^]]*(copilot|claude|cursor|codex|gemini|opencode|windsurf|kiro)' \
+        <<<"$mcp_manifest_adapter" \
+    || [ -z "$mcp_manifest_selection_line" ] \
+    || [ -z "$mcp_discovery_line" ] \
+    || [ "$mcp_manifest_selection_line" -ge "$mcp_discovery_line" ] \
+    || grep -q 'parse_targets_field(' <<<"$mcp_target_resolver" \
+    || [ -z "$mcp_validation_line" ] \
+    || [ -z "$mcp_install_line" ] \
+    || [ "$mcp_validation_line" -ge "$mcp_install_line" ] \
+    || ! grep -q 'return {"target": singular, "targets": list(plural)}' \
+        <<<"$mcp_target_projection"; then
+    echo "[x] MCP target precedence must route through the canonical manifest adapter before discovery"
+    violations=$((violations + 1))
+fi
+mcp_ownership_migration_owner="src/apm_cli/install/mcp/ownership.py"
+mcp_ownership_migration_duplicates=$(
+    grep -rEn --include='*.py' \
+        '^[[:space:]]*def migrate_legacy_project_target_servers\(' \
+        src/apm_cli \
+        | grep -v "^${mcp_ownership_migration_owner}:" \
+        || true
+)
+if ! grep -q '^def migrate_legacy_project_target_servers(' \
+        "$mcp_ownership_migration_owner" \
+    || ! grep -q 'migrate_legacy_project_target_servers(' \
+        src/apm_cli/integration/mcp_integrator_install.py \
+    || [ -n "$mcp_ownership_migration_duplicates" ]; then
+    echo "[x] Legacy MCP target ownership migration must stay owned by install/mcp/ownership.py"
+    [ -n "$mcp_ownership_migration_duplicates" ] && echo "$mcp_ownership_migration_duplicates"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC22: module-level behavioral test taxonomy authority"
+taxonomy_plugin="tests/quality/taxonomy_inventory_plugin.py"
+taxonomy_contract="tests/quality/test_test_taxonomy.py"
+taxonomy_parallel_hits=$(
+    grep -En \
+        '(^|[^A-Za-z_])(MANIFEST|_manifest_modules|tracked_python_inventory)|behavioral markers outside critical manifest|len\(modules\)[[:space:]]*==' \
+        "$taxonomy_contract" \
+        || true
+)
+if ! grep -q 'getattr(module, "pytestmark"' "$taxonomy_plugin" \
+    || ! grep -q '"modules": modules' "$taxonomy_plugin" \
+    || ! grep -q '"nodes": nodes' "$taxonomy_plugin" \
+    || ! grep -q '^def _assert_marker_only_taxonomy(' "$taxonomy_contract" \
+    || ! grep -q '^def test_tm003_multiple_node_classifications_fail(' "$taxonomy_contract" \
+    || ! grep -q '^def test_tm003_mixed_module_classifications_fail(' "$taxonomy_contract" \
+    || ! grep -q '^def test_tm004_new_module_classification_needs_no_whitelist(' \
+        "$taxonomy_contract" \
+    || [ -n "$taxonomy_parallel_hits" ]; then
+    echo "[x] Behavioral test taxonomy must stay owned by module-level pytestmark"
+    [ -n "$taxonomy_parallel_hits" ] && echo "$taxonomy_parallel_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC23: host-classification authority"
+identity_owner="src/apm_cli/models/dependency/identity.py"
+if ! grep -q 'if is_github_hostname(effective_host):' "$identity_owner" \
+    || grep -Eq 'effective_host.*==.*default_host|configured_default_host' "$identity_owner"; then
+    echo "[x] Package identity casing must route through is_github_hostname"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC24: ADO transport credential authority"
+ado_transport_direct_hits=$(
+    grep -En '(\._host|host)\.ado_token' \
+        src/apm_cli/deps/download_strategies.py \
+        src/apm_cli/deps/clone_engine.py \
+        src/apm_cli/deps/github_downloader_validation.py \
+        || true
+)
+if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/auth.py \
+    || ! grep -q '"COPILOT_GITHUB_TOKEN"' src/apm_cli/core/auth.py \
+    || ! grep -q 'self.auth_resolver.git_env_for_context(' \
+        src/apm_cli/deps/github_downloader.py \
+    || ! grep -q 'downloader.auth_resolver.git_env_for_context(' \
+        src/apm_cli/deps/github_downloader_validation.py \
+    || ! grep -q 'probe_env = auth_resolver.git_env_for_context(' \
+        src/apm_cli/install/pipeline.py \
+    || grep -q 'if is_generic or is_azure_devops_hostname(host):' \
+        src/apm_cli/install/pipeline.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/install/helpers/ref_reuse.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/marketplace/client.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/marketplace/builder.py \
+    || ! grep -q 'ctx.token or ctx.host_info.kind == "ado"' \
+        src/apm_cli/marketplace/auth_helpers.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/commands/marketplace/check.py \
+    || ! grep -q 'auth_resolver.try_with_fallback(' \
+        src/apm_cli/policy/discovery.py \
+    || ! grep -q 'key = (host, dep.port, org)' \
+        src/apm_cli/install/pipeline.py \
+    || [ -n "$ado_transport_direct_hits" ]; then
+    echo "[x] ADO transport credentials must route through AuthResolver context"
+    [ -n "$ado_transport_direct_hits" ] && echo "$ado_transport_direct_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC25: lifecycle smoke partition authority"
+lifecycle_topology_contract="tests/quality/test_ci_topology.py"
+lifecycle_membership_hits=$(
+    grep -En \
+        'LIFECYCLE_SMOKE_(FULL_COUNT|MERGE_GROUP_COUNT|REQUIRED_COUNT|MERGE_GROUP_NODES)|expected_(full_count|merge_group_nodes|required_count)' \
+        "$lifecycle_topology_contract" \
+        || true
+)
+if ! grep -q '^def _validated_lifecycle_node_set(' "$lifecycle_topology_contract" \
+    || ! grep -q '^def _assert_lifecycle_partition_sets(' "$lifecycle_topology_contract" \
+    || ! grep -q 'merge_group < full' "$lifecycle_topology_contract" \
+    || ! grep -q 'required == full - merge_group' "$lifecycle_topology_contract" \
+    || [ -n "$lifecycle_membership_hits" ]; then
+    echo "[x] Lifecycle marker partitions must be collection-derived, never count/list pinned"
+    [ -n "$lifecycle_membership_hits" ] && echo "$lifecycle_membership_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC26: self-update release selection authority"
+self_update_owner="src/apm_cli/commands/self_update.py"
+self_update_owner_defs=$(grep -Ec \
+    '^class _ResolvedSelfUpdateRelease:|^def _resolve_self_update_release\(' \
+    "$self_update_owner" || true)
+self_update_duplicate_defs=$(
+    grep -rEn --include='*.py' \
+        '^class _ResolvedSelfUpdateRelease:|^def _resolve_self_update_release\(' \
+        src/apm_cli \
+        | grep -v "^${self_update_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if [ "$self_update_owner_defs" -ne 2 ] \
+    || [ -n "$self_update_duplicate_defs" ] \
+    || ! grep -q \
+        'release = _resolve_self_update_release(latest_version)' \
+        "$self_update_owner" \
+    || ! grep -q \
+        'resolved_ref = release.tag if release is not None else _INSTALL_SCRIPT_REF' \
+        "$self_update_owner" \
+    || ! grep -q 'env\[_ENV_VERSION\] = release.tag' "$self_update_owner" \
+    || ! grep -q '_get_update_installer_url(release)' "$self_update_owner" \
+    || ! grep -q '_build_self_update_installer_env(release)' "$self_update_owner" \
+    || ! grep -q 'return _normalize_release_tag(pinned)' \
+        src/apm_cli/utils/version_checker.py; then
+    echo "[x] Self-update installer URL and VERSION must share _ResolvedSelfUpdateRelease"
+    [ -n "$self_update_duplicate_defs" ] && echo "$self_update_duplicate_defs"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC27: frozen install decision authority"
+frozen_owner="src/apm_cli/install/service.py"
+frozen_adapter="src/apm_cli/commands/install.py"
+frozen_preflight_line=$(grep -n 'InstallService\.enforce_frozen(' "$frozen_adapter" \
+    | head -1 | cut -d: -f1)
+frozen_migration_line=$(grep -n 'migrate_lockfile_if_needed(ctx\.apm_dir)' "$frozen_adapter" \
+    | head -1 | cut -d: -f1)
+frozen_add_guard_line=$(grep -n 'InstallService\.reject_frozen_mutation(' "$frozen_adapter" \
+    | head -1 | cut -d: -f1)
+frozen_root_guard_line=$(grep -n 'InstallService\.reject_missing_frozen_root(' "$frozen_adapter" \
+    | head -1 | cut -d: -f1)
+root_redirect_line=$(grep -n '_root_redirect = install_root_redirect(' "$frozen_adapter" \
+    | head -1 | cut -d: -f1)
+dedicated_mcp_line=$(grep -n '^[[:space:]]*_handle_mcp_install(' "$frozen_adapter" \
+    | tail -1 | cut -d: -f1)
+local_bundle_line=$(grep -n 'if len(packages) == 1 and not mcp_name' "$frozen_adapter" \
+    | head -1 | cut -d: -f1)
+frozen_duplicate_hits=$(
+    grep -rEn --include='*.py' 'raise FrozenInstallError' src/apm_cli \
+        | grep -v "^${frozen_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if ! grep -q '^    def enforce_frozen(' "$frozen_owner" \
+    || ! grep -q '^    def reject_frozen_mutation(' "$frozen_owner" \
+    || ! grep -q '^    def reject_missing_frozen_root(' "$frozen_owner" \
+    || [ -z "$frozen_preflight_line" ] \
+    || [ -z "$frozen_migration_line" ] \
+    || [ "$frozen_preflight_line" -ge "$frozen_migration_line" ] \
+    || [ -z "$frozen_add_guard_line" ] \
+    || [ -z "$frozen_root_guard_line" ] \
+    || [ -z "$root_redirect_line" ] \
+    || [ "$frozen_root_guard_line" -ge "$root_redirect_line" ] \
+    || [ -z "$dedicated_mcp_line" ] \
+    || [ -z "$local_bundle_line" ] \
+    || [ "$frozen_add_guard_line" -ge "$dedicated_mcp_line" ] \
+    || [ "$frozen_add_guard_line" -ge "$local_bundle_line" ] \
+    || [ -n "$frozen_duplicate_hits" ]; then
+    echo "[x] Frozen install decisions must route through InstallService before mutation"
+    [ -n "$frozen_duplicate_hits" ] && echo "$frozen_duplicate_hits"
+    violations=$((violations + 1))
+fi
+echo "[*] AC25: root vs dependency MCP declaration-scope authority"
+mcp_scope_owner="src/apm_cli/integration/mcp_config_view.py"
+mcp_root_scope_body=$(awk '
+    /^    def derive\(/ {flag=1}
+    flag && /^    def / && !/^    def derive\(/ {exit}
+    flag {print}
+' "$mcp_scope_owner")
+mcp_locked_scope_body=$(awk '
+    /^def _collect_locked_dependencies\(/ {flag=1}
+    flag && /^def / && !/^def _collect_locked_dependencies\(/ {exit}
+    flag {print}
+' "$mcp_scope_owner")
+mcp_unlocked_scope_body=$(awk '
+    /^def _collect_unlocked_compat\(/ {flag=1}
+    flag && /^def / && !/^def _collect_unlocked_compat\(/ {exit}
+    flag {print}
+' "$mcp_scope_owner")
+if [ "$(printf '%s\n' "$mcp_root_scope_body" \
+        | grep -c 'root\.get_all_mcp_dependencies()')" -ne 1 ] \
+    || printf '%s\n%s\n' "$mcp_locked_scope_body" "$mcp_unlocked_scope_body" \
+        | grep -q 'get_all_mcp_dependencies()' \
+    || [ "$(printf '%s\n' "$mcp_locked_scope_body" \
+        | grep -c 'package\.get_mcp_dependencies()')" -ne 1 ] \
+    || [ "$(printf '%s\n' "$mcp_unlocked_scope_body" \
+        | grep -c 'package\.get_mcp_dependencies()')" -ne 1 ]; then
+    echo "[x] Transitive MCP dependency scope must use production-only collection"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC26: MCP container launcher authority"
+mcp_container_owner="src/apm_cli/adapters/client/base.py"
+mcp_container_consumers=(
+    src/apm_cli/adapters/client/copilot.py
+    src/apm_cli/adapters/client/codex.py
+    src/apm_cli/adapters/client/gemini.py
+    src/apm_cli/adapters/client/vscode.py
+)
+mcp_image_owner_defs=$(grep -rEc \
+    '^[[:space:]]*def _ensure_docker_image_arg\(' \
+    src/apm_cli/adapters/client --include='*.py' \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+mcp_container_missing_consumers=$(grep -L \
+    '_ensure_docker_image_arg(' "${mcp_container_consumers[@]}" || true)
+if ! grep -q '_REGISTRY_TYPE_ALIASES = {"oci": "docker"}' "$mcp_container_owner" \
+    || [ "$mcp_image_owner_defs" -ne 1 ] \
+    || [ -n "$mcp_container_missing_consumers" ]; then
+    echo "[x] MCP container launcher decisions must route through MCPClientAdapter"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC25: host-classification authority"
+identity_owner="src/apm_cli/models/dependency/identity.py"
+if ! grep -q 'if is_github_hostname(effective_host):' "$identity_owner" \
+    || grep -Eq 'effective_host.*==.*default_host|configured_default_host' "$identity_owner"; then
+    echo "[x] Package identity casing must route through is_github_hostname"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC26: ADO transport credential authority"
+ado_transport_direct_hits=$(
+    grep -En '(\._host|host)\.ado_token' \
+        src/apm_cli/deps/download_strategies.py \
+        src/apm_cli/deps/clone_engine.py \
+        src/apm_cli/deps/github_downloader_validation.py \
+        || true
+)
+if ! grep -q '_clear_platform_token_env(env)' src/apm_cli/core/auth.py \
+    || ! grep -q '"COPILOT_GITHUB_TOKEN"' src/apm_cli/core/auth.py \
+    || ! grep -q 'self.auth_resolver.git_env_for_context(' \
+        src/apm_cli/deps/github_downloader.py \
+    || ! grep -q 'downloader.auth_resolver.git_env_for_context(' \
+        src/apm_cli/deps/github_downloader_validation.py \
+    || ! grep -q 'probe_env = auth_resolver.git_env_for_context(' \
+        src/apm_cli/install/pipeline.py \
+    || grep -q 'if is_generic or is_azure_devops_hostname(host):' \
+        src/apm_cli/install/pipeline.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/install/helpers/ref_reuse.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/marketplace/client.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/marketplace/builder.py \
+    || ! grep -q 'ctx.token or ctx.host_info.kind == "ado"' \
+        src/apm_cli/marketplace/auth_helpers.py \
+    || ! grep -q 'hardened_git_env_for_context' \
+        src/apm_cli/commands/marketplace/check.py \
+    || ! grep -q 'auth_resolver.try_with_fallback(' \
+        src/apm_cli/policy/discovery.py \
+    || ! grep -q 'key = (host, dep.port, org)' \
+        src/apm_cli/install/pipeline.py \
+    || [ -n "$ado_transport_direct_hits" ]; then
+    echo "[x] ADO transport credentials must route through AuthResolver context"
+    [ -n "$ado_transport_direct_hits" ] && echo "$ado_transport_direct_hits"
+    violations=$((violations + 1))
+fi
+echo "[*] AC28: JetBrains Copilot MCP config-path authority"
+intellij_path_owner="src/apm_cli/adapters/client/intellij.py"
+intellij_path_owner_count=$(grep -Ec '^def _intellij_config_dir\(' "$intellij_path_owner" || true)
+intellij_legacy_owner_count=$(
+    grep -Ec '^def _legacy_intellij_config_dir\(' "$intellij_path_owner" || true
+)
+intellij_path_duplicate_hits=$(
+    grep -rEn --include='*.py' \
+        'github-copilot.{0,80}intellij|intellij.{0,80}github-copilot' \
+        src/apm_cli \
+        | grep -v "^${intellij_path_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if [ "$intellij_path_owner_count" -ne 1 ] \
+    || [ "$intellij_legacy_owner_count" -ne 1 ] \
+    || [ -n "$intellij_path_duplicate_hits" ]; then
+    echo "[x] JetBrains Copilot MCP paths must come from the IntelliJ adapter"
+    [ -n "$intellij_path_duplicate_hits" ] && echo "$intellij_path_duplicate_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC27: marketplace tag-pattern authority"
+tag_pattern_owner="src/apm_cli/marketplace/tag_pattern.py"
+tag_pattern_parallel_hits=$(
+    grep -rEn --include='*.py' \
+        '["'\'']\{version\}["'\''][[:space:]]+(not[[:space:]]+)?in[[:space:]]+(pattern|tag_pattern)|\.(count)\(["'\'']\{version\}["'\'']\)' \
+        src/apm_cli/marketplace \
+        | grep -v "^${tag_pattern_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if ! grep -q '^def validate_tag_pattern(' "$tag_pattern_owner" \
+    || ! grep -A8 '^def _validate_tag_pattern(' \
+        src/apm_cli/marketplace/yml_schema.py \
+        | grep -q 'validate_tag_pattern(pattern, context=context)' \
+    || ! grep -A12 'raw_tp = source.get("tag_pattern")' \
+        src/apm_cli/marketplace/models.py \
+        | grep -q 'tag_pattern = validate_tag_pattern(' \
+    || ! grep -q 'tag_pattern = validate_tag_pattern(tag_pattern)' \
+        src/apm_cli/marketplace/version_resolver.py \
+    || [ -n "$tag_pattern_parallel_hits" ]; then
+    echo "[x] Marketplace tag patterns must route through marketplace/tag_pattern.py"
+    [ -n "$tag_pattern_parallel_hits" ] && echo "$tag_pattern_parallel_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC31: marketplace effective-output-path authority"
+if ! bash scripts/check_marketplace_output_path_authority.sh; then
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC29: dependency identity and materialization path authority"
+identity_owner="src/apm_cli/models/dependency/identity.py"
+materialization_owner="src/apm_cli/models/dependency/materialization.py"
+reference_owner="src/apm_cli/models/dependency/reference.py"
+unique_key_body=$(awk '
+    /^def build_dependency_unique_key\(/ {flag=1}
+    flag && /^def / && !/^def build_dependency_unique_key\(/ {exit}
+    flag {print}
+' "$identity_owner")
+install_path_body=$(awk '
+    /^    def get_install_path\(/ {flag=1}
+    flag && /^    def / && !/^    def get_install_path\(/ {exit}
+    flag {print}
+' "$reference_owner")
+materialization_path_body=$(awk '
+    /^def build_materialization_path\(/ {flag=1}
+    flag && /^def / && !/^def build_materialization_path\(/ {exit}
+    flag {print}
+' "$materialization_owner")
+if ! printf '%s\n' "$unique_key_body" | grep -q 'normalize_package_repo_url(' \
+    || ! grep -q '^def prepare_materialization_path(' "$materialization_owner" \
+    || ! grep -q 'prepare_materialization_path(' src/apm_cli/install/phases/resolve.py \
+    || ! printf '%s\n' "$install_path_body" \
+        | grep -q 'return build_materialization_path(self, apm_modules_dir)' \
+    || ! printf '%s\n' "$materialization_path_body" \
+        | grep -q 'repo_parts = dependency.repo_url.split("/")' \
+    || printf '%s\n' "$materialization_path_body" \
+        | grep -Eq 'canonical_repo_url|normalize_package_repo_url|\.lower\(\)|\.casefold\(\)' \
+    || grep -q 'self\.repo_url = normalize_package_repo_url' "$reference_owner"; then
+    echo "[x] Dependency identity may casefold only in identity.py; materialization must preserve source casing"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC30: MCP non-container launcher argv authority"
+mcp_noncontainer_consumers=(
+    src/apm_cli/adapters/client/copilot.py
+    src/apm_cli/adapters/client/vscode.py
+)
+mcp_noncontainer_owner_defs=$(grep -rEc \
+    '^[[:space:]]*def _build_non_container_launcher_argv\(' \
+    src/apm_cli/adapters/client --include='*.py' \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+mcp_noncontainer_missing_consumers=$(grep -L \
+    'self\._build_non_container_launcher_argv(' \
+    "${mcp_noncontainer_consumers[@]}" || true)
+mcp_legacy_extractor_calls=$(
+    grep -rEn --include='*.py' \
+        '_extract_package_args\(' src/apm_cli/adapters/client \
+        | grep -vE ':[0-9]+:[[:space:]]*def _extract_package_args\(' \
+        || true
+)
+if [ "$mcp_noncontainer_owner_defs" -ne 1 ] \
+    || ! grep -q 'cls\._build_non_container_launcher_argv(' "$mcp_container_owner" \
+    || [ -n "$mcp_noncontainer_missing_consumers" ] \
+    || [ -n "$mcp_legacy_extractor_calls" ]; then
+    echo "[x] MCP non-container launcher argv must route through MCPClientAdapter"
+    [ -n "$mcp_legacy_extractor_calls" ] && echo "$mcp_legacy_extractor_calls"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC30: local marketplace package-version source authority"
+local_version_owner="src/apm_cli/marketplace/version_check.py"
+local_version_duplicate_hits=$(
+    grep -rEn --include='*.py' \
+        '^[[:space:]]*def _read_(local|plugin).*version\(' \
+        src/apm_cli/marketplace \
+        | grep -v "^${local_version_owner}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+if [ "$(grep -Ec '^def _read_local_version\(|^def _read_plugin_json_version\(' \
+        "$local_version_owner")" -ne 2 ] \
+    || ! grep -q 'return _read_plugin_json_version(package_root)' "$local_version_owner" \
+    || ! grep -q 'plugin_json = find_plugin_json(package_root)' "$local_version_owner" \
+    || [ -n "$local_version_duplicate_hits" ]; then
+    echo "[x] Local marketplace package versions must route through marketplace/version_check.py"
+    [ -n "$local_version_duplicate_hits" ] && echo "$local_version_duplicate_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC31: applyTo normalization and hidden-tool placement authority"
+apply_to_owner="src/apm_cli/utils/patterns.py"
+apply_to_normalizer_defs=$(grep -rEc --include='*.py' \
+    '^def _?normalize_apply_to\(' src/apm_cli \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+apply_to_parser="src/apm_cli/primitives/parser.py"
+hidden_tool_placement_owner="src/apm_cli/compilation/context_optimizer.py"
+hidden_tool_tree_defs=$(grep -rEc --include='*.py' \
+    '^PLACEMENT_HIDDEN_TOOL_TREES[[:space:]]*=' src/apm_cli \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+if [ "$apply_to_normalizer_defs" -ne 1 ] \
+    || ! grep -q '^def normalize_apply_to(' "$apply_to_owner" \
+    || ! grep -q 'from apm_cli.utils.patterns import normalize_apply_to' "$apply_to_parser" \
+    || grep -Eq '^def _?normalize_apply_to\(' "$apply_to_parser" \
+    || ! grep -q 'normalize_apply_to(metadata.get("applyTo"), default="")' "$apply_to_parser" \
+    || [ "$hidden_tool_tree_defs" -ne 1 ] \
+    || ! grep -q '^PLACEMENT_HIDDEN_TOOL_TREES = frozenset(' "$hidden_tool_placement_owner" \
+    || ! grep -q 'not self._is_supported_hidden_tool_root(path)' "$hidden_tool_placement_owner"; then
+    echo "[x] applyTo normalization must use utils/patterns.py and hidden placement ContextOptimizer"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC32: MCP runtime argument variable authority"
+mcp_runtime_variable_owner_defs=$(grep -rEc \
+    '^[[:space:]]*def _substitute_runtime_variables\(' \
+    src/apm_cli/adapters/client --include='*.py' \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+if [ "$mcp_runtime_variable_owner_defs" -ne 1 ] \
+    || ! grep -q '^    def _substitute_runtime_variables(' "$mcp_container_owner" \
+    || ! grep -q 'cls\._substitute_runtime_variables(' src/apm_cli/adapters/client/vscode.py; then
+    echo "[x] MCP runtime argument variables must route through MCPClientAdapter"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC18: bootstrap project-name authority"
+if ! uv run --extra dev python scripts/lint-bootstrap-project-name.py; then
+    echo "[x] Manifest bootstrap names must route through core/project_name.py"
     violations=$((violations + 1))
 fi
 

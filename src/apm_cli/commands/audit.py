@@ -25,7 +25,7 @@ from ..core.deployment_ledger import (
 from ..deps.lockfile import LockFile, get_lockfile_path
 from ..policy._help_text import POLICY_SOURCE_FORMS_HELP
 from ..security.content_scanner import ContentScanner, ScanFinding
-from ..security.file_scanner import scan_lockfile_packages
+from ..security.file_scanner import scan_project_files
 from ..utils.console import (
     STATUS_SYMBOLS,
     _get_console,
@@ -553,8 +553,29 @@ def _audit_ci_gate(
 
     fail_fast = not no_fail_fast
 
+    prepared_replay = None
+    prepared_replay_error = None
+    if (cfg.project_root / "apm.yml").exists() and not (cfg.project_root / "apm_modules").exists():
+        from ..deps.lockfile import get_lockfile_path
+        from ..install.audit_replay import CiAuditReplayError, prepare_ci_audit_replay
+
+        if get_lockfile_path(cfg.project_root).exists():
+            try:
+                prepared_replay = prepare_ci_audit_replay(
+                    cfg.project_root,
+                    verbose=cfg.verbose,
+                )
+            except CiAuditReplayError as exc:
+                prepared_replay_error = str(exc)
+
     # Always run baseline checks
-    ci_result = run_baseline_checks(cfg.project_root, fail_fast=fail_fast, ci_mode=True)
+    ci_result = run_baseline_checks(
+        cfg.project_root,
+        fail_fast=fail_fast,
+        ci_mode=True,
+        prepared_replay=prepared_replay,
+        prepared_replay_error=prepared_replay_error,
+    )
 
     # Resolve policy source: explicit --policy wins; otherwise mirror
     # install's auto-discovery (closes #827) so CI catches sideloaded
@@ -672,12 +693,24 @@ def _audit_ci_gate(
         if lockfile_path.exists():
             lockfile = LockFile.read(lockfile_path)
             if lockfile is not None:
-                drift_check, drift_findings = _check_drift(
-                    cfg.project_root,
-                    lockfile,
-                    cache_only=True,
-                    verbose=cfg.verbose,
-                )
+                if prepared_replay_error is not None:
+                    from ..policy.models import CheckResult
+
+                    drift_check = CheckResult(
+                        name="drift",
+                        passed=False,
+                        message=f"drift replay failed: {prepared_replay_error}",
+                        details=[prepared_replay_error],
+                    )
+                    drift_findings = []
+                else:
+                    drift_check, drift_findings = _check_drift(
+                        cfg.project_root,
+                        lockfile,
+                        cache_only=prepared_replay is None,
+                        verbose=cfg.verbose,
+                        prepared_replay=prepared_replay,
+                    )
                 ci_result.checks.append(drift_check)
     elif no_drift and cfg.output_format == "text":
         # In structured output (json/sarif), --no-drift is implicit from
@@ -887,7 +920,7 @@ def _audit_content_scan(
                 if package:
                     logger.progress(f"Scanning package: {package}")
                 else:
-                    logger.start("Scanning all installed packages...")
+                    logger.start("Scanning installed packages and deployed files...")
 
             from apm_cli.deps.lockfile import LockfileFormatError
 
@@ -898,10 +931,11 @@ def _audit_content_scan(
                     if lockfile is not None
                     else ()
                 )
-                findings_by_file, files_scanned = scan_lockfile_packages(
+                findings_by_file, files_scanned = scan_project_files(
                     project_root,
                     package_filter=package,
                     lockfile=lockfile,
+                    include_deployed_trees=package is None,
                 )
             except LockfileFormatError as exc:
                 logger.error(f"Cannot audit invalid apm.lock.yaml: {exc}")
@@ -913,7 +947,7 @@ def _audit_content_scan(
                         f"Package '{package}' not found in apm.lock.yaml or has no deployed files"
                     )
                 else:
-                    logger.progress("No deployed files found in apm.lock.yaml")
+                    logger.progress("No deployed files found")
                 sys.exit(0)
         if not lockfile_path.exists():
             owner_violations = ()

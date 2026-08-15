@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -227,14 +227,32 @@ class LocalGitRepositoryFactory:
         append an adjacent remote suffix onto a sibling fixture repository
         path (same containment as :meth:`install_url_rewrite`).
         """
-        repository = self._owned_repository(repository)
-        remote_forms = self._remote_url_forms(remote_url)
+        return self.url_rewrite_subprocess_env_many(((repository, remote_url),))
+
+    def url_rewrite_subprocess_env_many(
+        self,
+        rewrites: Sequence[tuple[LocalGitRepository, str]],
+    ) -> dict[str, str]:
+        """Return one child env routing multiple remotes to owned repositories."""
+        if not rewrites:
+            raise ValueError("At least one repository rewrite is required")
         self._reject_preexisting_process_git_config(self._env)
-        rewrite_base = f"{repository.file_url}/"
-        key = f"url.{rewrite_base}.insteadOf"
+        slots: list[tuple[str, str]] = []
+        remote_owners: dict[str, Path] = {}
+        for repository, remote_url in rewrites:
+            repository = self._owned_repository(repository)
+            rewrite_base = f"{repository.file_url}/"
+            key = f"url.{rewrite_base}.insteadOf"
+            for remote_form in self._remote_url_forms(remote_url):
+                prior = remote_owners.setdefault(remote_form, repository.origin)
+                if prior != repository.origin:
+                    raise ValueError(
+                        f"Remote URL is assigned to multiple fixture repositories: {remote_form}"
+                    )
+                slots.append((key, remote_form))
         env = dict(self._env)
-        env["GIT_CONFIG_COUNT"] = str(len(remote_forms))
-        for index, remote_form in enumerate(remote_forms):
+        env["GIT_CONFIG_COUNT"] = str(len(slots))
+        for index, (key, remote_form) in enumerate(slots):
             env[f"GIT_CONFIG_KEY_{index}"] = key
             env[f"GIT_CONFIG_VALUE_{index}"] = remote_form
         return env

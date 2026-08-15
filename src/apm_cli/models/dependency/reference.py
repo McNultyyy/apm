@@ -3,7 +3,7 @@
 import re
 import urllib.parse
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from ...cache.url_normalize import SCP_LIKE_RE
 from ...utils.github_host import (
@@ -16,12 +16,12 @@ from ...utils.github_host import (
     is_visualstudio_legacy_hostname,
     maybe_raise_bare_fqdn_github_gitlab_conflict,
     parse_artifactory_path,
+    reject_unsupported_ado_server_base_path,
     unsupported_host_error,
     validate_ssh_user,
 )
 from ...utils.path_security import (
     PathTraversalError,
-    ensure_path_within,
     validate_path_segments,
 )
 from ..validation import InvalidVirtualPackageExtensionError
@@ -35,8 +35,10 @@ from .identity import (
     _split_shorthand_host_port,
     build_canonical_dependency_string,
     build_dependency_unique_key,
+    is_case_insensitive_package_identity,
     normalize_package_repo_url,
 )
+from .materialization import build_materialization_path
 from .object_fields import (
     apply_optional_dependency_fields,
     local_path_apm_yml_entry,
@@ -117,10 +119,22 @@ class DependencyReference(ProviderCoordinateMixin):
     marketplace_plugin_name: str | None = None
     marketplace_version_spec: str | None = None
 
-    def __post_init__(self) -> None:
-        """Normalize case-insensitive package identity at the model boundary."""
-        self.repo_url = normalize_package_repo_url(
+    @property
+    def canonical_repo_url(self) -> str:
+        """Return the comparison-only repository identity."""
+        return normalize_package_repo_url(
             self.repo_url,
+            host=self.host,
+            source=self.source,
+            registry_prefix=self.artifactory_prefix,
+            is_local=self.is_local,
+            is_marketplace=self.is_marketplace,
+        )
+
+    @property
+    def has_case_insensitive_repo_identity(self) -> bool:
+        """Return whether repository casing is presentation-only."""
+        return is_case_insensitive_package_identity(
             host=self.host,
             source=self.source,
             registry_prefix=self.artifactory_prefix,
@@ -210,8 +224,6 @@ class DependencyReference(ProviderCoordinateMixin):
 
     def is_azure_devops(self) -> bool:
         """Check if this reference points to Azure DevOps."""
-        from ...utils.github_host import is_azure_devops_hostname
-
         return self.host is not None and is_azure_devops_hostname(self.host)
 
     @classmethod
@@ -330,6 +342,7 @@ class DependencyReference(ProviderCoordinateMixin):
             registry_prefix=self.artifactory_prefix,
             declaring_parent=self.declaring_parent,
             anchored_local_path=self.anchored_local_path,
+            is_marketplace=self.is_marketplace,
         )
 
     def get_resolution_key(self) -> str:
@@ -343,6 +356,28 @@ class DependencyReference(ProviderCoordinateMixin):
         if self.is_local and self.anchored_local_path:
             return f"local:{self.anchored_local_path}"
         return self.get_unique_key()
+
+    def _format_reference(self, repo_url: str) -> str:
+        """Format one scheme-free reference from the supplied repository path."""
+        if self.is_local and self.local_path:
+            return self.local_path
+
+        host = self.host or default_host()
+        is_default = host.lower() == default_host().lower()
+        host_label = f"{host}:{self.port}" if self.port else host
+
+        if is_default and not self.port and not self.artifactory_prefix:
+            result = repo_url
+        elif self.artifactory_prefix:
+            result = f"{host_label}/{self.artifactory_prefix}/{repo_url}"
+        else:
+            result = f"{host_label}/{repo_url}"
+
+        if self.is_virtual and self.virtual_path:
+            result = f"{result}/{self.virtual_path}"
+        if self.reference:
+            result = f"{result}#{self.reference}"
+        return result
 
     def to_canonical(self) -> str:
         """Return the canonical scheme-free identity string for this dependency.
@@ -361,32 +396,11 @@ class DependencyReference(ProviderCoordinateMixin):
         Returns:
             str: Canonical dependency string
         """
-        if self.is_local and self.local_path:
-            return self.local_path
+        return self._format_reference(self.canonical_repo_url)
 
-        host = self.host or default_host()
-
-        is_default = host.lower() == default_host().lower()
-        # Custom port is part of the transport and must travel with the host label.
-        host_label = f"{host}:{self.port}" if self.port else host
-
-        # Start with optional host prefix
-        if is_default and not self.port and not self.artifactory_prefix:
-            result = self.repo_url
-        elif self.artifactory_prefix:
-            result = f"{host_label}/{self.artifactory_prefix}/{self.repo_url}"
-        else:
-            result = f"{host_label}/{self.repo_url}"
-
-        # Append virtual path for virtual packages
-        if self.is_virtual and self.virtual_path:
-            result = f"{result}/{self.virtual_path}"
-
-        # Append reference (branch, tag, commit)
-        if self.reference:
-            result = f"{result}#{self.reference}"
-
-        return result
+    def to_display_reference(self) -> str:
+        """Return a portable reference retaining source repository casing."""
+        return self._format_reference(self.repo_url)
 
     def get_identity(self) -> str:
         """Return the identity of this dependency (canonical form without ref/alias).
@@ -402,14 +416,16 @@ class DependencyReference(ProviderCoordinateMixin):
 
         host = self.host or default_host()
         is_default = host.lower() == default_host().lower()
-        host_label = f"{host}:{self.port}" if self.port else host
+        normalized_host = host.lower()
+        host_label = f"{normalized_host}:{self.port}" if self.port else normalized_host
+        repo_url = self.canonical_repo_url
 
         if is_default and not self.port and not self.artifactory_prefix:
-            result = self.repo_url
+            result = repo_url
         elif self.artifactory_prefix:
-            result = f"{host_label}/{self.artifactory_prefix}/{self.repo_url}"
+            result = f"{host_label}/{self.artifactory_prefix}/{repo_url}"
         else:
-            result = f"{host_label}/{self.repo_url}"
+            result = f"{host_label}/{repo_url}"
 
         if self.is_virtual and self.virtual_path:
             result = f"{result}/{self.virtual_path}"
@@ -444,7 +460,7 @@ class DependencyReference(ProviderCoordinateMixin):
             str: Host-blind canonical string (e.g., "owner/repo")
         """
         return build_canonical_dependency_string(
-            self.repo_url,
+            self.canonical_repo_url,
             is_local=self.is_local,
             local_path=self.local_path,
             is_virtual=self.is_virtual,
@@ -465,80 +481,7 @@ class DependencyReference(ProviderCoordinateMixin):
         Returns:
             Path: Absolute path to the package installation directory
         """
-        if self.is_marketplace:
-            raise ValueError(
-                f"Cannot compute install path for unresolved marketplace dependency "
-                f"'{self.marketplace_plugin_name}@{self.marketplace_name}'"
-            )
-
-        if self.is_local and self.local_path:
-            pkg_dir_name = Path(self.local_path).name
-            validate_path_segments(
-                pkg_dir_name,
-                context="local package path",
-                reject_empty=True,
-            )
-            if self.declaring_parent:
-                import hashlib
-
-                identity = self.anchored_local_path or self.local_path
-                parent_slot = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
-                result = apm_modules_dir / "_local" / parent_slot / pkg_dir_name
-            else:
-                result = apm_modules_dir / "_local" / pkg_dir_name
-            ensure_path_within(result, apm_modules_dir)
-            return result
-
-        repo_parts = self.repo_url.split("/")
-
-        # Security: reject traversal in repo_url segments (catches lockfile injection)
-        validate_path_segments(self.repo_url, context="repo_url")
-
-        # Security: reject traversal in virtual_path (catches lockfile injection)
-        if self.virtual_path:
-            validate_path_segments(self.virtual_path, context="virtual_path")
-        result: Path | None = None
-
-        if self.is_virtual:
-            # Subdirectory packages (like Claude Skills) should use natural path structure
-            if self.is_virtual_subdirectory():
-                # Use repo path + subdirectory path
-                if self.is_azure_devops() and len(repo_parts) >= 3:
-                    # ADO: org/project/repo/subdir
-                    result = (
-                        apm_modules_dir
-                        / repo_parts[0]
-                        / repo_parts[1]
-                        / repo_parts[2]
-                        / self.virtual_path
-                    )
-                elif len(repo_parts) >= 2:
-                    # owner/repo/subdir or group/subgroup/repo/subdir
-                    result = apm_modules_dir.joinpath(*repo_parts, self.virtual_path)
-            else:
-                # Virtual file/collection: use sanitized package name (flattened)
-                package_name = self.get_virtual_package_name()
-                if self.is_azure_devops() and len(repo_parts) >= 3:
-                    # ADO: org/project/virtual-pkg-name
-                    result = apm_modules_dir / repo_parts[0] / repo_parts[1] / package_name
-                elif len(repo_parts) >= 2:
-                    # owner/virtual-pkg-name (use first segment as namespace)
-                    result = apm_modules_dir / repo_parts[0] / package_name
-        # Regular package: use full repo path
-        elif self.is_azure_devops() and len(repo_parts) >= 3:
-            # ADO: org/project/repo
-            result = apm_modules_dir / repo_parts[0] / repo_parts[1] / repo_parts[2]
-        elif len(repo_parts) >= 2:
-            # owner/repo or group/subgroup/repo (generic hosts)
-            result = apm_modules_dir.joinpath(*repo_parts)
-
-        if result is None:
-            # Fallback: join all parts
-            result = apm_modules_dir.joinpath(*repo_parts)
-
-        # Security: ensure the computed path stays within apm_modules/
-        ensure_path_within(result, apm_modules_dir)
-        return result
+        return build_materialization_path(self, apm_modules_dir)
 
     @staticmethod
     def _reject_shorthand_alias(dependency_str: str) -> None:
@@ -1150,95 +1093,10 @@ class DependencyReference(ProviderCoordinateMixin):
 
     @classmethod
     def _parse_registry_object_entry(cls, entry: dict) -> "DependencyReference":
-        """Parse the object-form registry entry per §3.2.
+        """Parse the object-form registry entry per §3.2. See ``registry_entry.py``."""
+        from .registry_entry import parse_registry_object_entry
 
-        Required keys:
-            id:       <owner>/<repo>   # package identity at the registry
-            version:  <any-string>      # opaque version string; registry resolves it
-
-        Optional:
-            registry: <name>           # routes to named registry; omit to use default
-            path:     prompts/foo.md   # virtual sub-path; omit to install the whole package
-            alias:    <name>           # same meaning as in other object forms
-        """
-        from ...deps.registry.feature_gate import require_package_registry_enabled
-
-        require_package_registry_enabled("Object-form registry dependencies")
-
-        _registry_raw = entry.get("registry")
-        registry_name: str | None = None
-        if _registry_raw is not None:
-            if not isinstance(_registry_raw, str) or not _registry_raw.strip():
-                raise ValueError(
-                    "Object-form registry entry: 'registry' must be a non-empty "
-                    "string (the name of an entry in the apm.yml registries: block)"
-                )
-            registry_name = _registry_raw.strip()
-
-        pkg_id = entry.get("id")
-        if not isinstance(pkg_id, str) or not pkg_id.strip():
-            raise ValueError(
-                "Object-form registry entry: 'id' is required and must be a "
-                "non-empty 'owner/repo' string"
-            )
-        pkg_id = pkg_id.strip()
-        if "/" not in pkg_id:
-            raise ValueError(
-                f"Object-form registry entry: 'id' must be 'owner/repo', got {pkg_id!r}"
-            )
-
-        raw_path = entry.get("path")
-        sub_path: str | None = None
-        if raw_path is not None:
-            if not isinstance(raw_path, str) or not raw_path.strip():
-                raise ValueError(
-                    "Object-form registry entry: 'path' must be a non-empty string "
-                    "when provided (e.g. 'prompts/review.prompt.md')"
-                )
-            sub_path = raw_path.strip().strip("/").replace("\\", "/").strip("/")
-            validate_path_segments(sub_path, context="path")
-
-        version = entry.get("version")
-        if not isinstance(version, str) or not version.strip():
-            raise ValueError("Object-form registry entry: 'version' is required")
-        version = version.strip()
-
-        alias = entry.get("alias")
-        if alias is not None:
-            if not isinstance(alias, str) or not alias.strip():
-                raise ValueError("'alias' field must be a non-empty string")
-            alias = alias.strip()
-            if not re.match(r"^[a-zA-Z0-9._-]+$", alias):
-                raise ValueError(
-                    f"Invalid alias: {alias}. Aliases can only contain "
-                    f"letters, numbers, dots, underscores, and hyphens"
-                )
-
-        # Reject any unknown keys to catch typos early.
-        known = {"registry", "id", "path", "version", "alias"}
-        unknown = set(entry.keys()) - known
-        if unknown:
-            raise ValueError(
-                f"Object-form registry entry has unknown fields: "
-                f"{sorted(unknown)}. Known fields: {sorted(known)}"
-            )
-
-        owner_segments = pkg_id.split("/")
-        validate_path_segments(pkg_id, context="registry id")
-        for seg in owner_segments:
-            if not re.match(r"^[a-zA-Z0-9._-]+$", seg):
-                raise ValueError(f"Invalid registry id segment: {seg!r} in {pkg_id!r}")
-
-        return cls(
-            repo_url=pkg_id,
-            host=default_host(),
-            reference=version,
-            virtual_path=sub_path,
-            is_virtual=sub_path is not None,
-            alias=alias,
-            source="registry",
-            registry_name=registry_name,
-        )
+        return parse_registry_object_entry(cls, entry)
 
     @classmethod
     def _detect_virtual_package(cls, dependency_str: str):
@@ -1895,7 +1753,7 @@ class DependencyReference(ProviderCoordinateMixin):
         # --- Local path detection (must run before URL/host parsing) ---
         if cls.is_local_path(dependency_str):
             local = dependency_str.strip()
-            pkg_name = Path(local).name
+            pkg_name = (PureWindowsPath(local) if "\\" in local else Path(local)).name
             if not pkg_name or pkg_name in (".", ".."):
                 raise ValueError(
                     f"Local path '{local}' does not resolve to a named directory. "
@@ -1915,6 +1773,7 @@ class DependencyReference(ProviderCoordinateMixin):
             )
 
         cls._reject_shorthand_alias(dependency_str)
+        reject_unsupported_ado_server_base_path(dependency_str)
 
         maybe_raise_bare_fqdn_github_gitlab_conflict(dependency_str)
 
@@ -1992,11 +1851,13 @@ class DependencyReference(ProviderCoordinateMixin):
         - HTTP (insecure) git deps: returns a dict with 'git' and 'allow_insecure' keys.
         - Git deps with skill_subset or target_subset: returns a dict with 'git' plus
           the applicable optional keys.
-        - All other deps: returns the canonical string (same as to_canonical()).
+        - Registry deps (object-form ``id:``/``registry:``): always returns a dict
+          with 'id', 'version', plus the applicable optional keys.
+        - All other deps: returns a scheme-free string retaining repository casing.
 
         Returns:
-            str or dict: String for simple deps; dict for local-with-subsets, HTTP, or
-            skill/target-subset deps.
+            str or dict: String for simple deps; dict for local-with-subsets, HTTP,
+            registry, or skill/target-subset deps.
 
         Raises:
             ValueError: If this is an unresolved marketplace dependency.
@@ -2006,6 +1867,20 @@ class DependencyReference(ProviderCoordinateMixin):
                 f"Cannot serialize unresolved marketplace dependency "
                 f"'{self.marketplace_plugin_name}@{self.marketplace_name}'"
             )
+        if self.source == "registry":
+            entry: dict[str, object] = {"id": self.repo_url}
+            if self.registry_name:
+                entry["registry"] = self.registry_name
+            if self.virtual_path:
+                entry["path"] = self.virtual_path
+            entry["version"] = self.reference
+            if self.alias:
+                entry["alias"] = self.alias
+            if self.skill_subset:
+                entry["skills"] = sorted(self.skill_subset)
+            if self.target_subset:
+                entry["targets"] = sorted(self.target_subset)
+            return entry
         if self.is_local and self.local_path:
             if self.skill_subset or self.target_subset or self.alias:
                 return local_path_apm_yml_entry(
@@ -2014,7 +1889,7 @@ class DependencyReference(ProviderCoordinateMixin):
                     self.skill_subset,
                     self.target_subset,
                 )
-            return self.to_canonical()
+            return self.to_display_reference()
         if self.is_insecure:
             host = self.host or default_host()
             netloc = f"{host}:{self.port}" if self.port else host
@@ -2030,7 +1905,7 @@ class DependencyReference(ProviderCoordinateMixin):
                 entry["targets"] = sorted(self.target_subset)
             return entry
         if self.skill_subset or self.target_subset:
-            entry = {"git": self.get_identity()}
+            entry = {"git": self._format_reference(self.repo_url).split("#", 1)[0]}
             if self.reference:
                 entry["ref"] = self.reference
             if self.alias:
@@ -2040,7 +1915,7 @@ class DependencyReference(ProviderCoordinateMixin):
             if self.target_subset:
                 entry["targets"] = sorted(self.target_subset)
             return entry
-        return self.to_canonical()
+        return self.to_display_reference()
 
     def to_github_url(self) -> str:
         """Convert to the canonical repository URL, or return a local path."""
@@ -2057,7 +1932,8 @@ class DependencyReference(ProviderCoordinateMixin):
             ado_repo = self.ado_repo
             project = urllib.parse.quote(ado_project, safe="")
             repo = urllib.parse.quote(ado_repo, safe="")
-            return f"https://{netloc}/{organization}/{project}/_git/{repo}"
+            org_path = "" if is_visualstudio_legacy_hostname(host) else f"{organization}/"
+            return f"https://{netloc}/{org_path}{project}/_git/{repo}"
         elif self.artifactory_prefix:
             return f"{scheme}://{netloc}/{self.artifactory_prefix}/{self.repo_url}"
         else:

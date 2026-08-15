@@ -5,11 +5,32 @@ with runtime-neutral target selection.
 """
 
 import builtins
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from apm_cli.core.target_detection import EffectiveTargetDecision
     from apm_cli.models.apm_package import APMPackage
+
+
+def _cleanup_runtimes(
+    *,
+    runtime: str | None,
+    target_decision: "EffectiveTargetDecision | None",
+    owned_targets: builtins.dict | None,
+    user_scope: bool,
+) -> list[str | None]:
+    """Return only runtimes whose APM-owned MCP state may need cleanup."""
+    if runtime is not None:
+        return [runtime]
+    if owned_targets:
+        return sorted(owned_targets)
+    if target_decision is not None:
+        selected = target_decision.runtime_targets_for_scope(user_scope=user_scope)
+        if selected:
+            return list(selected)
+    return [None]
 
 
 def run_mcp_integration(  # noqa: PLR0913
@@ -34,7 +55,9 @@ def run_mcp_integration(  # noqa: PLR0913
     no_policy: bool = False,
     verbose: bool = False,
     explicit_target: str | list[str] | None = None,
+    target_decision: "EffectiveTargetDecision | None" = None,
     scope=None,
+    trusted_transitive_configs: (Mapping[str, tuple[str, Mapping[str, Any]]] | None) = None,
 ) -> tuple[int, dict]:
     """Run MCP server integration after APM package installation.
 
@@ -69,6 +92,8 @@ def run_mcp_integration(  # noqa: PLR0913
         no_policy: Skip policy enforcement for the merged MCP set.
         verbose: Show detailed installation information.
         explicit_target: Explicit target selected by CLI or manifest.
+        trusted_transitive_configs: Exact declaring-package/config pairs for
+            previously trusted self-defined servers that a no-op update may preserve.
         scope: Optional InstallScope for user/project filtering.
 
     Returns:
@@ -88,7 +113,7 @@ def run_mcp_integration(  # noqa: PLR0913
     from apm_cli.policy.install_preflight import run_policy_preflight
 
     current_view = None
-    if should_install:
+    if should_install and (mcp_deps or apm_modules_path.exists()):
         lockfile = LockFile.read(lock_path) if lock_path.exists() else None
         current_view = CurrentMcpConfigView.derive(
             apm_package,
@@ -96,6 +121,8 @@ def run_mcp_integration(  # noqa: PLR0913
             apm_modules_path,
             trust_transitive_self_defined=trust_transitive_mcp,
             diagnostics=diagnostics,
+            logger=logger,
+            trusted_transitive_configs=trusted_transitive_configs,
         )
         root_count = len(apm_package.get_all_mcp_dependencies())
         transitive_count = max(0, len(current_view.dependencies) - root_count)
@@ -130,9 +157,21 @@ def run_mcp_integration(  # noqa: PLR0913
     mcp_count = 0
     new_mcp_servers: builtins.set = builtins.set()
     mcp_apm_config: dict = {"scripts": apm_package.scripts or {}}
+    from apm_cli.core.apm_yml import (
+        ConflictingTargetsError,
+        EmptyTargetsListError,
+        UnknownTargetError,
+        parse_targets_field,
+    )
     from apm_cli.models.apm_package import canonical_package_target_config
 
     mcp_apm_config.update(canonical_package_target_config(apm_package))
+    try:
+        parse_targets_field(mcp_apm_config)
+    except (ConflictingTargetsError, EmptyTargetsListError, UnknownTargetError) as exc:
+        logger.error(str(exc), symbol="")
+        logger.render_summary()
+        raise SystemExit(2) from exc
 
     if should_install and mcp_deps:
         old_mcp_target_servers = old_mcp_target_servers or {}
@@ -158,6 +197,8 @@ def run_mcp_integration(  # noqa: PLR0913
             project_root=project_root,
             user_scope=user_scope,
             explicit_target=explicit_target,
+            target_decision=target_decision,
+            fail_on_write_error=True,
             diagnostics=diagnostics,
             scope=scope,
             managed_target_servers=managed_target_servers,
@@ -175,19 +216,27 @@ def run_mcp_integration(  # noqa: PLR0913
                 project_root=project_root,
                 user_scope=user_scope,
                 scope=scope,
+                fail_on_write_error=True,
             )
 
         # Remove stale MCP servers that are no longer needed
         stale_servers = old_mcp_servers - new_mcp_servers
         if stale_servers:
-            MCPIntegrator.remove_stale(
-                stale_servers,
-                runtime,
-                exclude,
-                project_root=project_root,
+            for cleanup_runtime in _cleanup_runtimes(
+                runtime=runtime,
+                target_decision=target_decision,
+                owned_targets=managed_target_servers,
                 user_scope=user_scope,
-                scope=scope,
-            )
+            ):
+                MCPIntegrator.remove_stale(
+                    stale_servers,
+                    cleanup_runtime,
+                    exclude,
+                    project_root=project_root,
+                    user_scope=user_scope,
+                    scope=scope,
+                    fail_on_write_error=True,
+                )
 
         # Persist the new MCP server set, configs, and transitive provenance.
         MCPIntegrator.update_lockfile(
@@ -196,24 +245,35 @@ def run_mcp_integration(  # noqa: PLR0913
             mcp_configs=new_mcp_configs,
             mcp_target_servers=managed_target_servers,
             mcp_config_provenance=new_mcp_provenance,
+            logger=logger,
+            fail_on_write_error=True,
         )
     elif should_install and not mcp_deps:
         # No MCP deps at all -- remove any old APM-managed servers
         if old_mcp_servers:
-            MCPIntegrator.remove_stale(
-                old_mcp_servers,
-                runtime,
-                exclude,
-                project_root=project_root,
+            for cleanup_runtime in _cleanup_runtimes(
+                runtime=runtime,
+                target_decision=target_decision,
+                owned_targets=old_mcp_target_servers,
                 user_scope=user_scope,
-                scope=scope,
-            )
+            ):
+                MCPIntegrator.remove_stale(
+                    old_mcp_servers,
+                    cleanup_runtime,
+                    exclude,
+                    project_root=project_root,
+                    user_scope=user_scope,
+                    scope=scope,
+                    fail_on_write_error=True,
+                )
             MCPIntegrator.update_lockfile(
                 builtins.set(),
                 lock_path,
                 mcp_configs={},
                 mcp_target_servers={},
                 mcp_config_provenance={},
+                logger=logger,
+                fail_on_write_error=True,
             )
         logger.verbose_detail("No MCP dependencies found in apm.yml")
     elif not should_install and old_mcp_servers:
@@ -225,6 +285,8 @@ def run_mcp_integration(  # noqa: PLR0913
             mcp_configs=old_mcp_configs,
             mcp_target_servers=old_mcp_target_servers,
             mcp_config_provenance=old_mcp_provenance,
+            logger=logger,
+            fail_on_write_error=True,
         )
 
     return mcp_count, mcp_apm_config

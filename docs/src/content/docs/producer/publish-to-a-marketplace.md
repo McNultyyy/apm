@@ -132,7 +132,8 @@ self-hosted GitLab, or Azure DevOps. The host is preserved end to end, so a
 consumer installs from the same host you authored on. Any relative source
 composes onto the base, including two-segment values like
 `acme-org/pinned-package`. Host-prefixed sources like `github.com/acme/tool`,
-full HTTPS URLs, and local `./` paths remain per-entry overrides. If
+full HTTPS URLs (including nested paths such as
+`https://gitlab.example.com/group/subgroup/package.git`), and local `./` paths remain per-entry overrides. If
 `sourceBase` is absent, existing `owner/repo` source behavior is unchanged.
 See the [manifest schema](../../reference/manifest-schema/#75-marketplacepackages)
 for the full validation and override rules.
@@ -140,11 +141,14 @@ for the full validation and override rules.
 The generated source object is also a producer-to-consumer contract.
 `apm pack` emits `source: url` for a remote repository and
 `source: git-subdir` when `subdir` is set.
+It also emits the effective `source.tag_pattern`: a package override takes
+precedence over `marketplace.build.tagPattern`. Repack and publish the generated
+metadata after changing either value so consumers receive the new convention.
 `apm install <package>@<marketplace>` accepts both forms, derives the package host from
 the generated entry rather than from the marketplace host, and preserves
 the generated path and ref.
 
-For an Azure DevOps marketplace, point `sourceBase` at the
+For an Azure DevOps Services marketplace, point `sourceBase` at the
 `https://dev.azure.com/{org}/{project}/_git` base; relative sources compose
 onto it and the `dev.azure.com` host is kept on the consumer side:
 
@@ -157,8 +161,12 @@ marketplace:
       ref: 3f2a9b1c
 ```
 
-Azure DevOps authentication uses `ADO_APM_PAT` (with an `az` CLI bearer
-fallback); see [authentication](../../getting-started/authentication/#azure-devops).
+Services authentication checks `ADO_APM_PAT`, then the Azure CLI bearer. For
+Azure DevOps Server, register the host with `ADO_HOST` or `APM_ADO_HOSTS`,
+use `ADO_APM_PAT`, and use the portless root-hosted
+`https://host/Collection/Project/_git` form for `sourceBase`. Server does not
+use the Azure CLI bearer. See
+[authentication](../../getting-started/authentication/#azure-devops).
 
 Before:
 
@@ -225,8 +233,9 @@ For the release-gate flags (`--check-versions`, `--check-clean`),
 see [Releasing from any CI](../releasing-from-any-ci/).
 
 The same `apm pack` run also produces a bundle to `./build/<name>/`
-when `apm.yml` declares `dependencies:`. Marketplace projects with
-no `dependencies:` block produce only `marketplace.json`. See
+when `apm.yml` declares a `dependencies:` mapping, including an empty
+mapping (`dependencies: {}`). Marketplace projects with an omitted or null
+`dependencies:` value produce only `marketplace.json`. See
 [Pack a bundle](../pack-a-bundle/) for the bundle side.
 
 ## Validate before you ship

@@ -124,15 +124,15 @@ the [policy schema](../policy-schema/).
 
 ### `config-consistency`
 
-- **What it verifies.** That MCP server configs derived from the root `dependencies.mcp` and `devDependencies.mcp`, plus every current local or installed-remote package manifest bounded by the lockfile, match the `mcp_configs` baseline.
-- **Fails when.** A server's resolved config differs from the lockfile, a server exists on only one side, or a locked package manifest is unreadable. A missing manifest also fails unless the lockfile records a skill bundle, or declares a virtual subdirectory that APM detects as a Claude skill at that location. `mcp_config_provenance` identifies the package in lock-only diagnostics but never exempts a removed declaration.
+- **What it verifies.** That MCP server configs derived from the root `dependencies.mcp` and `devDependencies.mcp`, plus `dependencies.mcp` from every current local or installed-remote package manifest bounded by the lockfile, match the `mcp_configs` baseline. Dependency-package `devDependencies.mcp` is author-only and is excluded from the consumer baseline.
+- **Fails when.** A server's resolved config differs from the lockfile, a server exists on only one side, or a locked package manifest is unreadable. In `apm audit --ci`, when `apm_modules/` is absent but the lockfile is present, APM first self-hydrates a lock-pinned scratch install and derives the current MCP truth from that isolated modules tree; if the scratch replay itself fails, `config-consistency` fails closed with the replay error. A missing manifest also fails unless the lockfile records a skill bundle, or declares a virtual subdirectory whose lock metadata and materialized shape both identify it as a Claude skill. `mcp_config_provenance` identifies the package in lock-only diagnostics but never exempts a removed declaration.
 - **Remediation.** Run `apm install` to reconcile the MCP configuration or restore an unreadable package source.
 
 ### `content-integrity`
 
-- **What it verifies.** Two signals across every deployed file (including local `.apm/` content via the synthesized self-entry):
-  1. Critical hidden Unicode (tag characters, bidi overrides, variation selectors 17-256, and similar steganographic markers).
-  2. SHA-256 drift between the on-disk content and the hash recorded in `deployed_file_hashes` at install time.
+- **What it verifies.** Two signals across every deployed file (including local `.apm/` content via the synthesized self-entry), each with the scope its evidence allows:
+  1. Critical hidden Unicode (tag characters, bidi overrides, variation selectors 17-256, and similar steganographic markers), over **every file under the deploy trees the project's targets govern**. This signal needs no recorded baseline, so it is deliberately not limited to `deployed_files` -- otherwise a deployed file the lockfile omits would be exempt from scanning for as long as it stayed unrecorded.
+  2. SHA-256 drift between the on-disk content and the hash recorded in `deployed_file_hashes` at install time. Necessarily lockfile-scoped: an unrecorded file has no baseline to compare against.
 - **Fails when.** Any deployed file contains a critical Unicode finding or its hash no longer matches the lockfile entry. Missing files are intentionally not reported here -- `deployed-files-present` owns that signal. Symlinks and entries without a recorded hash are skipped.
 - **Remediation.** Run `apm audit --strip` to clean Unicode findings, and `apm install` to restore hash-drifted files. Both may be needed.
 
@@ -146,14 +146,14 @@ the [policy schema](../policy-schema/).
 ### `drift`
 
 - **What it verifies.** That the working tree matches what an install from the current lockfile would produce. The check replays the install pipeline into a scratch tree and diffs the result against the project.
-- **Fails when.** Any deployed file differs from the replay output (hand-edits, missing integrations, orphaned files).
-- **Skips when.** The install cache has not been warmed (the replay is cache-only by design so audit stays deterministic). The check returns a pass with an informational message advising the user to run `apm install` first.
+- **Fails when.** Any deployed file differs from the replay output (hand-edits, missing integrations, orphaned files). In `apm audit --ci`, a cold cache no longer yields a green skip: if `apm_modules/` is absent, APM self-hydrates a lock-pinned scratch install first and then diffs against the checkout. If that scratch replay cannot be materialized, the drift check fails closed with the replay error.
+- **Skips when.** Only in bare `apm audit`, where the replay remains cache-only and a missing cache yields an informational skip advising the user to run `apm install` first.
 - **Skip with.** `apm audit --ci --no-drift` (reduces coverage; reserve for performance-constrained CI loops).
 - **Remediation.** Run `apm install` to restore the deployed state, or revert the hand-edit. For a cache-miss skip, the same `apm install` warms the cache and enables the check on the next run.
 
 ## Run order and fail-fast
 
-The aggregate runner in `run_baseline_checks` evaluates checks in this order: `manifest-parse` (only when `apm.yml` is unparseable), `lockfile-exists`, `ref-consistency`, `deployment-ledger-owners`, `deployed-files-present`, `no-orphaned-packages`, `skill-subset-consistency`, `config-consistency`, `content-integrity`, `includes-consent`. Drift is invoked separately by the audit command after the baseline batch.
+The aggregate runner in `run_baseline_checks` evaluates checks in this order: `manifest-parse` (only when `apm.yml` is unparseable), `lockfile-exists`, `ref-consistency`, `deployment-ledger-owners`, `deployed-files-present`, `no-orphaned-packages`, `skill-subset-consistency`, `config-consistency`, `content-integrity`, `includes-consent`. Drift is invoked separately by the audit command after the baseline batch, but in `--ci` mode it shares the same cold-cache scratch materialization with `config-consistency`.
 
 With fail-fast on (the default), the runner stops at the first failing check. `apm audit --ci --no-fail-fast` evaluates every check so the report lists every problem at once.
 

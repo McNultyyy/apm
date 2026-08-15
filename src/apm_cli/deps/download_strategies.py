@@ -28,12 +28,12 @@ from ..utils.archive import ArchiveError, safe_extract_zip
 from ..utils.github_host import (
     build_ado_api_url,
     build_artifactory_archive_url,
-    build_authorization_header_git_env,
     build_https_clone_url,
     build_raw_content_url,
     build_ssh_url,
     default_host,
     is_github_hostname,
+    set_authorization_header_git_env,
 )
 from ..utils.path_security import PathTraversalError
 from .git_file_transport import (
@@ -267,8 +267,8 @@ class DownloadDelegate:
             effective_token: str | None = ""
         elif token is not None:
             effective_token = token
-        elif is_ado:
-            effective_token = self._host.ado_token
+        elif is_ado and dep_ref is not None:
+            effective_token = self._host.auth_resolver.resolve_for_dep(dep_ref).token
         elif backend.is_github_family:
             effective_token = self._host.github_token
         elif backend.kind == "gitlab" and dep_ref is not None:
@@ -541,6 +541,9 @@ class DownloadDelegate:
     def try_raw_download(self, owner: str, repo: str, ref: str, file_path: str) -> bytes | None:
         """Attempt to fetch a file via raw.githubusercontent.com (CDN).
 
+        This pre-auth helper must remain token-free: it runs before
+        ``AuthResolver`` has established that credentials may be required.
+
         Returns the raw bytes on success, or ``None`` if the file was not found
         (HTTP 404) or the request failed for any reason.  This is intentionally
         best-effort: callers fall back to the Contents API when ``None`` is
@@ -592,6 +595,7 @@ class DownloadDelegate:
             file_path,
             ref,
             host,
+            dep_ref.port,
         )
 
         # Set up authentication headers.
@@ -600,22 +604,21 @@ class DownloadDelegate:
         # AuthResolver.resolve() so this module stays inside the auth-protocol
         # boundary (scripts/lint-auth-signals.sh Rule A); auth.py's resolver
         # handles the AAD bearer lookup internally.
-        headers: dict[str, str] = {}
-        if self._host.ado_token:
-            # ADO uses Basic auth: username can be empty, password is the PAT
-            auth = base64.b64encode(f":{self._host.ado_token}".encode()).decode()
-            headers["Authorization"] = f"Basic {auth}"
-        else:
-            # No PAT: ask the resolver for an AAD bearer token.  If az-cli is
-            # available and the user is signed in, AuthResolver._resolve_token()
-            # returns a bearer token and auth_scheme="bearer" transparently.
-            auth_ctx = self._host.auth_resolver.resolve(
-                host,
-                dep_ref.ado_organization,
-                port=dep_ref.port,
-            )
-            if auth_ctx.token and auth_ctx.auth_scheme == "bearer":
-                headers["Authorization"] = f"Bearer {auth_ctx.token}"
+        auth_ctx = self._host.auth_resolver.resolve(
+            host,
+            dep_ref.ado_organization,
+            port=dep_ref.port,
+        )
+
+        def _headers_for(token: str | None, scheme: str) -> dict[str, str]:
+            if not token:
+                return {}
+            if scheme == "bearer":
+                return {"Authorization": f"Bearer {token}"}
+            encoded = base64.b64encode(f":{token}".encode()).decode()
+            return {"Authorization": f"Basic {encoded}"}
+
+        headers = _headers_for(auth_ctx.token, auth_ctx.auth_scheme)
 
         def _check_html_signin(response) -> None:
             """Fail-closed when ADO returns an interactive sign-in HTML page.
@@ -628,7 +631,7 @@ class DownloadDelegate:
             existing 404-fallback / 401-403 error paths.  Content-Type is
             lowercased before comparison per RFC 7230 case-insensitivity.
             """
-            if response.status_code != 200:
+            if not 200 <= response.status_code < 300:
                 return
             content_type = response.headers.get("Content-Type", "").lower()
             if "text/html" in content_type:
@@ -646,10 +649,42 @@ class DownloadDelegate:
                 )
                 raise RuntimeError(error_msg)
 
+        bearer_attempted = False
+
+        def _request(url: str):
+            nonlocal bearer_attempted
+
+            def _primary_op():
+                return self._host._resilient_get(url, headers=headers, timeout=30)
+
+            if auth_ctx.source != "ADO_APM_PAT":
+                return _primary_op()
+
+            def _bearer_op(bearer: str):
+                return self._host._resilient_get(
+                    url,
+                    headers=_headers_for(bearer, "bearer"),
+                    timeout=30,
+                )
+
+            outcome = self._host.auth_resolver.execute_with_bearer_fallback(
+                dep_ref,
+                _primary_op,
+                _bearer_op,
+                lambda response: response.status_code in (401, 403),
+            )
+            bearer_attempted = bearer_attempted or outcome.bearer_attempted
+            return outcome.outcome
+
         try:
-            response = self._host._resilient_get(api_url, headers=headers, timeout=30)
+            response = _request(api_url)
             _check_html_signin(response)
             response.raise_for_status()
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Unexpected HTTP {response.status_code} downloading "
+                    f"{file_path} from Azure DevOps"
+                )
             return response.content
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
@@ -667,12 +702,18 @@ class DownloadDelegate:
                     file_path,
                     fallback_ref,
                     host,
+                    dep_ref.port,
                 )
 
                 try:
-                    response = self._host._resilient_get(fallback_url, headers=headers, timeout=30)
+                    response = _request(fallback_url)
                     _check_html_signin(response)
                     response.raise_for_status()
+                    if response.status_code != 200:
+                        raise RuntimeError(
+                            f"Unexpected HTTP {response.status_code} downloading "
+                            f"{file_path} from Azure DevOps"
+                        )
                     return response.content
                 except requests.exceptions.HTTPError as fallback_err:
                     raise RuntimeError(
@@ -681,16 +722,14 @@ class DownloadDelegate:
                     ) from fallback_err
             elif e.response.status_code in (401, 403):
                 error_msg = f"Authentication failed for Azure DevOps {dep_ref.repo_url}. "
-                if not self._host.ado_token:
-                    error_msg += self._host.auth_resolver.build_error_context(
-                        host,
-                        "download",
-                        org=dep_ref.ado_organization if dep_ref else None,
-                        port=dep_ref.port if dep_ref else None,
-                        dep_url=dep_ref.repo_url if dep_ref else None,
-                    )
-                else:
-                    error_msg += "Please check your Azure DevOps PAT permissions."
+                error_msg += self._host.auth_resolver.build_error_context(
+                    host,
+                    "download",
+                    org=dep_ref.ado_organization if dep_ref else None,
+                    port=dep_ref.port if dep_ref else None,
+                    dep_url=dep_ref.repo_url if dep_ref else None,
+                    bearer_also_failed=bearer_attempted,
+                )
                 raise RuntimeError(error_msg) from e
             else:
                 raise RuntimeError(
@@ -746,15 +785,71 @@ class DownloadDelegate:
     ) -> GitFileFetchResult:
         """Fetch a throttled GitHub virtual file through one sparse Git transport."""
         key = self._git_file_transport_key(dep_ref, ref)
+        host = dep_ref.host or default_host()
+        if (
+            self._host.auth_resolver.uses_public_github_anonymous_first(
+                host,
+                port=dep_ref.port,
+                host_type=dep_ref.host_type,
+            )
+            is True
+        ):
+
+            def _fetch(
+                token: str | None,
+                git_env: dict[str, str],
+            ) -> GitFileFetchResult:
+                attempt_env = dict(git_env)
+                if token:
+                    set_authorization_header_git_env(
+                        attempt_env,
+                        "Bearer",
+                        token,
+                    )
+                    attempt_env.pop("GIT_TOKEN", None)
+
+                def _tokenless_repo_url(
+                    repo_ref: str,
+                    *,
+                    dep_ref: DependencyReference,
+                ) -> str:
+                    return self.build_repo_url(
+                        repo_ref,
+                        dep_ref=dep_ref,
+                        token="",
+                        auth_scheme="basic",
+                    )
+
+                transport_factory = self._git_file_transport_factory or GitSparseFileTransport
+                transport = transport_factory(
+                    dep_ref,
+                    ref,
+                    build_repo_url_fn=_tokenless_repo_url,
+                    git_env=attempt_env,
+                )
+                try:
+                    return transport.fetch_file_with_commit(file_path)
+                finally:
+                    transport.close()
+
+            return self._host.auth_resolver.try_with_fallback(
+                host,
+                _fetch,
+                org=dep_ref.repo_url.split("/", 1)[0],
+                port=dep_ref.port,
+                path=dep_ref.repo_url,
+                host_type=dep_ref.host_type,
+                unauth_first=True,
+                base_env=self._host.git_env,
+            )
+
         auth_ctx = self._host.auth_resolver.resolve_for_dep(dep_ref)
         if auth_ctx.token:
             # AuthResolver owns credential resolution. Convert its resolved
             # GitHub credential into Git's header channel so the token remains
             # out of the remote URL and is actually consumed by git.
-            git_env = {
-                **auth_ctx.git_env,
-                **build_authorization_header_git_env("Bearer", auth_ctx.token),
-            }
+            git_env = dict(auth_ctx.git_env)
+            set_authorization_header_git_env(git_env, "Bearer", auth_ctx.token)
             git_env.pop("GIT_TOKEN", None)
             auth_scheme = "basic"
         else:
@@ -935,6 +1030,128 @@ class DownloadDelegate:
     # GitHub file download
     # ------------------------------------------------------------------
 
+    def _download_public_github_file_anonymous_first(
+        self,
+        dep_ref: DependencyReference,
+        file_path: str,
+        ref: str,
+        verbose_callback=None,
+    ) -> bytes:
+        """Fetch one github.com file anonymously, resolving auth only on 4xx."""
+        host = dep_ref.host or default_host()
+        owner, repo = dep_ref.repo_url.split("/", 1)
+        refs = [ref]
+        if ref in ("main", "master"):
+            refs.append("master" if ref == "main" else "main")
+
+        for candidate_ref in refs:
+            content = self.try_raw_download(owner, repo, candidate_ref, file_path)
+            if content is not None:
+                if verbose_callback:
+                    verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
+                return content
+
+        def _contents_request(
+            token: str | None,
+            _git_env: dict[str, str],
+        ) -> bytes:
+            headers: dict[str, str] = {
+                "Accept": "application/vnd.github.v3.raw",
+            }
+            if token:
+                headers["Authorization"] = f"token {token}"
+            last_response = None
+            for candidate_ref in refs:
+                api_url = self._build_contents_api_urls(
+                    host,
+                    owner,
+                    repo,
+                    file_path,
+                    candidate_ref,
+                    is_github_host=True,
+                )[0]
+                response = self._host._resilient_get(
+                    api_url,
+                    headers=headers,
+                    timeout=30,
+                    retry_throttles=False,
+                )
+                if response.status_code == 200:
+                    if verbose_callback:
+                        verbose_callback(f"Downloaded file: {host}/{dep_ref.repo_url}/{file_path}")
+                    return self._extract_contents_api_payload(
+                        response,
+                        is_github_host=True,
+                    )
+                throttle = github_throttle_error(response, host)
+                if throttle is not None:
+                    raise throttle
+                last_response = response
+                if response.status_code != 404:
+                    response.raise_for_status()
+            if last_response is not None:
+                last_response.raise_for_status()
+            raise RuntimeError(f"No GitHub Contents API response for {file_path}")
+
+        try:
+            return self._host.auth_resolver.try_with_fallback(
+                host,
+                _contents_request,
+                org=owner,
+                port=dep_ref.port,
+                path=dep_ref.repo_url,
+                host_type=dep_ref.host_type,
+                unauth_first=True,
+                verbose_callback=verbose_callback,
+            )
+        except GitHubThrottleError:
+            raise
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            if status in (401, 403):
+                raise RuntimeError(
+                    f"Authentication failed for {dep_ref.repo_url} "
+                    f"(file: {file_path}, ref: {ref}). "
+                    "The repository may be private or the resolved credential "
+                    "may lack access."
+                ) from exc
+            if status == 404:
+                raise RuntimeError(
+                    self._build_unsupported_or_missing_error(
+                        host,
+                        dep_ref.repo_url,
+                        file_path,
+                        ref,
+                        self._build_contents_api_urls(
+                            host,
+                            owner,
+                            repo,
+                            file_path,
+                            ref,
+                            is_github_host=True,
+                        ),
+                        is_github_host=True,
+                        fallback_ref=refs[-1] if len(refs) > 1 else None,
+                    )
+                ) from exc
+            raise RuntimeError(
+                self._build_download_http_error(
+                    host,
+                    file_path,
+                    status,
+                    "Contents API",
+                )
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(
+                self._build_download_network_error(
+                    host,
+                    file_path,
+                    "Contents API",
+                    exc,
+                )
+            ) from exc
+
     def download_github_file(
         self,
         dep_ref: DependencyReference,
@@ -959,6 +1176,21 @@ class DownloadDelegate:
             bytes: File content
         """
         host = dep_ref.host or default_host()
+
+        if (
+            self._host.auth_resolver.uses_public_github_anonymous_first(
+                host,
+                port=dep_ref.port,
+                host_type=dep_ref.host_type,
+            )
+            is True
+        ):
+            return self._download_public_github_file_anonymous_first(
+                dep_ref,
+                file_path,
+                ref,
+                verbose_callback,
+            )
 
         # Parse owner/repo from repo_url
         owner, repo = dep_ref.repo_url.split("/", 1)

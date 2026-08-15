@@ -38,6 +38,14 @@ installed package's source tree are parent-owned content, not separate
 dependencies. Real lockfile-resolved dependencies install at their own package
 roots and remain visible regardless of graph depth.
 
+Local dependencies are shown as portable `_local/<name>` keys rather than
+machine-specific absolute paths. For a direct local declaration with matching
+`apm.lock.yaml` metadata, copy that key into `apm uninstall` (with `-g` for user
+scope). Without a lockfile, use the exact path from the manifest. Transitive
+local dependencies are removed through their declaring parent. If more than one
+declared local path has the same name, `apm uninstall` reports an ambiguity and
+changes nothing; use one exact path already declared in `apm.yml`.
+
 ```bash
 apm deps list [OPTIONS]
 ```
@@ -116,7 +124,7 @@ apm deps update [PACKAGES...] [OPTIONS]
 |---|---|
 | `-v, --verbose` | Show detailed update information. |
 | `--force` | Overwrite locally-authored files on collision. |
-| `-t, --target` | Force deployment to specific targets. Comma-separated. Values: `copilot`, `claude`, `cursor`, `opencode`, `codex`, `gemini`, `antigravity`, `windsurf`, `kiro`, `agent-skills`, `all`. `copilot-cowork` is also accepted when its experimental flag is enabled. `agent-skills` and `antigravity` are explicit-only and excluded from `all`; combine them with `all` when needed. |
+| `-t, --target` | Force deployment to specific targets. Comma-separated. Values: `copilot`, `claude`, `grok-build`, `cursor`, `opencode`, `codex`, `gemini`, `antigravity`, `windsurf`, `kiro`, `agent-skills`, `all`. `copilot-cowork`, `copilot-app`, and `grok-cloud` (skills only) are also accepted when their experimental flags are enabled. Experimental targets are excluded from `all`. |
 | `--parallel-downloads N` | Max concurrent downloads. Default `4`. `0` disables parallelism. |
 | `-g, --global` | Update user-scope dependencies in `~/.apm/`. |
 | `--legacy-skill-paths` | Deploy skill files to per-client paths (`.cursor/skills/`, etc.) instead of the shared `.agents/skills/` directory. |
@@ -147,9 +155,10 @@ apm deps list
 Sample output:
 
 ```
- Package             Version  Source  Prompts  Instructions  Agents  Skills
- compliance-rules    1.0.0    github  2        1             -       1
- design-guidelines   1.0.0    github  -        1             1       -
+ Package             Version  Source  Prompts  Instructions  Agents  Skills  Hooks
+ compliance-rules    1.0.0    github  2        1             -       1       -
+ design-guidelines   1.0.0    github  -        1             1       -       -
+ _local/review-kit   0.4.0    local   1        2             -       -       -
 ```
 
 Show only insecure (HTTP-locked) dependencies and their origin:

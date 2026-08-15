@@ -1,27 +1,22 @@
 """Dependency resolution phase.
 
-Reads ``ctx.apm_package``, ``ctx.update_refs``, ``ctx.scope``, etc.;
-populates ``ctx.deps_to_install``, ``ctx.intended_dep_keys``,
-``ctx.dependency_graph``, ``ctx.existing_lockfile``, and several ancillary
-fields consumed by later phases (download, integrate, cleanup, lockfile).
+Loads inputs and populates resolution state consumed by later phases.
 
 This is the first phase of the install pipeline.  It covers:
 
 1. Lockfile loading (``apm.lock.yaml``)
 2. ``apm_modules/`` directory creation
 3. Auth resolver defaulting + downloader construction
-4. Transitive dependency resolution via ``APMDependencyResolver``
-5. ``--only`` filtering (restrict to named packages + their subtrees)
-6. ``intended_dep_keys`` computation (the manifest-intent set used by
-   orphan cleanup in a later phase)
+4. Dependency resolution, ``--only`` filtering, and intended-key computation
 """
 
 from __future__ import annotations
 
 import builtins
 import logging
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from apm_cli.install.helpers.ref_reuse import (
     annotate_update_plan_refs,
@@ -32,6 +27,7 @@ from apm_cli.install.helpers.ref_reuse import (
 from apm_cli.install.helpers.ref_seed import seed_ref_resolver_from_lockfile
 from apm_cli.install.transaction import resolution_for_context
 from apm_cli.models.apm_package import GitReferenceType, ResolvedReference
+from apm_cli.models.dependency import materialization as _materialization
 from apm_cli.utils.short_sha import format_short_sha
 
 if TYPE_CHECKING:
@@ -47,15 +43,7 @@ _logger = logging.getLogger(__name__)
 
 
 def _lockfile_has_registry_deps(existing_lockfile) -> bool:
-    """True when the on-disk lockfile records at least one registry-sourced dep.
-
-    Used to construct the registry resolver even when apm.yml's
-    ``registries:`` block has been removed but locked deps still need to
-    re-install. A user clones a repo, the apm.yml has no registries: block
-    but the lockfile says some deps are ``source: registry`` — we still
-    want them to install (they'll fail at auth lookup if the URL doesn't
-    match anything configured, with a clear remediation per §6.2).
-    """
+    """Return whether the lockfile contains a registry-sourced dependency."""
     if not existing_lockfile:
         return False
     return any(
@@ -81,21 +69,9 @@ def _purge_cached_semver_paths_for_update(
     logger,
     staging_session: ResolutionStagingSession,
 ) -> None:
-    """Pre-purge on-disk install paths for direct git-source and registry semver deps
-    when ``--update`` / ``--refresh`` is set.
+    """Clear direct semver install paths for update/refresh re-resolution.
 
-    Bug 1 fix (#1496): the BFS resolver short-circuits at
-    ``install_path.exists()`` and never invokes ``download_callback``,
-    which is where ``_maybe_resolve_git_semver`` lives. For git-source
-    semver direct deps we therefore pre-purge the install path so the
-    resolver is forced through the callback, re-runs ``git ls-remote``,
-    and rewrites the lockfile with the latest matching tag. Matches
-    npm / cargo / bundler: ``--update`` is the explicit re-resolve
-    trigger and must not be swallowed by the on-disk cache. Scoped to
-    direct deps -- a transitive dep's own range is covered separately by
-    ``APMDependencyResolver._should_force_recheck``. Local and proxy deps
-    are excluded (different resolver path). Registry semver deps are
-    included: their callback also gates on install_path.exists().
+    Transitives use resolver recheck; local and proxy dependencies are excluded.
     """
     from contextlib import suppress
 
@@ -123,6 +99,78 @@ def _purge_cached_semver_paths_for_update(
                     f"[*] --update: cleared cached install path for "
                     f"{_dep.get_unique_key()} to force semver re-resolution"
                 )
+
+
+def _prepare_existing_materialization_paths(
+    ctx: InstallContext,
+    staging_session: ResolutionStagingSession,
+    materialization_reader: _materialization.MaterializationPathReader,
+) -> None:
+    """Migrate case-only legacy paths before resolver cache checks can bypass callbacks."""
+    apm_modules_dir = getattr(ctx, "apm_modules_dir", None)
+    if apm_modules_dir is None:
+        return
+    dependencies = list(getattr(ctx, "all_apm_deps", ()))
+    seen_keys = {dependency.get_unique_key() for dependency in dependencies}
+    existing_lockfile = getattr(ctx, "existing_lockfile", None)
+    if existing_lockfile is not None:
+        for locked in existing_lockfile.get_package_dependencies():
+            dependency = locked.to_dependency_ref()
+            key = dependency.get_unique_key()
+            if key in seen_keys:
+                continue
+            dependencies.append(dependency)
+            seen_keys.add(key)
+
+    on_migrate = _materialization_migration_logger(getattr(ctx, "logger", None), apm_modules_dir)
+    for dependency in dependencies:
+        if dependency.is_marketplace:
+            continue
+        _materialization.prepare_materialization_path(
+            dependency,
+            apm_modules_dir,
+            staging_session,
+            reader=materialization_reader,
+            on_migrate=on_migrate,
+        )
+
+
+def _materialization_migration_logger(
+    logger,
+    apm_modules_dir: Path,
+) -> Callable[[Path, Path], None] | None:
+    """Build a verbose-only callback for case migration diagnostics."""
+    if logger is None:
+        return None
+    modules = apm_modules_dir.absolute()
+
+    def report(source: Path, destination: Path) -> None:
+        source_rel = source.absolute().relative_to(modules).as_posix()
+        destination_rel = destination.absolute().relative_to(modules).as_posix()
+        logger.verbose_detail(
+            f"    Migrated package directory casing: {source_rel} -> {destination_rel}"
+        )
+
+    return report
+
+
+def _prepare_callback_materialization_path(
+    dependency: Any,
+    modules_dir: Path,
+    staging_session: ResolutionStagingSession,
+    materialization_reader: _materialization.MaterializationPathReader,
+    callback_lock: Any,
+    logger: Any,
+) -> Path:
+    """Serialize transitive casing lookup and migration across resolver workers."""
+    with callback_lock:
+        return _materialization.prepare_materialization_path(
+            dependency,
+            modules_dir,
+            staging_session,
+            reader=materialization_reader,
+            on_migrate=_materialization_migration_logger(logger, modules_dir),
+        )
 
 
 def _load_lockfile(ctx: InstallContext) -> None:
@@ -232,12 +280,19 @@ def _setup_downloader(ctx: InstallContext) -> None:
     # Wired AFTER persistent_git_cache so L2 can reach it. Reused by
     # every code path that calls downloader.resolve_git_reference():
     # install, update, outdated, publish.
-    try:
-        from apm_cli.deps.tiered_ref_resolver import build_tiered_ref_resolver
+    from apm_cli.deps.tiered_ref_resolver import (
+        build_tiered_ref_resolver,
+        ref_freshness_policy_for_install,
+    )
 
+    ctx.ref_freshness_policy = ref_freshness_policy_for_install(ctx)
+    if ctx.ref_freshness_policy.requires_remote and ctx.logger:
+        ctx.logger.verbose_detail("[*] Resolving refs from upstream; local cached refs bypassed")
+    try:
         _tiered = build_tiered_ref_resolver(
             downloader=downloader,
             git_cache=getattr(downloader, "persistent_git_cache", None),
+            freshness_policy=ctx.ref_freshness_policy,
         )
         if _tiered is not None:
             downloader._tiered_resolver = _tiered
@@ -275,7 +330,40 @@ def _fail_on_resolution_errors(ctx: InstallContext, dependency_graph) -> None:
     raise RuntimeError(f"Dependency resolution failed: {joined_errors}")
 
 
-def _resolve_dependencies(ctx: InstallContext, staging_session: ResolutionStagingSession) -> None:
+def _requires_remote_ref_resolution(ctx: InstallContext) -> bool:
+    """Return the configured policy decision or fail before resolution."""
+    policy = ctx.ref_freshness_policy
+    if policy is None:
+        raise RuntimeError("Ref freshness policy was not configured")
+    return policy.requires_remote
+
+
+def _attach_resolver_marketplace_provenance(
+    ctx: InstallContext,
+    resolver,
+) -> None:
+    """Carry manifest-resolved marketplace identity into lockfile assembly."""
+    if not resolver.marketplace_provenance:
+        return
+    if ctx.marketplace_provenance is None:
+        ctx.marketplace_provenance = {}
+    ctx.marketplace_provenance.update(resolver.marketplace_provenance)
+
+
+def _build_dependency_graph(ctx: InstallContext, resolver):
+    """Resolve the manifest graph and retain its marketplace provenance."""
+    manifest_anchor = ctx.source_root if ctx.source_root != ctx.project_root else ctx.apm_dir
+    dependency_graph = resolver.resolve_dependencies(manifest_anchor)
+    ctx.dependency_graph = dependency_graph
+    _attach_resolver_marketplace_provenance(ctx, resolver)
+    return dependency_graph
+
+
+def _resolve_dependencies(
+    ctx: InstallContext,
+    staging_session: ResolutionStagingSession,
+    materialization_reader: _materialization.MaterializationPathReader,
+) -> None:
     """Resolve dependencies and populate the resolution fields on ``ctx``."""
     import threading as _threading
 
@@ -347,9 +435,9 @@ def _resolve_dependencies(ctx: InstallContext, staging_session: ResolutionStagin
     # --refresh implies re-resolution of all refs (but does NOT discard
     # lockfile entries for packages not in the manifest, unlike --update
     # which may restructure the whole graph).
-    update_refs = ctx.update_refs or ctx.refresh
+    update_refs = _requires_remote_ref_resolution(ctx)
     if ctx.refresh and ctx.logger:
-        ctx.logger.verbose_detail("[*] --refresh: re-resolving all refs")
+        ctx.logger.verbose_detail("[*] --refresh: bypassing cached package content")
     logger = ctx.logger
     existing_lockfile = ctx.existing_lockfile
     downloader = ctx.downloader
@@ -376,7 +464,14 @@ def _resolve_dependencies(ctx: InstallContext, staging_session: ResolutionStagin
                 transitive ``../sibling`` resolves against the declaring
                 package's directory rather than the root consumer (#857).
         """
-        install_path = dep_ref.get_install_path(modules_dir)
+        install_path = _prepare_callback_materialization_path(
+            dep_ref,
+            modules_dir,
+            staging_session,
+            materialization_reader,
+            callback_lock,
+            logger,
+        )
         # Cache reuse stays behind the canonical ref-drift owner.
         if install_path.exists():
             _locked_for_recheck = (
@@ -676,9 +771,7 @@ def _resolve_dependencies(ctx: InstallContext, staging_session: ResolutionStagin
     # ``apm_modules_dir`` is already pinned on the resolver above, so
     # this arg selects only where ``apm.yml`` is read -- never where
     # ``apm_modules/`` is written.
-    manifest_anchor = ctx.source_root if ctx.source_root != ctx.project_root else ctx.apm_dir
-    dependency_graph = resolver.resolve_dependencies(manifest_anchor)
-    ctx.dependency_graph = dependency_graph
+    dependency_graph = _build_dependency_graph(ctx, resolver)
     _fail_on_resolution_errors(ctx, dependency_graph)
 
     # Fold remote-parent local_path rejections into ``callback_failures`` so
@@ -895,9 +988,12 @@ def run(ctx: InstallContext) -> None:
     """
     _load_lockfile(ctx)
     _ensure_modules_dir(ctx)
+    staging_session = resolution_for_context(ctx)
+    materialization_reader = _materialization.CachedMaterializationPathReader()
+    _prepare_existing_materialization_paths(ctx, staging_session, materialization_reader)
     _setup_downloader(ctx)
     seed_ref_resolver_from_lockfile(ctx)
-    _resolve_dependencies(ctx, resolution_for_context(ctx))
+    _resolve_dependencies(ctx, staging_session, materialization_reader)
     _record_update_plan_complete_dep_keys(ctx)
     if ctx.only_packages:
         _apply_only_filter(ctx)

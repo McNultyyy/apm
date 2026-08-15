@@ -19,6 +19,7 @@ import copy
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from apm_cli.core.scope import is_user_scope
 from apm_cli.install.package_resolution import effective_deploy_skill_subset
 from apm_cli.utils.content_hash import compute_file_hash
 
@@ -154,9 +155,11 @@ class LockfileBuilder:
             # merge new entries into the existing lockfile instead of
             # overwriting it -- otherwise the uninstalled packages disappear.
             lockfile = self._maybe_merge_partial(lockfile, lockfile_path, _LF)
+            # Restore local compatibility state first so the canonical ledger is
+            # complete when MCP target rows are projected into it.
+            self._preserve_existing_local_state(lockfile)
             self._preserve_existing_mcp_state(lockfile)
             self._preserve_existing_lsp_state(lockfile)
-            self._preserve_existing_local_state(lockfile)
             self._preserve_existing_revision_pin_tags(lockfile)
 
             # Only write when the semantic content has actually changed
@@ -245,6 +248,13 @@ class LockfileBuilder:
         cleanup_retained = getattr(self.ctx, "package_cleanup_retained", {})
         from apm_cli.core.deployment_state import DeploymentLedger
 
+        # `apm lock` (lockfile_only) reconciles the lockfile without touching
+        # the working tree: dropped-target files must stay on disk, with the
+        # physical prune deferred to the next `apm install` (issue #2296). In
+        # that mode we also skip ghost-drop accounting -- rows are preserved,
+        # not removed, so a "Repaired inactive-target entries" report would be
+        # misleading.
+        lockfile_only = getattr(self.ctx, "lockfile_only", False)
         canonical_records = {}
         ghost_count = 0
         for dep_key in lockfile.dependencies:
@@ -278,12 +288,14 @@ class LockfileBuilder:
                 active_targets=self.ctx.targets,
                 declared_targets=declared,
                 diagnostics=diagnostics,
-                on_ghost_drop=_log_ghost_drop,
+                on_ghost_drop=None if lockfile_only else _log_ghost_drop,
                 prior_ledger=prior_ledger,
                 cleanup_retained_hashes=retained_hashes,
                 current_run_trusted=diagnostics.count_for_package(dep_key, "error") == 0,
                 owner=dep_key,
                 include_ledger=True,
+                apply_disk_deletion=not lockfile_only,
+                user_scope=is_user_scope(getattr(self.ctx, "scope", None)),
             )
             if not files:
                 # Nothing this install governs and nothing to carry forward;
@@ -427,12 +439,32 @@ class LockfileBuilder:
             lockfile.mcp_config_provenance = copy.deepcopy(
                 self.ctx.existing_lockfile.mcp_config_provenance
             )
-            if self.ctx.logger:
-                self.ctx.logger.verbose_detail(
-                    "MCP state unchanged -- carrying forward "
-                    f"{len(lockfile.mcp_servers)} server(s), "
-                    f"{len(lockfile.mcp_configs)} config(s)"
+            target_servers = self.ctx.existing_lockfile.mcp_target_servers
+            # The codec rebuild is linear in deployment rows and also marks the
+            # compatibility view present, so skip it when there is no target
+            # state to preserve.
+            if target_servers:
+                from apm_cli.core.deployment_ledger import DeploymentLedgerCodec
+
+                DeploymentLedgerCodec.replace_mcp_target_servers(
+                    lockfile,
+                    copy.deepcopy(target_servers),
                 )
+            if self.ctx.logger:
+                server_count = len(lockfile.mcp_servers)
+                config_count = len(lockfile.mcp_configs)
+                server_noun = "server" if server_count == 1 else "servers"
+                config_noun = "config" if config_count == 1 else "configs"
+                detail = (
+                    "MCP state unchanged -- carrying forward "
+                    f"{server_count} {server_noun}, "
+                    f"{config_count} {config_noun}"
+                )
+                if target_servers:
+                    mapping_count = len(target_servers)
+                    mapping_noun = "mapping" if mapping_count == 1 else "mappings"
+                    detail += f", {mapping_count} target {mapping_noun}"
+                self.ctx.logger.verbose_detail(detail)
 
     def _preserve_existing_lsp_state(self, lockfile: LockFile) -> None:
         """Keep LSP fields until LSP integration reconciles them later in install."""

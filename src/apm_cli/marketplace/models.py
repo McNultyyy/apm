@@ -180,6 +180,16 @@ class MarketplaceSource:
         return self.path == "" and url_names_remote_manifest(self.url)
 
     @property
+    def port(self) -> int | None:
+        """Return the explicit remote URL port, if present."""
+        if not self.url or _looks_like_local_path(self.url):
+            return None
+        try:
+            return urlsplit(self.url).port
+        except ValueError:
+            return None
+
+    @property
     def kind(self) -> str:
         """Derived source kind: ``local`` | ``url`` | ``github`` | ``gitlab`` | ``ado`` | ``git``.
 
@@ -312,6 +322,13 @@ class MarketplacePlugin:
     # ``source`` is a string path or ``{type: github, repo: ...}`` dict.
     registry: str = ""
 
+    # Tag pattern declared by the marketplace producer (e.g. "{name}/{version}").
+    # Stored in the ``source`` dict of marketplace.json by ``apm pack`` so that
+    # the consumer-side semver resolver can honour the same naming convention.
+    # ``None`` means the field was absent (old marketplace.json); the resolver
+    # falls back to its built-in default in that case.
+    tag_pattern: str | None = None
+
     def matches_query(self, query: str) -> bool:
         """Return True if the plugin matches a search query (case-insensitive)."""
         q = query.lower()
@@ -439,6 +456,17 @@ def _parse_plugin_entry(entry: dict[str, Any], source_name: str) -> MarketplaceP
                 f"but version {version!r} is not a valid semver selector"
             )
 
+    tag_pattern: str | None = None
+    if isinstance(source, dict):
+        raw_tp = source.get("tag_pattern")
+        if raw_tp is not None:
+            from .tag_pattern import validate_tag_pattern
+
+            tag_pattern = validate_tag_pattern(
+                raw_tp,
+                context=f"Plugin {name!r} source.tag_pattern",
+            )
+
     return MarketplacePlugin(
         name=name,
         source=source,
@@ -447,6 +475,7 @@ def _parse_plugin_entry(entry: dict[str, Any], source_name: str) -> MarketplaceP
         tags=tags,
         source_marketplace=source_name,
         registry=registry_name,
+        tag_pattern=tag_pattern,
     )
 
 

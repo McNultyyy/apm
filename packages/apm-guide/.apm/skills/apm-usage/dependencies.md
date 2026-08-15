@@ -44,10 +44,13 @@ dependencies:
 ```
 
 GitHub and package-registry owner/repository identifiers are normalized to
-lowercase before APM derives lock keys, cache identity, canonical strings, or
-`apm_modules/` paths. `Owner/Repo` and `owner/repo` therefore identify one
-package. Repository path casing is preserved for unknown git hosts because a
-self-hosted backend may be case-sensitive.
+lowercase only for comparison, lock keys, and cache identity. The first
+declaration selects the repository display spelling retained in `apm.yml`,
+`apm_modules/`, and generated relative links. Reinstall migrates one stale
+APM-created case variant; multiple case-equivalent package directories stop
+install for manual inspection. Repository path casing remains
+identity-significant for unknown git hosts because a self-hosted backend may be
+case-sensitive.
 
 **Local-path anchor rule:** a `local_path` declared INSIDE another local
 package is resolved relative to THAT package's own directory (npm/pip/cargo
@@ -206,22 +209,42 @@ package's directory, not the project root.
   targets: [claude]
 ```
 
+After install, `apm deps list` presents a local dependency as
+`_local/<directory-name>`. For a direct declaration with matching
+`apm.lock.yaml` metadata, that portable key is accepted verbatim by
+`apm uninstall` and `apm uninstall -g`; user-scope automation does not need to
+discover or print the absolute declared path. Without a lockfile, use the exact
+manifest path. Remove transitive local dependencies through their declaring
+parent.
+
+If two declarations end in the same directory name, their portable keys are
+ambiguous. Uninstall exits nonzero without running lifecycle scripts or writing
+files. Use one exact path already present in the relevant `apm.yml`; APM never
+guesses or removes both.
+
+When three or more declarations share a slot, one exact-path uninstall must not
+leave multiple physical survivors. Pass enough exact paths in the same command
+that at most one declaration remains.
+
 ### Marketplace (`name` + `marketplace`)
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | REQUIRED | Plugin identifier within the marketplace (`^[a-zA-Z0-9._-]+$`). |
 | `marketplace` | REQUIRED | Registered marketplace name (`^[a-zA-Z0-9._-]+$`). |
-| `version` | OPTIONAL | Semver range or exact version (e.g. `~2.1.0`, `^2.0`, `>=1.4`, `2.1.0`). Resolved against `{name}--v{version}` git tags on the marketplace repo. |
+| `version` | OPTIONAL | Semver range or exact version (e.g. `~2.1.0`, `^2.0`, `>=1.4`, `2.1.0`). Resolved against git tags using the publisher's effective pattern: `packages[].tag_pattern`, then `marketplace.build.tagPattern`. Older metadata without `source.tag_pattern` uses the legacy `{name}--v{version}` fallback. |
 
 During resolution, marketplace entries are looked up in the marketplace's
 `marketplace.json` and replaced with concrete git coordinates. When `version`
 is a semver range or bare version number, the resolver lists git tags
-matching `{name}--v{version}`, filters by the constraint, and picks the
-highest matching tag. Raw git refs (e.g. `v2.0.0`, `main`) bypass tag
-resolution and override the source ref directly. The lockfile records the
-resolved ref, not the marketplace placeholder. Unknown keys in a marketplace
-entry are rejected.
+using the `source.tag_pattern` emitted by `apm pack`. The package-level
+`tag_pattern` overrides `marketplace.build.tagPattern`. APM filters by the
+constraint and picks the highest matching tag. Old `marketplace.json` files
+that omit `source.tag_pattern` fall back to `{name}--v{version}`. Patterns
+must contain exactly one `{version}` placeholder, and a no-match does not
+silently become a raw ref. Raw git refs (e.g. `v2.0.0`, `main`) bypass tag
+resolution. The lockfile records the resolved ref, not the marketplace
+placeholder. Unknown keys in a marketplace entry are rejected.
 
 Producer-emitted `source: url` and `source: git-subdir` objects resolve
 through the same Git dependency parser as direct object-form dependencies.
@@ -354,16 +377,16 @@ GitHub URLs are stripped to shorthand; non-GitHub hosts keep the FQDN.
 receive that dependency's target-scoped primitives.
 
 Package-level `targets:` (top-level) selects the package's own
-compile/install runtimes; per-dependency `targets:` (inside a
-`dependencies.apm` entry) selects which active harnesses receive that
+compile/install targets; per-dependency `targets:` (inside a
+`dependencies.apm` entry) selects which active targets receive that
 dependency's target-scoped primitives. They compose via intersection. See
 `package-authoring.md` for author guidance.
 
-- Type: list of harness keys (`copilot`, `claude`, `cursor`, `codex`,
-  `gemini`, `antigravity`, `windsurf`, `kiro`, plus canonical targets
-  such as `opencode`, `agent-skills`, `openclaw`, `hermes`,
-  `copilot-cowork`, and `copilot-app`). Use `copilot`, not the runtime
-  alias `vscode`, for Copilot-family dependency routing.
+- Type: list of target keys. Stable targets are `copilot`, `claude`, `grok-build`,
+  `cursor`, `codex`, `gemini`, `antigravity`, `windsurf`, `kiro`,
+  `opencode`, and `agent-skills`. Experimental targets are `openclaw`, `hermes`,
+  `copilot-cowork`, `copilot-app`, and `grok-cloud`. Use `copilot`, not the
+  target alias `vscode`, for Copilot-family dependency routing.
 - Default: omitted means all active install targets.
 - Semantics: effective reach is `install_targets INTERSECT dep_targets`.
   A non-empty list narrows reach; it never widens beyond what the install
@@ -392,7 +415,7 @@ lives in `docs/src/content/docs/reference/manifest-schema.md` section
 
 ## MCP dependency formats
 
-See also: [MCP Servers guide](../../../../../docs/src/content/docs/guides/mcp-servers.md) for the CLI-first `apm install --mcp` workflow.
+See also: [MCP Servers guide](../../../../../docs/src/content/docs/consumer/install-mcp-servers.md) for the CLI-first `apm install --mcp` workflow.
 
 ```yaml
 dependencies:
@@ -452,6 +475,42 @@ dependencies:
         clientId: "<pre-registered-client-id>"
         callbackPort: 3118
 ```
+
+MCP Registry v0.1 uses `registryType: oci` for container packages. APM
+maps that type to the Docker launcher automatically, preserves Docker
+run options before the image, and appends package arguments after the
+image. Copilot, Codex, Gemini, and related adapters select `npm`, OCI,
+then PyPI; VS Code selects `npm`, PyPI, then OCI. Docker must be
+available when the harness starts an OCI server. Do not add per-target
+launcher overrides.
+
+For VS Code and Copilot-family adapters, non-container `npm`, `pypi`,
+and generic packages preserve typed v0.1 `runtimeArguments` and
+`packageArguments` in authored order, with exactly one semantic package
+identity. Legacy `value_hint` arguments remain compatible. Registry
+defaults resolve normally, secret variables use target-native references,
+unresolved optional groups are omitted atomically, and malformed or
+unresolved required entries fail closed.
+
+### Development MCP scope
+
+Use `dependencies.mcp` for servers that a consuming project should
+receive. Use `devDependencies.mcp` for author-only servers such as local
+mocks or debug bridges:
+
+```yaml
+devDependencies:
+  mcp:
+    - name: author-debug
+      registry: false
+      transport: stdio
+      command: ./scripts/author-debug
+```
+
+The root project activates both sections during `apm install`. Direct
+and transitive dependency packages contribute only `dependencies.mcp`;
+their development MCP entries do not enter the consumer's target config
+or `mcp_config_provenance`.
 
 At user scope, Claude MCP entries are written to
 `$CLAUDE_CONFIG_DIR/.claude.json` when `CLAUDE_CONFIG_DIR` is set to a
@@ -519,8 +578,9 @@ install time APM runs `git ls-remote` against the dep and picks the
 highest tag matching the range; the resolved tag, commit SHA, version,
 and original constraint are pinned in the lockfile. Subsequent
 `apm install` runs replay the lockfile without network. Use
-`apm install --update` (or change the manifest constraint) to
-re-resolve against current remote tags. Tag patterns are tried in order:
+`apm update` (or change the manifest constraint) to re-resolve against
+current remote tags. Update-like commands require authenticated upstream
+truth and do not accept a stale persistent bare-cache ref. Tag patterns are tried in order:
 `v{version}`, `{name}--v{version}`, and `{name}-v{version}`, then a bare
 `{version}` fallback. For virtual subdirectory deps, `{name}` is the
 final path segment (for example `pkg-a` in `acme/mono/packages/pkg-a`). A
@@ -575,6 +635,9 @@ enterprise security guide for the threat model.
 `apm.lock.yaml` records the exact commit SHA for every dependency, regardless
 of the ref format in apm.yml. Running `apm install` without `--update` always
 uses the locked SHA, ensuring reproducible installs across machines.
+`apm install --update`, `apm install --refresh`, `apm update` (including
+`--force`), `apm lock --update`, and `apm outdated` establish mutable refs from
+upstream instead of using a persistent bare-cache ref as current-state evidence.
 
 Lockfile keys keep `github.com` implicit for migration stability while
 non-default hosts add the lowercased host segment. See the [lockfile spec](https://microsoft.github.io/apm/reference/lockfile-spec/#lockfile-identity-keys)

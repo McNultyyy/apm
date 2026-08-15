@@ -2,7 +2,11 @@
 
 ## Token precedence chain
 
-APM checks these sources in order, using the first valid token found:
+For public `github.com` HTTPS repositories, APM makes one anonymous attempt before checking any token source. The attempt removes GitHub token variables, overrides authorization headers and credential helpers with empty values, and preserves caller-supplied global/system Git config such as CA settings, URL rewrites, and `credential.interactive=never`.
+
+Only HTTP 401, 403, 404, or an equivalent Git authentication failure unlocks the fallback chain below. DNS, TLS, timeout, and GitHub throttle failures do not prompt for credentials. Private-repository fallback is cached per repository path for the process, so later phases reuse it without applying that credential to a different repository.
+
+When fallback is required, APM checks these sources in order:
 
 | Priority | Variable | Scope | Notes |
 |----------|----------|-------|-------|
@@ -12,12 +16,13 @@ APM checks these sources in order, using the first valid token found:
 | 4 | `GH_TOKEN` | Global | Set by `gh auth login` |
 | 5 | `gh auth token --hostname <host>` | GitHub-like hosts | Active `gh auth login` account |
 | 6 | `git credential fill` | Per-host | System credential manager. APM forwards `path=<owner>/<repo>` so Git Credential Manager users with `credential.useHttpPath = true` get per-URL account selection (no account-picker prompt). |
-| -- | None | -- | Unauthenticated (public GitHub repos only) |
+| -- | None | -- | No credential was available after an auth-shaped anonymous failure |
 
 APM checks the active `gh` CLI account before invoking OS credential helpers. This reduces ambiguous multi-account prompts on hosts like github.com. If the `gh` CLI is not installed or no account is active, APM skips this step silently and continues to `git credential fill`.
 
-Unauthenticated public-repository retries use a fresh Git environment with
-inherited token and authorization-header settings removed.
+This anonymous-first rule applies only to `github.com` HTTPS. GHE Cloud, GHES, ADO,
+GitLab, SSH, local paths, and generic hosts keep their existing authentication
+and transport behavior.
 
 For multi-account Git Credential Manager setups, see the [Multi-account Git Credential Manager](https://microsoft.github.io/apm/getting-started/authentication/#multi-account-git-credential-manager) section in the main authentication guide.
 
@@ -83,8 +88,9 @@ For SSO-protected orgs, authorize the token under Settings > Tokens > Configure 
 
 ## Azure DevOps (ADO)
 
-ADO supports two auth modes; the GitHub token chain does not apply. The recommended
-approach is `az login`; explicit PATs are also supported. Resolution order:
+Azure DevOps Services supports two auth modes; the GitHub token chain does
+not apply. The recommended approach is `az login`; explicit PATs are also
+supported. Resolution order:
 
 1. `ADO_APM_PAT` env var if set
 2. AAD bearer from `az account get-access-token` if `az` is installed and signed in
@@ -110,11 +116,45 @@ or run `az login` and inspect `az account show --query tenantId -o tsv`.
 
 If `ADO_APM_PAT` is set but ADO returns 401, APM silently retries with the `az`
 bearer for clone, preflight, semver tag, and marketplace ref resolution, then warns:
-`[!] ADO_APM_PAT was rejected for {host} (HTTP 401); fell back to az cli bearer.`
+`[!] ADO_APM_PAT was rejected for {host}; fell back to az cli bearer.`
 
 When auth fails entirely, APM prints a targeted diagnostic (not a generic "not accessible"
 message). For `--update` operations, a pre-flight auth check runs before any files are
 modified -- on failure you see `No files were modified`.
+
+### On-prem Azure DevOps Server
+
+For self-hosted Azure DevOps Server installations (not Azure DevOps Services at
+`dev.azure.com`), tell APM which hostname to treat as ADO:
+
+```bash
+# Single server
+export ADO_HOST=ado.corp.example.com
+export ADO_APM_PAT=your_ado_pat
+apm install ado.corp.example.com/DefaultCollection/project/_git/repo
+
+# Explicit HTTPS port belongs in the dependency URL, not ADO_HOST
+apm install https://ado.corp.example.com:8443/DefaultCollection/project/_git/repo
+
+# Multiple servers
+export APM_ADO_HOSTS=ado1.corp.example.com,ado2.corp.example.com
+```
+
+`ADO_HOST` registers a single on-prem host; `APM_ADO_HOSTS` accepts a
+comma-separated list for environments with multiple ADO Server instances.
+Values are hostnames only (no scheme, port, or path), trimmed, matched
+case-insensitively, and must be valid FQDNs. Explicit HTTPS ports belong in
+the dependency URL. The first path segment is the server collection.
+Root-hosted collection URLs are supported; `/tfs/` or another server
+base-path prefix is not currently supported.
+
+Azure DevOps Server authentication is PAT-only in APM. Set `ADO_APM_PAT`;
+the Azure CLI bearer fallback applies to Azure DevOps Services, not Server.
+
+`GITHUB_HOST` alone classifies a custom hostname as GitHub Enterprise Server.
+When `ADO_HOST` or `APM_ADO_HOSTS` also names that host, the ADO
+configuration takes precedence and excludes GitHub credentials. You do not
+need to unset `GITHUB_HOST`.
 
 ### ADO auth troubleshooting
 
@@ -124,6 +164,7 @@ modified -- on failure you see `No files were modified`.
 | `az CLI is installed but no active session was found` | `az account show` fails | Run `az login --tenant <tenant>` against the tenant that owns the org |
 | `az CLI returned a token but the org does not accept it (likely a tenant mismatch)` | Wrong tenant | Run `az login --tenant <correct-tenant>`, or set `ADO_APM_PAT` |
 | `ADO_APM_PAT was rejected (HTTP 401) and no az cli fallback was available` | Stale PAT, no `az` | Rotate the PAT, or install `az` and run `az login --tenant <tenant>` |
+| On-prem host classified as GHES / GitHub credentials selected | `GITHUB_HOST` set without an ADO host configuration | Add `ADO_HOST=your-ado-server.example.com` (or list it in `APM_ADO_HOSTS`); ADO takes precedence |
 
 ## GitHub Enterprise Server (GHES)
 

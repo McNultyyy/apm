@@ -34,15 +34,16 @@ APM uses a tiered approach to integration testing:
 - **Trigger**: merge queue integration workflow, plus tag, schedule, and manual promotion runs
 
 ### 3. **Lifecycle Smoke** (PR-time required check)
-- **Location**: selected declaratively via `lifecycle_smoke and not lifecycle_merge_group`. The original 14 nodes plus six real-subprocess state-machine nodes form the bounded required set. Three unique prune-ledger/throttle regressions carry both markers and remain in the full merge-group integration suite.
+- **Location**: selected declaratively via `lifecycle_smoke and not lifecycle_merge_group`. Tests marked `lifecycle_merge_group` remain outside the bounded required set.
 - **Purpose**: Promote a stable, hermetic slice of Consume/Produce/Govern lifecycle contracts onto the PR-time critical path, so regressions in install, lock, deployment ownership, compile, pack, prune, uninstall, audit, and repair fail the PR.
-- **Scope**: the existing family contains one static authority guard plus in-process/mocked content-hash, policy, hook, virtual-skill, and virtual-package rows. The six added rows invoke the uv-installed `apm` console script through real subprocesses and local Git. This is not frozen PyInstaller coverage.
-- **Prerequisites**: the pytest step sets `APM_E2E_TESTS=1` so the six subprocess rows execute. `APM_RUN_INTEGRATION_TESTS` remains unset, the socket guard denies network sockets, and the job binds no credentials.
-- **Duration**: the 20-node required expression must remain inside its hard 3-minute job timeout; hosted duration is authoritative.
+- **Scope**: the family contains a static authority guard plus content-hash, policy, hook, virtual-package, audit, auth, and installed-console rows. Real subprocess cases use the uv-installed `apm` command and local Git. This is not frozen PyInstaller coverage.
+- **Prerequisites**: the pytest step sets `APM_E2E_TESTS=1` so subprocess rows execute. `APM_RUN_INTEGRATION_TESTS` remains unset, the socket guard denies network sockets, and the job binds no credentials.
+- **Duration**: the required expression must remain inside its hard 5-minute job timeout; hosted duration is authoritative.
 - **Trigger**: every pull request and merge queue run (`ci.yml`'s `lifecycle-smoke` job, required via `merge-gate.yml`)
-- **Selection mechanism**: `pytest --strict-markers -m 'lifecycle_smoke and not lifecycle_merge_group' tests/integration` -- declarative, not a file/node-id list. The full `lifecycle_smoke` family has 23 nodes; `lifecycle_merge_group` has exactly three named nodes; the difference is the required 20.
-- **Full-coverage path**: merge-group workflow `ci-integration.yml`, job `integration-tests-shard`, step `Run integration tests (sharded + parallelized)`, calls `uv run ./scripts/test-integration.sh`; that script runs `pytest tests/integration/`, so all 23 lifecycle nodes remain exercised.
-- **Drift guard**: `tests/quality/test_ci_topology.py` pins the 23/3/20 partition, exact merge-group membership, required expression, full-integration execution path, step-level `APM_E2E_TESTS: "1"` binding, network/credential prohibitions, and required-check membership.
+- **Selection mechanism**: `pytest --strict-markers -m 'lifecycle_smoke and not lifecycle_merge_group' tests/integration` -- declarative, not a file/node-id list. No central count or membership list is maintained.
+- **Full-coverage path**: merge-group workflow `ci-integration.yml`, job `integration-tests-shard`, step `Run integration tests (sharded + parallelized)`, calls `uv run ./scripts/test-integration.sh`; that script runs unfiltered `pytest tests/integration/`, so the complete lifecycle family remains exercised.
+- **Drift guard**: `tests/quality/test_ci_topology.py` independently collects the full, merge-group-only, and required selections; verifies their set partition; and preserves the required expression, full-integration execution path, step-level `APM_E2E_TESTS: "1"` binding, network/credential prohibitions, and required-check membership.
+- **Fixture controls**: lifecycle helpers set `APM_TEST_LOOPBACK_PORTS` for a port-scoped local registry and `APM_TEST_FAIL_LOCK_REPLACE=1` for atomic-write fault injection. These are internal test controls, not user-facing APM settings.
 - **Run it locally** (the exact command CI runs):
   ```bash
   APM_E2E_TESTS=1 uv run --extra dev pytest -p no:cacheprovider -q --strict-markers \
@@ -80,7 +81,7 @@ what the test family you want actually requires.
 | `requires_runtime_codex` | The `codex` runtime installed under `~/.apm/runtimes/` | `apm runtime setup codex` |
 | `requires_runtime_copilot` | The GitHub Copilot CLI runtime installed under `~/.apm/runtimes/` | `apm runtime setup copilot` |
 | `requires_runtime_llm` | The `llm` runtime installed under `~/.apm/runtimes/` | `apm runtime setup llm` |
-| `live` | Tests that hit real GitHub repos via cloning; deselected by default | Override the deselect: `pytest -m live tests/integration -v` |
+| `live` | Tests that hit real third-party repositories; deselected by default | Override the deselect: `pytest -m live tests/integration -v` |
 
 Without any of those env vars or runtimes a `pytest tests/integration`
 invocation is silent rather than red: every test is collected and
@@ -113,21 +114,32 @@ The behavioral definitions are:
 | `component` | In-process behavior that touches a filesystem or one command boundary |
 | `e2e` | A real installed CLI crossing at least one command boundary |
 
-`pyproject.toml` owns these definitions, while
-`tests/quality/critical_suite.toml` owns the finite classified module set.
+`pyproject.toml` owns these definitions.
+Module-level `pytestmark` is the sole behavioral classification authority.
+This is a marker-only behavioral taxonomy.
+Every classified module declares exactly one behavioral marker, and every
+collected node in that module must inherit the same classification. Function-
+or class-level behavioral markers are rejected because they would split the
+module's authority.
+
+There is no central module whitelist or exact classified-module count. New
+modules opt in by adding one module-level marker. The trade-off is deliberate:
+APM gives up the old closed-set/count ratchet in exchange for distributed
+ownership and removal of a central merge hotspot. Repository-wide collection
+still rejects empty, mixed, and multiple classifications deterministically.
+
 Directory names and `_e2e.py` suffixes are not proof of behavior.
 `test_policy_pinned_constraint_e2e.py` is `component` because it uses Click
 in-process; `test_core_smoke.py` is `e2e` because it invokes an installed
 binary through subprocess boundaries.
 
-To extend the manifest:
+To classify a module:
 
 1. Confirm the whole module has one behavioral boundary.
-2. Add its literal path and marker to `critical_suite.toml`.
-3. Add the module-level behavioral `pytestmark`, preserving any scheduling and
+2. Add exactly one module-level behavioral `pytestmark`, preserving scheduling and
    prerequisite markers.
-4. Document why behavior wins if the filename suggests another boundary.
-5. Run the contracts:
+3. Document why behavior wins if the filename suggests another boundary.
+4. Run the contracts:
 
 ```bash
 uv run --extra dev pytest -p no:cacheprovider -q tests/quality
@@ -292,6 +304,22 @@ marker registry described above. New integration tests dropped into
 `requires_*` marker and the registry will skip the test when its
 precondition is missing.
 
+Release promotion sets `PYTEST_MARK_EXPR="not live"`, so an expiring
+third-party credential cannot block publication. Live ADO PAT coverage is
+owned by the **Auth Acceptance Tests** workflow: dispatch it with
+`ado_pat_e2e: true` and an `ado_repo` acceptance fixture. That workflow
+selects `live and requires_ado_pat`, requires
+`AUTH_TEST_ADO_APM_PAT`, and fails with the normal actionable auth
+diagnostic when the PAT is rejected.
+
+Run the same focused acceptance locally with:
+
+```bash
+APM_TEST_ADO_REPO=dev.azure.com/org/project/_git/repo \
+ADO_APM_PAT=... \
+uv run pytest tests/integration/ -m "live and requires_ado_pat" -v
+```
+
 The orchestrator is mainly intended for reproducing the full CI
 environment end-to-end; for local iteration prefer the direct
 `pytest` invocations earlier on this page.
@@ -306,7 +334,7 @@ environment end-to-end; for local iteration prefer the direct
 **On version tag releases:**
 1. Unit tests + Smoke tests
 2. Build binaries (cross-platform)
-3. **E2E golden scenario tests** (using built binaries)
+3. **E2E golden scenario tests** (using built binaries). Linux and macOS Apple Silicon retain the full non-live integration corpus; macOS Intel runs the marker-bounded `lifecycle_smoke and not live` subset plus native startup and isolated release validation.
 4. Create GitHub Release
 5. Publish to PyPI 
 
@@ -334,12 +362,14 @@ Runtime setup prefers `GITHUB_TOKEN` for GitHub Models and falls back to `GITHUB
 The workflow ensures quality gates at each step:
 
 1. **build-and-test** jobs - Unit tests plus binary builds
-2. **integration-tests** job - Comprehensive runtime scenarios
+2. **integration-tests** job - Comprehensive non-live runtime scenarios
 3. **release-validation** job - Final shipped-binary validation
 4. **create-release** job - GitHub release creation
 5. **publish-pypi** job - PyPI package publication
 
-Each stage must succeed before proceeding to the next, ensuring only fully validated releases reach users.
+Each publication stage must succeed before proceeding to the next. Live
+third-party credential acceptance remains a failing gate in the opt-in Auth
+Acceptance workflow rather than a dependency of release publication.
 
 The [`microsoft/homebrew-apm`](https://github.com/microsoft/homebrew-apm) tap updates independently: it polls the latest APM release and commits formula updates with its own repository-scoped `GITHUB_TOKEN`. The release pipeline does not hold a cross-repository Homebrew credential.
 
@@ -348,8 +378,8 @@ The [`microsoft/homebrew-apm`](https://github.com/microsoft/homebrew-apm) tap up
 Promotion integration tests run on:
 - **Linux**: ubuntu-24.04 (x86_64), ubuntu-24.04-arm (arm64)
 - **Windows**: windows-latest (x86_64)
-- **macOS Intel**: macos-15-intel (x86_64)
-- **macOS Apple Silicon**: macos-latest (arm64)
+- **macOS Intel**: macos-15-intel (x86_64), with marker-bounded `lifecycle_smoke and not live` integration coverage, native binary startup, and isolated release validation
+- **macOS Apple Silicon**: macos-latest (arm64), with the full non-live integration corpus
 
 **Python Version**: 3.12 (standardized across all environments)
 **Package Manager**: uv (for fast dependency management and virtual environments)

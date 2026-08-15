@@ -77,6 +77,34 @@ Decision matrix:
 
 Schema details: [Lockfile spec](../../reference/lockfile-spec/).
 
+### Mixed-case GitHub package paths
+
+APM keeps GitHub lock and deduplication identity lowercase, but preserves the
+repository display spelling from `apm.yml` in `apm_modules/` and generated
+links. After upgrading, run:
+
+```bash
+apm install --verbose
+apm audit --ci
+```
+
+One stale case-only package directory is renamed transactionally and appears in
+verbose output. APM-managed links are rewritten; files you authored remain
+untouched.
+
+If install reports multiple package directories for one dependency:
+
+1. Stop and back up every named directory.
+2. Compare the directories and the matching `apm.yml` / `apm.lock.yaml` entry.
+3. Keep the directory whose spelling matches `apm.yml`. Remove another only
+   after confirming it is a duplicate and contains no unique edits.
+4. Run `apm install --verbose`, then `apm audit --ci`.
+
+An interrupted case-only rename can leave a hidden
+`.apm-case-migration-<id>` entry beside the package directory. Inspect its
+contents before renaming it back or removing it; APM does not delete an
+unverified recovery entry automatically.
+
 ## 4. Compile strategy migration
 
 The compile step writes per-target output (e.g. `.github/copilot-instructions.md`, `.claude/`, `.cursor/rules/`). Some targets support both a single-file (monolithic) layout and a per-primitive (distributed) layout.

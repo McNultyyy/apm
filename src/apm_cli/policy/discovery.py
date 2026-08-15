@@ -36,7 +36,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import requests
 import yaml
@@ -46,6 +46,7 @@ from ..utils.github_host import (
     build_ado_api_url,
     is_azure_devops_hostname,
     is_visualstudio_legacy_hostname,
+    parse_ado_repo_url,
 )
 from ..utils.path_security import PathTraversalError, ensure_path_within
 from ..utils.yaml_io import load_yaml_str
@@ -197,7 +198,7 @@ def _verify_hash_pin(
 POLICY_CACHE_DIR = ".policy-cache"
 DEFAULT_CACHE_TTL = 3600  # 1 hour
 MAX_STALE_TTL = 7 * 24 * 3600  # 7 days -- stale cache usable on refresh failure
-CACHE_SCHEMA_VERSION = "5"  # Bump when cache format changes to auto-invalidate
+CACHE_SCHEMA_VERSION = "6"  # Bump when cache format changes to auto-invalidate
 
 
 @dataclass
@@ -222,6 +223,7 @@ class PolicyFetchResult:
 
     policy: ApmPolicy | None = None
     source: str = ""  # "org:contoso/.github", "file:/path", "url:https://..."
+    cache_ref: str | None = field(default=None, repr=False)
     cached: bool = False  # True if served from cache
     error: str | None = None  # Error message if fetch failed
 
@@ -345,6 +347,29 @@ def discover_policy_with_chain(
 def _strip_source_prefix(src: str) -> str:
     """Strip 'org:' / 'url:' / 'file:' prefix from a PolicyFetchResult.source."""
     return src.removeprefix("org:").removeprefix("url:").removeprefix("file:")
+
+
+def _redact_policy_ref(ref: str) -> str:
+    """Return a credential-free policy reference for persistence and output."""
+    prefix = "url:" if ref.startswith("url:") else ""
+    bare_ref = ref.removeprefix(prefix)
+    if not bare_ref.startswith(("http://", "https://")):
+        return ref
+
+    try:
+        parts = urlsplit(bare_ref)
+        host = parts.hostname or ""
+        port = parts.port
+    except (TypeError, ValueError):
+        return f"{prefix}<redacted-url>"
+
+    if not host:
+        return f"{prefix}<redacted-url>"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    safe_url = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    return f"{prefix}{safe_url}"
 
 
 def _derive_leaf_host(source: str, project_root: Path) -> str | None:
@@ -577,6 +602,7 @@ def _resolve_and_persist_chain(
 
     leaf_policy = fetch_result.policy
     leaf_source = fetch_result.source
+    leaf_cache_ref = fetch_result.cache_ref or _strip_source_prefix(leaf_source)
 
     # Host pin: extends: refs may only resolve against the leaf's origin
     # host. Prevents credential leakage to attacker-controlled hosts via
@@ -591,7 +617,7 @@ def _resolve_and_persist_chain(
     # Track normalized refs we've already followed to break cycles.
     # We seed with the leaf's source so an extends pointing back at the
     # leaf is also detected.
-    visited: list[str] = [_strip_source_prefix(leaf_source)] if leaf_source else []
+    visited: list[str] = [leaf_cache_ref] if leaf_source else []
 
     current = leaf_policy
     incomplete_chain: tuple[str, int, int] | None = None
@@ -605,18 +631,23 @@ def _resolve_and_persist_chain(
         _validate_extends_host(leaf_host, next_ref)
 
         if _inheritance_mod.detect_cycle(visited, next_ref):
+            safe_visited = [_redact_policy_ref(ref) for ref in visited]
+            safe_next_ref = _redact_policy_ref(next_ref)
             raise _inheritance_mod.PolicyInheritanceError(
-                f"Cycle detected in policy extends chain: {' -> '.join(visited)} -> {next_ref}"
+                f"Cycle detected in policy extends chain: "
+                f"{' -> '.join(safe_visited)} -> {safe_next_ref}"
             )
 
         # Depth check: chain_policies already has len() entries; next fetch
         # would push us to len()+1.  resolve_policy_chain enforces this
         # afterwards, but failing here gives a clearer error.
         if len(chain_policies) + 1 > _inheritance_mod.MAX_CHAIN_DEPTH:
+            safe_visited = [_redact_policy_ref(ref) for ref in visited]
+            safe_next_ref = _redact_policy_ref(next_ref)
             raise _inheritance_mod.PolicyInheritanceError(
                 f"Policy chain depth exceeds maximum of "
                 f"{_inheritance_mod.MAX_CHAIN_DEPTH} "
-                f"(chain: {' -> '.join(visited)} -> {next_ref})"
+                f"(chain: {' -> '.join(safe_visited)} -> {safe_next_ref})"
             )
 
         parent_result = _fetch_chain_parent(
@@ -653,7 +684,7 @@ def _resolve_and_persist_chain(
             ref, resolved, attempted = incomplete_chain
             fetch_result.outcome = "incomplete_chain"
             fetch_result.error = (
-                f"Policy chain incomplete: {ref} unreachable "
+                f"Policy chain incomplete: {_redact_policy_ref(ref)} unreachable "
                 f"({resolved} of {attempted} policies resolved)"
             )
             fetch_result.policy = None
@@ -672,7 +703,7 @@ def _resolve_and_persist_chain(
 
     chain_refs: list[str] = [_strip_source_prefix(src) for src in ordered_sources if src]
 
-    cache_key = _strip_source_prefix(leaf_source) if leaf_source else ""
+    cache_key = leaf_cache_ref if leaf_source else ""
     if cache_key and incomplete_chain is None and stale_ancestor is None:
         _write_cache(
             cache_key,
@@ -687,7 +718,7 @@ def _resolve_and_persist_chain(
         ref, resolved, attempted = incomplete_chain
         fetch_result.outcome = "incomplete_chain"
         fetch_result.error = (
-            f"Policy chain incomplete: {ref} unreachable "
+            f"Policy chain incomplete: {_redact_policy_ref(ref)} unreachable "
             f"({resolved} of {attempted} policies resolved)"
         )
         fetch_result.policy = None
@@ -832,14 +863,14 @@ def _auto_discover(
        - Found -> return (first match wins)
     5. All candidates exhausted -> outcome="absent"
     """
-    org_and_host = _extract_org_from_git_remote(project_root)
-    if org_and_host is None:
+    identity = _extract_org_host_port_from_git_remote(project_root)
+    if identity is None:
         return PolicyFetchResult(
             error="Could not determine org from git remote",
             outcome="no_git_remote",
         )
 
-    org, host = org_and_host
+    org, host, port = identity
     candidates = _policy_repo_candidates(host)
     is_ado = is_azure_devops_hostname(host)
 
@@ -851,6 +882,7 @@ def _auto_discover(
                 project=ADO_POLICY_PROJECT,
                 repo=candidate_repo,
                 host=host,
+                port=port,
                 project_root=project_root,
                 no_cache=no_cache,
                 expected_hash=expected_hash,
@@ -907,6 +939,14 @@ def _extract_org_from_git_remote(
     - git@github.com:contoso/my-project.git -> ("contoso", "github.com")
     - https://github.example.com/contoso/my-project.git -> ("contoso", "github.example.com")
     """
+    identity = _extract_org_host_port_from_git_remote(project_root)
+    return (identity[0], identity[1]) if identity is not None else None
+
+
+def _extract_org_host_port_from_git_remote(
+    project_root: Path,
+) -> tuple[str, str, int | None] | None:
+    """Extract ``(org, host, port)`` from git remote origin."""
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -918,8 +958,18 @@ def _extract_org_from_git_remote(
         )
         if result.returncode != 0:
             return None
-        return _parse_remote_url(result.stdout.strip())
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+        remote_url = result.stdout.strip()
+        parsed_identity = _parse_remote_url(remote_url)
+        if parsed_identity is None:
+            return None
+        port = None
+        if "://" in remote_url:
+            try:
+                port = urlparse(remote_url).port
+            except ValueError:
+                return None
+        return parsed_identity[0], parsed_identity[1], port
+    except (ValueError, subprocess.TimeoutExpired, FileNotFoundError):
         return None
 
 
@@ -962,11 +1012,20 @@ def _parse_remote_url(url: str) -> tuple[str, str] | None:
         try:
             parsed = urlparse(url)
             host = parsed.hostname or ""
+            if is_azure_devops_hostname(host):
+                ado_coordinates = parse_ado_repo_url(url)
+                if ado_coordinates is None:
+                    return None
+                return ado_coordinates[0], host
             path_parts = parsed.path.strip("/").removesuffix(".git").rstrip("/").split("/")
             if is_visualstudio_legacy_hostname(host):
                 return (host[: -len(".visualstudio.com")], host)
             if host and path_parts and path_parts[0]:
                 return (path_parts[0], host)
+        except ValueError as exc:
+            if "mounted below '/tfs/'" in str(exc):
+                raise
+            return None
         except Exception:
             return None
 
@@ -982,7 +1041,8 @@ def _fetch_from_url(
     cache_only: bool = False,
 ) -> PolicyFetchResult:
     """Fetch policy YAML from a direct URL."""
-    source_label = f"url:{url}"
+    safe_url = _redact_policy_ref(url)
+    source_label = f"url:{safe_url}"
     cache_entry: _CacheEntry | None = None
     cache_entry_persisted = _cache_entry_files_exist(url, project_root)
 
@@ -994,6 +1054,7 @@ def _fetch_from_url(
             return PolicyFetchResult(
                 policy=cache_entry.policy,
                 source=cache_entry.source,
+                cache_ref=url,
                 cached=True,
                 cache_age_seconds=cache_entry.age_seconds,
                 outcome=outcome,
@@ -1003,12 +1064,14 @@ def _fetch_from_url(
             )
 
     if cache_only:
-        return _cache_only_policy_result(
+        result = _cache_only_policy_result(
             cache_entry,
             source_label=source_label,
             expected_hash=expected_hash,
             cache_entry_persisted=cache_entry_persisted,
         )
+        result.cache_ref = url
+        return result
 
     fetch_error: str | None = None
     content: str | None = None
@@ -1018,6 +1081,7 @@ def _fetch_from_url(
         if resp.status_code == 404:
             return PolicyFetchResult(
                 source=source_label,
+                cache_ref=url,
                 error="404: Policy file not found",
                 outcome="absent",
             )
@@ -1025,27 +1089,32 @@ def _fetch_from_url(
             # Redirects are refused: a malicious or compromised origin
             # could otherwise bounce us to an attacker-controlled host
             # (SSRF / Referer leakage). Treat as fetch failure.
-            location = resp.headers.get("Location", "<no Location header>")
-            fetch_error = f"Refusing HTTP redirect ({resp.status_code}) from {url} to {location}"
+            location = _redact_policy_ref(resp.headers.get("Location", "<no Location header>"))
+            fetch_error = (
+                f"Refusing HTTP redirect ({resp.status_code}) from {safe_url} to {location}"
+            )
         elif resp.status_code != 200:
-            fetch_error = f"HTTP {resp.status_code} fetching {url}"
+            fetch_error = f"HTTP {resp.status_code} fetching {safe_url}"
         else:
             content = resp.text
     except requests.exceptions.Timeout:
-        fetch_error = f"Timeout fetching {url}"
+        fetch_error = f"Timeout fetching {safe_url}"
     except requests.exceptions.ConnectionError:
-        fetch_error = f"Connection error fetching {url}"
+        fetch_error = f"Connection error fetching {safe_url}"
     except Exception as e:
-        fetch_error = f"Error fetching {url}: {e}"
+        fetch_error = f"Error fetching {safe_url}: {type(e).__name__}"
 
     if fetch_error:
-        return _stale_fallback_or_error(
+        result = _stale_fallback_or_error(
             cache_entry, fetch_error, source_label, "cache_miss_fetch_fail"
         )
+        result.cache_ref = url
+        return result
 
     # Garbage-response detection: body must be valid YAML mapping
-    garbage_result = _detect_garbage(content, url, source_label, cache_entry)
+    garbage_result = _detect_garbage(content, safe_url, source_label, cache_entry)
     if garbage_result is not None:
+        garbage_result.cache_ref = url
         return garbage_result
 
     # Hash pin verification (#827) -- BEFORE parse, on raw bytes off wire.
@@ -1054,14 +1123,16 @@ def _fetch_from_url(
     # exactly the compromise this pin is designed to catch.
     mismatch = _verify_hash_pin(content, expected_hash, source_label)
     if mismatch is not None:
+        mismatch.cache_ref = url
         return mismatch
 
     try:
         policy, warnings = load_policy(content)
     except PolicyValidationError as e:
         return PolicyFetchResult(
-            error=f"Invalid policy from {url}: {e}",
+            error=f"Invalid policy from {safe_url}: {e}",
             source=source_label,
+            cache_ref=url,
             outcome="malformed",
             warnings=e.warnings,
         )
@@ -1081,6 +1152,7 @@ def _fetch_from_url(
     return PolicyFetchResult(
         policy=policy,
         source=source_label,
+        cache_ref=url,
         outcome=outcome,
         raw_bytes_hash=actual_hash,
         expected_hash=expected_hash,
@@ -1254,6 +1326,7 @@ def _fetch_from_ado_repo(
     project: str,
     repo: str,
     host: str,
+    port: int | None = None,
     project_root: Path,
     no_cache: bool = False,
     expected_hash: str | None = None,
@@ -1264,7 +1337,8 @@ def _fetch_from_ado_repo(
     Mirrors ``_fetch_from_repo`` but uses ``_fetch_ado_contents`` (ADO
     Items API) instead of ``_fetch_github_contents`` (GitHub Contents API).
     """
-    repo_ref = f"{host}/{org}/{project}/{repo}"
+    host_label = f"{host}:{port}" if port is not None else host
+    repo_ref = f"{host_label}/{org}/{project}/{repo}"
     source_label = f"org:{repo_ref}"
     cache_entry: _CacheEntry | None = None
     cache_entry_persisted = _cache_entry_files_exist(repo_ref, project_root)
@@ -1292,7 +1366,16 @@ def _fetch_from_ado_repo(
             cache_entry_persisted=cache_entry_persisted,
         )
 
-    content, error = _fetch_ado_contents(org, project, repo, "apm-policy.yml", host=host)
+    fetch_kwargs = {"host": host}
+    if port is not None:
+        fetch_kwargs["port"] = port
+    content, error = _fetch_ado_contents(
+        org,
+        project,
+        repo,
+        "apm-policy.yml",
+        **fetch_kwargs,
+    )
 
     if error:
         if "404" in error:
@@ -1349,35 +1432,62 @@ def _fetch_ado_contents(
     file_path: str,
     *,
     host: str = "dev.azure.com",
+    port: int | None = None,
 ) -> tuple[str | None, str | None]:
     """Fetch file contents from Azure DevOps Items API.
 
     Returns ``(content_string, error_string)``. One will be ``None``.
     """
-    api_url = build_ado_api_url(org, project, repo, file_path, host=host)
-    repo_ref = f"{host}/{org}/{project}/{repo}"
+    api_url = build_ado_api_url(
+        org,
+        project,
+        repo,
+        file_path,
+        host=host,
+        port=port,
+    )
+    host_label = f"{host}:{port}" if port is not None else host
+    repo_ref = f"{host_label}/{org}/{project}/{repo}"
 
     # ADO auth is centralized in AuthResolver: ADO_APM_PAT uses Basic auth,
     # and az CLI AAD tokens use Bearer auth. No GitHub PATs are consulted.
     from ..core.auth import AuthResolver
 
-    headers: dict[str, str] = {}
     auth_resolver = AuthResolver()
-    auth_ctx = auth_resolver.resolve(host, org=org)
-    if auth_ctx.token:
-        if auth_ctx.auth_scheme == "bearer":
-            headers["Authorization"] = f"Bearer {auth_ctx.token}"
-        else:
-            basic_cred = base64.b64encode(f":{auth_ctx.token}".encode()).decode()
-            headers["Authorization"] = f"Basic {basic_cred}"
+
+    def _headers(token: str | None, git_env: dict[str, str]) -> dict[str, str]:
+        if not token:
+            return {}
+        count = int(git_env.get("GIT_CONFIG_COUNT", "0") or "0")
+        for index in range(max(0, count)):
+            value = git_env.get(f"GIT_CONFIG_VALUE_{index}", "")
+            if value.lower().startswith("authorization: bearer "):
+                return {"Authorization": f"Bearer {token}"}
+        basic_cred = base64.b64encode(f":{token}".encode()).decode()
+        return {"Authorization": f"Basic {basic_cred}"}
+
+    def _request(token: str | None, git_env: dict[str, str]):
+        response = requests.get(
+            api_url,
+            headers=_headers(token, git_env),
+            timeout=10,
+            allow_redirects=False,
+        )
+        if response.status_code in (401, 403):
+            raise RuntimeError(f"{response.status_code}: unauthorized")
+        return response
 
     try:
-        resp = requests.get(api_url, headers=headers, timeout=10, allow_redirects=False)
+        resp = auth_resolver.try_with_fallback(
+            host,
+            _request,
+            org=org,
+            port=port,
+            path=f"{org}/{project}/{repo}",
+            unauth_first=False,
+        )
         if resp.status_code == 404:
             return None, "404: Policy file not found"
-        if resp.status_code in (401, 403):
-            remediation = auth_resolver.build_error_context(host, "fetch org policy", org=org)
-            return None, (f"{resp.status_code}: Access denied to {repo_ref}{remediation}")
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("Location", "<no Location header>")
             return None, (
@@ -1391,6 +1501,16 @@ def _fetch_ado_contents(
         return None, f"Timeout fetching policy from {repo_ref}"
     except requests.exceptions.ConnectionError:
         return None, f"Connection error fetching policy from {repo_ref}"
+    except RuntimeError as exc:
+        error_kwargs = {"org": org}
+        if port is not None:
+            error_kwargs["port"] = port
+        remediation = auth_resolver.build_error_context(
+            host,
+            "fetch org policy",
+            **error_kwargs,
+        )
+        return None, f"{exc}: Access denied to {repo_ref}{remediation}"
     except Exception as e:
         return None, f"Error fetching policy from {repo_ref}: {e}"
 
@@ -1809,6 +1929,7 @@ def _read_cache_entry(
 
         # Schema version check -- auto-invalidate on format change
         if meta.get("schema_version") != CACHE_SCHEMA_VERSION:
+            meta_file.unlink(missing_ok=True)
             return None
 
         cached_at = meta.get("cached_at", 0)
@@ -1844,7 +1965,7 @@ def _read_cache_entry(
 
         # Determine source label
         if repo_ref.startswith("http://") or repo_ref.startswith("https://"):
-            source = f"url:{repo_ref}"
+            source = f"url:{_redact_policy_ref(repo_ref)}"
         else:
             source = f"org:{repo_ref}"
 
@@ -1853,7 +1974,7 @@ def _read_cache_entry(
             source=source,
             age_seconds=age,
             stale=age > effective_ttl,
-            chain_refs=meta.get("chain_refs", [repo_ref]),
+            chain_refs=[_redact_policy_ref(str(ref)) for ref in meta.get("chain_refs", [repo_ref])],
             warnings=cached_warnings,
             fingerprint=meta.get("fingerprint", ""),
             raw_bytes_hash=raw_bytes_hash,
@@ -1934,10 +2055,11 @@ def _write_cache(
         return
 
     # Atomic write: metadata sidecar
+    persisted_chain_refs = chain_refs if chain_refs is not None else [repo_ref]
     meta = {
-        "repo_ref": repo_ref,
+        "repo_ref": _redact_policy_ref(repo_ref),
         "cached_at": time.time(),
-        "chain_refs": chain_refs if chain_refs is not None else [repo_ref],
+        "chain_refs": [_redact_policy_ref(ref) for ref in persisted_chain_refs],
         "warnings": warnings or [],
         "schema_version": CACHE_SCHEMA_VERSION,
         "fingerprint": fingerprint,

@@ -79,6 +79,8 @@ class TestInstallCommandAutoBootstrap:
                 MagicMock(repo_url="test/package", reference="main")
             ]
             mock_pkg_instance.get_mcp_dependencies.return_value = []
+            mock_pkg_instance.get_all_mcp_dependencies.return_value = []
+            mock_pkg_instance.get_lsp_dependencies.return_value = []
             mock_apm_package.from_apm_yml.return_value = mock_pkg_instance
 
             # Mock the install function to avoid actual installation
@@ -89,7 +91,7 @@ class TestInstallCommandAutoBootstrap:
             )
 
             result = self.runner.invoke(cli, ["install", "test/package"])
-            assert result.exit_code == 0
+            assert result.exit_code == 0, (result.output, result.exception)
             assert "Created apm.yml" in result.output
             assert Path("apm.yml").exists()
 
@@ -130,7 +132,7 @@ class TestInstallCommandAutoBootstrap:
 
             result = self.runner.invoke(cli, ["install", "org1/pkg1", "org2/pkg2"])
 
-            assert result.exit_code == 0
+            assert result.exit_code == 0, (result.output, result.exception)
             assert "Created apm.yml" in result.output
             assert Path("apm.yml").exists()
 
@@ -299,10 +301,18 @@ class TestInstallCommandAutoBootstrap:
     @patch("apm_cli.commands.install.APM_DEPS_AVAILABLE", True)
     @patch("apm_cli.commands.install.APMPackage")
     @patch("apm_cli.commands.install._install_apm_dependencies")
+    @patch(
+        "apm_cli.commands.install._resolve_bootstrap_project_name",
+        return_value="resolved-name",
+    )
     def test_install_auto_created_apm_yml_has_correct_metadata(
-        self, mock_install_apm, mock_apm_package, mock_validate
+        self,
+        mock_resolve_project_name,
+        mock_install_apm,
+        mock_apm_package,
+        mock_validate,
     ):
-        """Test that auto-created apm.yml has correct metadata."""
+        """Auto-bootstrap must write the centrally resolved project name."""
         with self._chdir_tmp() as tmp_dir:
             # Create a directory with a specific name to test project name detection
             project_dir = tmp_dir / "my-awesome-project"
@@ -325,18 +335,66 @@ class TestInstallCommandAutoBootstrap:
                 )
             )
 
-            result = self.runner.invoke(cli, ["install", "test/package"])
+            result = self.runner.invoke(cli, ["install", "test/package", "--verbose"])
 
             assert result.exit_code == 0
             assert Path("apm.yml").exists()
 
-            # Verify auto-detected project name
+            mock_resolve_project_name.assert_called_once_with("my-awesome-project")
+            assert (
+                'Using default project name "resolved-name" because '
+                "derived name 'my-awesome-project' is invalid"
+            ) in " ".join(result.output.split())
+
+            # Verify centrally resolved project name
             with open("apm.yml", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
-                assert config["name"] == "my-awesome-project"
+                assert config["name"] == "resolved-name"
                 assert "version" in config
                 assert "description" in config
                 assert "APM project" in config["description"]
+
+    @patch("apm_cli.commands.install._validate_package_exists")
+    @patch("apm_cli.commands.install.APM_DEPS_AVAILABLE", True)
+    @patch("apm_cli.commands.install.APMPackage")
+    @patch("apm_cli.commands.install._install_apm_dependencies")
+    def test_install_auto_bootstrap_at_root_writes_valid_name(
+        self,
+        mock_install_apm,
+        mock_apm_package,
+        mock_validate,
+    ):
+        """A filesystem-root candidate must produce a valid manifest name."""
+        with self._chdir_tmp():
+            mock_validate.return_value = True
+            mock_pkg_instance = MagicMock()
+            mock_pkg_instance.get_apm_dependencies.return_value = [
+                MagicMock(repo_url="test/package", reference="main")
+            ]
+            mock_pkg_instance.get_mcp_dependencies.return_value = []
+            mock_apm_package.from_apm_yml.return_value = mock_pkg_instance
+            mock_install_apm.return_value = InstallResult(
+                diagnostics=MagicMock(
+                    has_diagnostics=False, has_critical_security=False, error_count=0
+                )
+            )
+
+            real_path = Path
+
+            class RootCwdPath:
+                def __new__(cls, *args):
+                    return real_path(*args)
+
+                @classmethod
+                def cwd(cls):
+                    return real_path("/")
+
+            with patch("apm_cli.commands.install.Path", RootCwdPath):
+                result = self.runner.invoke(cli, ["install", "test/package"])
+
+            assert result.exit_code == 0, f"{result.output}\n{result.exception!r}"
+            with open("apm.yml", encoding="utf-8") as f:
+                assert yaml.safe_load(f)["name"] == "my-project"
 
     @patch("apm_cli.commands.install._validate_package_exists", return_value=False)
     def test_install_positional_url_total_validation_failure_exits_one(self, mock_validate):
@@ -550,11 +608,8 @@ class TestValidationFailureReasonMessages:
         ):
             result = _validate_package_exists("owner/repo/skills/my-skill", verbose=True)
             assert result is False
-            mock_resolve.assert_called_once()
-            mock_build_ctx.assert_called_once()
-            call_args = mock_build_ctx.call_args
-            assert call_args[0][0] == "github.com"  # host
-            assert "owner/repo/skills/my-skill" in call_args[0][1]  # operation
+            mock_resolve.assert_not_called()
+            mock_build_ctx.assert_not_called()
 
     def test_virtual_package_validation_reuses_auth_resolver(self):
         """Virtual package validation should pass its AuthResolver to the downloader."""
@@ -748,7 +803,7 @@ class TestDevMcpDependenciesInstall:
             patch("apm_cli.commands.install.MCPIntegrator.install", return_value=1) as install,
             patch("apm_cli.commands.install.MCPIntegrator.update_lockfile"),
         ):
-            result = CliRunner().invoke(cli, ["install"])
+            result = CliRunner().invoke(cli, ["install", "--target", "claude"])
 
         assert result.exit_code == 0, result.output
         assert install.call_count == 1
@@ -1833,6 +1888,7 @@ class TestInstallMcpFlag:
                             "version": "0.1.0",
                             "description": "",
                             "author": "",
+                            "targets": ["claude"],
                             "dependencies": {"apm": [], "mcp": []},
                             "scripts": {},
                         },

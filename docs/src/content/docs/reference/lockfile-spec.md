@@ -188,6 +188,7 @@ Each item in `dependencies` describes one resolved package.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `repo_url` | string | yes | Canonical repository path or URL. Entry identity is derived from `repo_url`, `host`, and virtual/local markers; see [lockfile identity keys](#lockfile-identity-keys). |
+| `materialization_repo_url` | string | no | Source-cased path that preserves repository display spelling when APM reconstructs the dependency, including for `apm_modules/` materialization and generated links. Omitted when it equals `repo_url`; it must normalize to the same identity and cannot redirect a lock entry. |
 | `host` | string | no | FQDN when not inferable from `repo_url` (e.g. for registry proxies or non-GitHub hosts). |
 | `host_type` | string | no | Explicit host-kind hint, currently `gitlab`, copied from object-form `type: gitlab`. |
 | `port` | int | no | Non-standard SSH/HTTPS port. Validated to `1..65535` on read. |
@@ -203,7 +204,7 @@ Each item in `dependencies` describes one resolved package.
 | `package_type` | string | no | Kind of package: `apm_package`, `skill_bundle`, `claude_skill`, `hook_package`, `hybrid`, `marketplace_plugin`. Drives target placement. |
 | `skill_subset` | list of strings | no | For dependencies that expose selectable skills: the sorted subset of skill names the manifest selected. Empty means "all". |
 | `target_subset` | list of strings | no | Sorted target names selected by a dependency's `targets:` subset. Empty means "all active install targets". |
-| `deployed_files` | list of strings | no | Project-relative paths APM wrote for this dep. Sorted. Powers `prune` and `audit`'s file-presence check. A shared path has one canonical package owner; uninstall transfers ownership to a surviving provider. When the consumer manifest declares targets, reinstall preserves entries for other declared, gated, or dynamic targets and removes entries outside that target universe. On a target contraction, APM removes an obsolete target's file only when its recorded hash still matches; a user-edited file stays on disk and remains tracked for review. Without a declared target set, reinstall preserves prior other-target entries. |
+| `deployed_files` | list of strings | no | Project-relative paths APM wrote for this dep. Sorted. Powers `prune` and `audit`'s file-presence check. A shared path has one canonical package owner; uninstall transfers ownership to a surviving provider. When the consumer manifest declares targets, reinstall preserves entries for other declared, gated, or dynamic targets and removes entries outside that target universe. On a target contraction, a normal install/prune run removes an obsolete target's file only when its recorded hash still matches; a user-edited file stays on disk and remains tracked for review. `apm lock` is non-destructive: if bytes remain on disk, the lockfile preserves their `deployed_files`, `deployed_file_hashes`, and deployment-ledger rows until the next normal install can prove and perform cleanup. Without a declared target set, reinstall preserves prior other-target entries. |
 | `deployed_file_hashes` | map | no | `path -> sha256` for the files in `deployed_files`. Powers `audit`'s content-integrity check. Hashed over canonical content -- UTF-8 text is normalized CRLF -> LF (bare CR preserved) so the hash is the same whether git checks the file out with Windows or POSIX line endings; binary is hashed raw. Directory entries (trailing `/`) have no hash. |
 | `exec_status` | string | no | Executable-trust state of this dep's executable primitives, set by the install-time gate via the shared deny-wins resolver. One of `deployed` (trusted and materialized), `gated_pending_approval` (present but parked until approved), `denied` (blocked by an org/user deny), or `absent` (declares no executables). Consumed by `audit`'s `required-executable-untrusted` signal; see [Executable approval](../cli/approve/). |
 | `source` | string | no | `"local"` for path dependencies, `"registry"` for dedicated-registry resolutions. Absent for Git deps. |
@@ -244,8 +245,11 @@ logical key because the proxy host is transport, not package identity.
 
 GitHub and package-registry owner/repository paths are lowercased before APM
 derives the key. Older mixed-case GitHub entries therefore serialize with the
-same key as new lowercase references. Repository path casing remains unchanged
-for unknown git hosts because those backends may be case-sensitive.
+same key as new lowercase references. Their source spelling is retained
+separately in `materialization_repo_url`, so filesystem paths and relative links
+do not reuse the lowercase comparison key. Repository path casing remains
+identity-significant for unknown git hosts because those backends may be
+case-sensitive.
 
 ## Self entry
 
@@ -316,7 +320,7 @@ shipped.
 | Command | Reads | Writes |
 |---|---|---|
 | `apm install` | existing lockfile (for `--frozen` and incremental reuse) | full rewrite on resolution change |
-| `apm install --frozen` | required | never writes; fails on missing pin |
+| `apm install --frozen` | required | never writes; fails on a missing pin or MCP config/server-name drift |
 | `apm compile` | yes (resolution + integrity) | no |
 | `apm audit` | yes | no |
 | `apm prune` | yes (orphans and `deployments` ownership, even with nothing else to prune) | yes (after removing orphans and reconciling `deployments`) |

@@ -11,6 +11,7 @@ _NETWORK_GUARD = """\
 import _socket
 import builtins
 import importlib
+import os
 import socket
 import sys
 
@@ -19,6 +20,28 @@ _REAL_SOCKET = socket.socket
 _REAL_RAW_SOCKET = _socket.socket
 _REAL_IMPORT = builtins.__import__
 _REAL_IMPORT_MODULE = importlib.import_module
+_REAL_CREATE_CONNECTION = socket.create_connection
+_REAL_GETADDRINFO = _socket.getaddrinfo
+_ALLOWED_LOOPBACK_PORTS = {
+    int(value)
+    for value in os.environ.get("APM_TEST_LOOPBACK_PORTS", "").split(",")
+    if value.isdigit()
+}
+
+
+def _normalized_port(port):
+    if isinstance(port, int):
+        return port
+    if isinstance(port, str) and port.isdigit():
+        return int(port)
+    return None
+
+
+def _is_allowed_loopback(address):
+    if not isinstance(address, tuple) or len(address) < 2:
+        return False
+    host, port = address[:2]
+    return host in ("127.0.0.1", "::1") and _normalized_port(port) in _ALLOWED_LOOPBACK_PORTS
 
 
 class _GuardedSocketOperations:
@@ -33,12 +56,12 @@ class _GuardedSocketOperations:
         return super().bind(address)
 
     def connect(self, address):
-        if self.family in (socket.AF_INET, socket.AF_INET6):
+        if self.family in (socket.AF_INET, socket.AF_INET6) and not _is_allowed_loopback(address):
             raise OSError(_MESSAGE)
         return super().connect(address)
 
     def connect_ex(self, address):
-        if self.family in (socket.AF_INET, socket.AF_INET6):
+        if self.family in (socket.AF_INET, socket.AF_INET6) and not _is_allowed_loopback(address):
             raise OSError(_MESSAGE)
         return super().connect_ex(address)
 
@@ -73,10 +96,25 @@ def _deny_network(*args, **kwargs):
     raise OSError(_MESSAGE)
 
 
+def _guarded_getaddrinfo(host, port, *args, **kwargs):
+    if (
+        host not in ("127.0.0.1", "::1")
+        or _normalized_port(port) not in _ALLOWED_LOOPBACK_PORTS
+    ):
+        raise OSError(_MESSAGE)
+    return _REAL_GETADDRINFO(host, port, *args, **kwargs)
+
+
+def _guarded_create_connection(address, *args, **kwargs):
+    if not _is_allowed_loopback(address):
+        raise OSError(_MESSAGE)
+    return _REAL_CREATE_CONNECTION(address, *args, **kwargs)
+
+
 def _guard_raw_socket_module(module):
     module.socket = _GuardedRawSocket
     module.SocketType = _GuardedRawSocket
-    module.getaddrinfo = _deny_network
+    module.getaddrinfo = _guarded_getaddrinfo
     module.gethostbyaddr = _deny_network
     module.gethostbyname = _deny_network
     module.gethostbyname_ex = _deny_network
@@ -102,8 +140,8 @@ def _guarded_import_module(name, package=None):
 socket.socket = _GuardedSocket
 socket.SocketType = _GuardedSocket
 _guard_raw_socket_module(_socket)
-socket.create_connection = _deny_network
-socket.getaddrinfo = _deny_network
+socket.create_connection = _guarded_create_connection
+socket.getaddrinfo = _guarded_getaddrinfo
 socket.gethostbyaddr = _deny_network
 socket.gethostbyname = _deny_network
 socket.gethostbyname_ex = _deny_network
@@ -151,9 +189,13 @@ _APM_REMOTE_CONTROL_ENV_NAMES = frozenset(
         "APM_ALLOW_PROTOCOL_FALLBACK",
         "APM_GIT_CREDENTIAL_TIMEOUT",
         "APM_GIT_PROTOCOL",
+        "APM_ADO_HOSTS",
         "APM_GITLAB_HOSTS",
         "APM_NO_CACHE",
         "APM_POLICY_DISABLE",
+        "ADO_HOST",
+        "APM_TEST_FAIL_LOCK_REPLACE",
+        "APM_TEST_LOOPBACK_PORTS",
         "GITHUB_HOST",
         "GITHUB_URL",
         "GITLAB_HOST",
@@ -222,6 +264,7 @@ _PINNED_ENVIRONMENT_NAMES = (
     "HOME",
     "USERPROFILE",
     "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "LOCALAPPDATA",
     "APM_HOME",
@@ -330,6 +373,7 @@ class IsolatedApmEnvironment:
         temp_root = root / "tmp"
         guard_root = root / "network_guard"
         xdg_config_root = root / "xdg-config"
+        xdg_data_root = root / "xdg-data"
         xdg_cache_root = root / "xdg-cache"
         local_app_data = root / "local-app-data"
         gh_config_root = root / "gh-config"
@@ -344,6 +388,7 @@ class IsolatedApmEnvironment:
             temp_root,
             guard_root,
             xdg_config_root,
+            xdg_data_root,
             xdg_cache_root,
             local_app_data,
             gh_config_root,
@@ -370,6 +415,7 @@ class IsolatedApmEnvironment:
             "HOME": str(home),
             "USERPROFILE": str(home),
             "XDG_CONFIG_HOME": str(xdg_config_root),
+            "XDG_DATA_HOME": str(xdg_data_root),
             "XDG_CACHE_HOME": str(xdg_cache_root),
             "LOCALAPPDATA": str(local_app_data),
             "APM_HOME": str(config_root),

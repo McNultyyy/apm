@@ -30,6 +30,16 @@ _ALLOWED_EXEC_STATUS = {"deployed", "gated_pending_approval", "denied", "absent"
 SUPPORTED_LOCKFILE_VERSIONS = frozenset({"1", "2"})
 
 
+def installed_apm_version() -> str:
+    """Return the running APM distribution version for lockfile metadata."""
+    try:
+        from importlib.metadata import version
+
+        return version("apm-cli")
+    except Exception:
+        return "unknown"
+
+
 class LockfileFormatError(ValueError):
     """Raised when a lockfile container does not match its schema."""
 
@@ -79,9 +89,23 @@ def _validate_lockfile_container(data: object) -> dict[str, Any]:
         if not isinstance(dependency, dict):
             raise LockfileFormatError(f"Lockfile dependency at index {index} must be a mapping")
     for target, servers in (data.get("mcp_target_servers") or {}).items():
-        if not isinstance(target, str) or not isinstance(servers, list):
+        if not isinstance(target, str) or not target or not isinstance(servers, list):
             raise LockfileFormatError(
                 "Lockfile mcp_target_servers values must be string-to-list mappings"
+            )
+        if not all(isinstance(server, str) and bool(server) for server in servers):
+            raise LockfileFormatError("Lockfile mcp_target_servers entries must be strings")
+    for server, provenance in (data.get("mcp_config_provenance") or {}).items():
+        if not isinstance(server, str) or not (
+            (isinstance(provenance, str) and bool(provenance))
+            or (
+                isinstance(provenance, list)
+                and bool(provenance)
+                and all(isinstance(owner, str) and bool(owner) for owner in provenance)
+            )
+        ):
+            raise LockfileFormatError(
+                "Lockfile mcp_config_provenance values must be strings or string lists"
             )
     if "deployments" in data:
         from ..core.deployment_ledger import DeploymentLedgerCodec
@@ -91,6 +115,16 @@ def _validate_lockfile_container(data: object) -> dict[str, Any]:
         except ValueError as exc:
             raise LockfileFormatError(str(exc)) from exc
     return data
+
+
+def _normalized_mcp_provenance(
+    provenance: dict[str, str | list[str]],
+) -> dict[str, str | list[str]]:
+    """Return deterministic MCP provenance with list-valued owners sorted."""
+    return {
+        server: sorted(owners) if isinstance(owners, list) else owners
+        for server, owners in sorted(provenance.items())
+    }
 
 
 def _normalize_lockfile_host_type(raw: Any) -> str | None:
@@ -133,6 +167,7 @@ class LockedDependency:
     """A resolved dependency with exact commit/version information."""
 
     repo_url: str
+    materialization_repo_url: str | None = None
     host: str | None = None
     host_type: str | None = None
     port: int | None = None  # Non-standard SSH/HTTPS port (e.g. 7999 for Bitbucket DC)
@@ -208,12 +243,29 @@ class LockedDependency:
     _unknown_fields: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Normalize case-insensitive package identity when loading or creating locks."""
-        self.repo_url = normalize_package_repo_url(
+        """Separate canonical lock identity from materialization spelling."""
+        original_repo_url = self.repo_url
+        canonical_repo_url = normalize_package_repo_url(
             self.repo_url,
             host=self.host,
             source=self.source,
             registry_prefix=self.registry_prefix,
+        )
+        materialization_repo_url = self.materialization_repo_url or original_repo_url
+        materialization_identity = normalize_package_repo_url(
+            materialization_repo_url,
+            host=self.host,
+            source=self.source,
+            registry_prefix=self.registry_prefix,
+        )
+        if materialization_identity != canonical_repo_url:
+            raise ValueError(
+                f"materialization_repo_url {materialization_repo_url!r} does not "
+                f"identify the same package as repo_url {self.repo_url!r}"
+            )
+        self.repo_url = canonical_repo_url
+        self.materialization_repo_url = (
+            materialization_repo_url if materialization_repo_url != canonical_repo_url else None
         )
 
     def get_unique_key(self) -> str:
@@ -249,6 +301,8 @@ class LockedDependency:
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for YAML output."""
         result: dict[str, Any] = {"repo_url": self.repo_url}
+        if self.materialization_repo_url:
+            result["materialization_repo_url"] = self.materialization_repo_url
         if self.name is not None:
             result["name"] = self.name
         if self.host:
@@ -364,6 +418,7 @@ class LockedDependency:
         # the explicit legacy key handled above; do NOT consider it unknown.
         _known_keys = {
             "repo_url",
+            "materialization_repo_url",
             "host",
             "host_type",
             "port",
@@ -411,6 +466,7 @@ class LockedDependency:
 
         return cls(
             repo_url=data["repo_url"],
+            materialization_repo_url=data.get("materialization_repo_url"),
             host=data.get("host"),
             host_type=host_type,
             port=port,
@@ -546,8 +602,19 @@ class LockedDependency:
         else:
             version_value = None
 
+        canonical_repo_url = normalize_package_repo_url(
+            dep_ref.repo_url,
+            host=dep_ref.host,
+            source="local" if dep_ref.is_local else dep_ref.source,
+            registry_prefix=dep_ref.artifactory_prefix,
+            is_local=dep_ref.is_local,
+            is_marketplace=dep_ref.is_marketplace,
+        )
         return cls(
-            repo_url=dep_ref.repo_url,
+            repo_url=canonical_repo_url,
+            materialization_repo_url=(
+                dep_ref.repo_url if dep_ref.repo_url != canonical_repo_url else None
+            ),
             host=host,
             host_type=dep_ref.host_type,
             port=dep_ref.port,
@@ -605,7 +672,7 @@ class LockedDependency:
         is_registry = self.source == "registry"
         ref = self.version if (is_registry and self.version) else self.resolved_ref
         return DependencyReference(
-            repo_url=self.repo_url,
+            repo_url=self.materialization_repo_url or self.repo_url,
             host=self.host,
             host_type=self.host_type,
             port=self.port,
@@ -642,7 +709,7 @@ class LockFile:
     # ``resolved_by is None`` convention). Kept OUT of ``mcp_configs`` values so
     # it never pollutes config comparisons. Consistency diagnostics use this as
     # ownership context only; provenance never exempts a lock-only server.
-    mcp_config_provenance: dict[str, str] = field(default_factory=dict)
+    mcp_config_provenance: dict[str, str | list[str]] = field(default_factory=dict)
     lsp_servers: list[str] = field(default_factory=list)
     lsp_configs: dict[str, dict] = field(default_factory=dict)
     local_deployed_files: list[str] = field(default_factory=list)
@@ -750,7 +817,9 @@ class LockFile:
                     for target, servers in sorted(self.mcp_target_servers.items())
                 }
             if self.mcp_config_provenance:
-                data["mcp_config_provenance"] = dict(sorted(self.mcp_config_provenance.items()))
+                data["mcp_config_provenance"] = _normalized_mcp_provenance(
+                    self.mcp_config_provenance
+                )
             if self.lsp_servers:
                 data["lsp_servers"] = sorted(self.lsp_servers)
             if self.lsp_configs:
@@ -867,15 +936,7 @@ class LockFile:
         """
         from .installed_package import InstalledPackage
 
-        # Get APM version
-        try:
-            from importlib.metadata import version
-
-            apm_version = version("apm-cli")
-        except Exception:
-            apm_version = "unknown"
-
-        lock = cls(apm_version=apm_version)
+        lock = cls(apm_version=installed_apm_version())
 
         for entry in installed_packages:
             registry_resolution = None
@@ -973,7 +1034,9 @@ class LockFile:
             self.deployment_ledger.records
         ) != dict(other.deployment_ledger.records):
             return False
-        if self.mcp_config_provenance != other.mcp_config_provenance:
+        if _normalized_mcp_provenance(self.mcp_config_provenance) != _normalized_mcp_provenance(
+            other.mcp_config_provenance
+        ):
             return False
         if sorted(self.lsp_servers) != sorted(other.lsp_servers):
             return False

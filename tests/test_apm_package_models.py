@@ -39,7 +39,7 @@ class TestDependencyReference:
         mixed = DependencyReference.parse("Owner/Example-Package#v1.0.0")
         lower = DependencyReference.parse("owner/example-package#v1.0.0")
 
-        assert mixed.repo_url == "owner/example-package"
+        assert mixed.repo_url == "Owner/Example-Package"
         assert mixed.get_identity() == lower.get_identity()
         assert mixed.to_canonical() == lower.to_canonical()
 
@@ -50,14 +50,15 @@ class TestDependencyReference:
 
         assert mixed.get_unique_key() == lower.get_unique_key() == "owner/example-package"
 
-    def test_github_owner_repo_casing_has_one_install_path(self):
-        """GitHub owner/repo casing must not create distinct install directories."""
+    def test_github_owner_repo_casing_preserves_materialization_spelling(self):
+        """GitHub identity deduplication must not choose the display path."""
         mixed = DependencyReference.parse("Owner/Example-Package")
         lower = DependencyReference.parse("owner/example-package")
         modules = Path("apm_modules")
 
-        assert mixed.get_install_path(modules) == lower.get_install_path(modules)
-        assert mixed.get_install_path(modules) == modules / "owner" / "example-package"
+        assert mixed.get_unique_key() == lower.get_unique_key()
+        assert mixed.get_install_path(modules) == modules / "Owner" / "Example-Package"
+        assert lower.get_install_path(modules) == modules / "owner" / "example-package"
 
     def test_generic_git_host_preserves_case_sensitive_repo_path(self):
         """Unknown git hosts retain path casing because their semantics are unknown."""

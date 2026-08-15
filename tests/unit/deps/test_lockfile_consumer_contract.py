@@ -16,6 +16,7 @@ pytestmark = pytest.mark.unit
 
 _LOCKED_DEPENDENCY_VALUES = {
     "repo_url": "apm-org/apm-project/consume-contract",
+    "materialization_repo_url": None,
     "host": "dev.azure.com",
     "host_type": "gitlab",
     "port": 2222,
@@ -59,6 +60,7 @@ _LOCKED_DEPENDENCY_VALUES = {
 
 _RECONSTRUCTED_LOCK_FIELDS = {
     "repo_url",
+    "materialization_repo_url",
     "host",
     "host_type",
     "port",

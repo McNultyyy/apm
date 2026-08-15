@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from apm_cli.install.argv import (
+    _get_invocation_argv,
+    _split_argv_at_double_dash,
+)
 from apm_cli.install.artifactory_resolver import _resolve_artifactory_boundary
 from apm_cli.install.errors import (
     AuthenticationError,
@@ -19,10 +23,12 @@ from apm_cli.install.errors import (
     FrozenInstallError,
     InstallFailureAlreadyRendered,
     PolicyViolationError,
+    RequiredIntegrationError,
 )
 from apm_cli.install.gitlab_resolver import _try_resolve_gitlab_direct_shorthand
 
 if TYPE_CHECKING:
+    from apm_cli.core.target_detection import EffectiveTargetDecision
     from apm_cli.install.plan import UpdatePlan
 
 # Re-export the pre-deploy security scan so that bare-name call sites inside
@@ -52,8 +58,9 @@ from apm_cli.install.package_resolution import (
     cli_skill_subset,
     dependency_reference_to_yaml_entry,
     persist_dependency_list_if_changed,
+    propagate_existing_registry_source,
     resolve_parsed_dependency_reference,
-    update_existing_dependency_entry_if_needed,
+    try_update_existing_dependency_entry,
     user_scope_rejection_reason,
 )
 from apm_cli.install.package_selection import only_packages_from_validation
@@ -100,6 +107,9 @@ from ..constants import (
 )
 from ..core.auth import AuthResolver
 from ..core.command_logger import InstallLogger, _ValidationOutcome
+from ..core.project_name import (
+    resolve_bootstrap_project_name as _resolve_bootstrap_project_name,
+)
 from ..core.target_catalog import target_help_fragment
 from ..core.target_detection import TargetParamType, manifest_targets_from_target_option
 
@@ -177,41 +187,7 @@ class InstallContext:
     skill_subset_from_cli: bool = False
     audit_override: str | None = None
     install_result: InstallResult | None = None
-
-
-# ---------------------------------------------------------------------------
-# Argv `--` boundary helpers (W3 --mcp flag)
-# ---------------------------------------------------------------------------
-#
-# Click's ``nargs=-1`` silently swallows the ``--`` separator and merges
-# everything after it into the positional argument tuple.  For
-# ``apm install --mcp foo -- npx -y srv`` we cannot distinguish that from
-# ``apm install --mcp foo npx -y srv`` once Click is done parsing.
-#
-# We therefore inspect ``sys.argv`` ourselves to detect the boundary and
-# extract the post-``--`` portion as the stdio command argv.  ``--`` IS
-# present in ``sys.argv`` even though Click strips it from the parsed
-# arguments.  The pre-``--`` portion is used to flag conflicts (E1).
-#
-# ``_get_invocation_argv`` exists as a tiny seam so tests using
-# ``CliRunner`` (which does not modify ``sys.argv``) can patch it without
-# resorting to ``monkeypatch.setattr('sys.argv', ...)``.
-
-
-def _get_invocation_argv():
-    """Return the process invocation argv. Wrapped for test injection."""
-    return sys.argv
-
-
-def _split_argv_at_double_dash(argv):
-    """Return ``(clean_argv, command_argv_tuple)``.
-
-    If ``--`` is not present, ``command_argv_tuple`` is ``()``.
-    """
-    if "--" not in argv:
-        return argv, ()
-    idx = argv.index("--")
-    return argv[:idx], builtins.tuple(argv[idx + 1 :])
+    target_decision: "EffectiveTargetDecision | None" = None
 
 
 # APM Dependencies (conditional import for graceful degradation)
@@ -307,6 +283,7 @@ def _resolve_package_references(
     _apm_yml_entries = {}  # canonical -> apm.yml entry (str or dict for HTTP deps)
     validated_packages = []
     dependencies_changed = False
+    manifest_identities = builtins.set(existing_identities)
 
     if logger:
         logger.validation_start(len(packages))
@@ -409,6 +386,13 @@ def _resolve_package_references(
             )
             canonical = dep_ref.to_canonical()
             identity = dep_ref.get_identity()
+            existing_source_is_registry = propagate_existing_registry_source(
+                dep_ref,
+                current_deps,
+                identity,
+                dependency_reference_cls=DependencyReference,
+                logger=logger,
+            )
             apply_cli_skill_pin(
                 dep_ref,
                 skill_subset,
@@ -419,7 +403,7 @@ def _resolve_package_references(
                 logger=logger,
             )
             if marketplace_dep_ref is not None or direct_virtual_resolved:
-                _apm_yml_entries[canonical] = dependency_reference_to_yaml_entry(dep_ref)
+                _apm_yml_entries.setdefault(canonical, dependency_reference_to_yaml_entry(dep_ref))
         except ValueError as e:
             reason = str(e)
             invalid_outcomes.append((package, reason))
@@ -449,18 +433,18 @@ def _resolve_package_references(
                 logger.validation_fail(package, scope_reject)
             continue
 
-        # Ensure structured entry is used for apm.yml persistence when skill
-        # filter is active (normal non-marketplace/non-insecure path doesn't
-        # set _apm_yml_entries; _merge_packages_into_yml falls back to the
-        # plain canonical string without this).
         if skill_subset and canonical not in _apm_yml_entries:
             _apm_yml_entries[canonical] = dep_ref.to_apm_yml_entry()
+        _apm_yml_entries.setdefault(canonical, dep_ref.to_apm_yml_entry())
 
         # Check if package is already in dependencies (by identity)
         already_in_deps = identity in existing_identities
 
         verbose = bool(logger and logger.verbose)
-        if should_skip_github_probe_for_dep(dep_ref, default_registry):
+        # An already-known registry identity also skips the probe.
+        if existing_source_is_registry or should_skip_github_probe_for_dep(
+            dep_ref, default_registry
+        ):
             ref_ok, ref_err = validate_registry_ref(dep_ref)
             if not ref_ok:
                 invalid_outcomes.append((package, ref_err))
@@ -477,9 +461,9 @@ def _resolve_package_references(
                 dep_ref=dep_ref,
             )
         if package_accessible:
-            updates_existing_entry = update_existing_dependency_entry_if_needed(
+            updates_existing_entry, update_error = try_update_existing_dependency_entry(
                 current_deps,
-                already_in_deps=already_in_deps,
+                already_in_deps=identity in manifest_identities,
                 apm_yml_entries=_apm_yml_entries,
                 canonical=canonical,
                 dep_ref=dep_ref,
@@ -487,6 +471,11 @@ def _resolve_package_references(
                 dependency_reference_cls=DependencyReference,
                 logger=logger,
             )
+            if update_error:
+                invalid_outcomes.append((package, update_error))
+                if logger:
+                    logger.validation_fail(package, update_error)
+                continue
             valid_outcomes.append((canonical, already_in_deps))
             if logger:
                 logger.validation_pass(canonical, already_in_deps, updates_existing_entry)
@@ -763,6 +752,14 @@ def _handle_mcp_install(  # noqa: PLR0913
     mcp_scope = InstallScope.PROJECT
     mcp_manifest_path = get_manifest_path(mcp_scope)
     mcp_apm_dir = get_apm_dir(mcp_scope)
+    from ..core.target_detection import resolve_manifest_target_decision
+
+    target_decision = resolve_manifest_target_decision(
+        Path.cwd(),
+        manifest_path=mcp_manifest_path,
+        explicit_target=target or runtime,
+    )
+
     # -- W2-mcp-preflight: policy enforcement before MCP install --
     # Build a lightweight MCPDependency for policy evaluation.
     # This mirrors _build_mcp_entry routing but we only need the
@@ -788,7 +785,7 @@ def _handle_mcp_install(  # noqa: PLR0913
     )
     from ..core.target_detection import normalize_policy_targets
 
-    policy_targets = normalize_policy_targets(target or runtime)
+    policy_targets = normalize_policy_targets(target_decision.value)
 
     try:
         _pf_result, _pf_active = run_policy_preflight(
@@ -829,7 +826,8 @@ def _handle_mcp_install(  # noqa: PLR0913
         dev=dev,
         force=force,
         runtime=runtime,
-        target=target,
+        target=target_decision.value,
+        target_decision=target_decision,
         exclude=exclude,
         logger=logger,
         apm_dir=mcp_apm_dir,
@@ -839,7 +837,7 @@ def _handle_mcp_install(  # noqa: PLR0913
 
 
 @click.command(
-    help="Install APM and MCP dependencies (supports APM packages, Claude skills (SKILL.md), and plugin collections (plugin.json); auto-creates apm.yml; use --allow-insecure for http:// packages)"
+    help="Install APM, MCP, and LSP dependencies (supports APM packages, Claude skills (SKILL.md), and plugin collections (plugin.json); auto-creates apm.yml; use --allow-insecure for http:// packages)"
 )
 @click.argument("packages", nargs=-1)
 @click.option(
@@ -849,7 +847,7 @@ def _handle_mcp_install(  # noqa: PLR0913
         "(legacy alias for --target, single value only; prefer --target)"
     ),
 )
-@click.option("--exclude", help="Exclude specific runtime from installation")
+@click.option("--exclude", help="Exclude one runtime from the resolved MCP/LSP target set")
 @click.option(
     "--only",
     type=click.Choice(["apm", "mcp"]),
@@ -869,7 +867,12 @@ def _handle_mcp_install(  # noqa: PLR0913
 @click.option(
     "--frozen",
     is_flag=True,
-    help="Refuse to install when apm.lock.yaml is missing or out of sync with apm.yml (CI-safe; mutually exclusive with --update). Structural presence check only; use 'apm audit' for on-disk integrity.",
+    help=(
+        "Refuse to install when apm.lock.yaml is missing or out of sync with "
+        "apm.yml, including MCP config state (CI-safe; mutually exclusive with "
+        "--update, --mcp, and positional packages). Use 'apm audit' for on-disk "
+        "integrity."
+    ),
 )
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed installation information")
 @click.option(
@@ -901,9 +904,10 @@ def _handle_mcp_install(  # noqa: PLR0913
     "IntelliJ-specific integration is MCP-only; file primitives use the Copilot profile. "
     "'all' excludes agent-skills, antigravity, experimental targets, and intellij; combine "
     "explicit-only targets when needed. Experimental targets require their feature flags. "
-    "Resolution order: --target > apm.yml targets: > apm config target > auto-detect. "
-    "With nothing to detect, install exits 2 with a teaching message. For 'apm compile', "
-    "use '--all'; '--target all' is deprecated.",
+    "Target resolution: --runtime/--target > apm.yml targets: > apm config set target ... > "
+    "auto-detect (only when no higher-priority selection exists). With nothing to detect, install "
+    "exits 2 with a teaching message. For 'apm compile', use '--all'; '--target all' "
+    "is deprecated.",
 )
 @click.option(
     "--allow-insecure",
@@ -957,9 +961,8 @@ def _handle_mcp_install(  # noqa: PLR0913
     help=(
         "Add an MCP server entry to apm.yml. Use with --transport, --url, --env, "
         "--header, --mcp-version, or a stdio command after `--`. Resolves active "
-        "targets the same way `apm install` does (--target > apm.yml targets: > "
-        "apm config target > "
-        "auto-detect); writes only for active targets, skips others with [i]."
+        "targets as --runtime/--target > apm.yml targets: > apm config set target ... > auto-detect "
+        "(only when no higher-priority selection exists); writes only for active targets."
     ),
 )
 @click.option(
@@ -1159,6 +1162,15 @@ def install(  # noqa: PLR0913
     logger = None
     command_result: InstallResult | None = None
     transaction: InstallTransaction | None = None
+    from ..install.service import InstallService
+
+    try:
+        if mcp_name is not None:
+            InstallService.reject_frozen_mutation(frozen, "--mcp")
+        elif packages:
+            InstallService.reject_frozen_mutation(frozen, "positional packages")
+    except FrozenInstallError as exc:
+        raise click.ClickException(str(exc)) from exc
     if frozen and update:
         raise click.UsageError(
             "--frozen and --update are mutually exclusive. "
@@ -1183,6 +1195,10 @@ def install(  # noqa: PLR0913
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
 
+    try:
+        InstallService.reject_missing_frozen_root(frozen, root)
+    except FrozenInstallError as exc:
+        raise click.ClickException(str(exc)) from exc
     _root_redirect = install_root_redirect(root, dry_run=dry_run)
     _root_redirect.__enter__()
     try:
@@ -1329,7 +1345,6 @@ def install(  # noqa: PLR0913
             any_transport_flag=use_ssh or use_https or allow_protocol_fallback,
             registry_url=validated_registry_url,
         )
-
         # Normalize --skill: '*' means all (same as absent). Reject with --mcp.
         if skill_names and mcp_name is not None:
             raise click.UsageError("--skill cannot be combined with --mcp.")
@@ -1354,6 +1369,7 @@ def install(  # noqa: PLR0913
                 no_policy=no_policy,
                 validated_registry_url=validated_registry_url,
             )
+            summary_rendered = True
             return
 
         # Resolve transport selection inputs.
@@ -1428,7 +1444,15 @@ def install(  # noqa: PLR0913
         )
 
         if not apm_yml_exists and packages:
-            project_name = Path.cwd().name if scope is InstallScope.PROJECT else Path.home().name
+            derived_project_name = (
+                Path.cwd().name if scope is InstallScope.PROJECT else Path.home().name
+            )
+            project_name = _resolve_bootstrap_project_name(derived_project_name)
+            if project_name != derived_project_name:
+                logger.verbose_detail(
+                    f'Using default project name "{project_name}" because '
+                    f"derived name {derived_project_name!a} is invalid"
+                )
             config = _get_default_config(project_name)
             if manifest_targets := manifest_targets_from_target_option(target):
                 config["targets"] = manifest_targets
@@ -1572,7 +1596,7 @@ def install(  # noqa: PLR0913
         logger.error(str(e))
         for reason in e.reasons:
             logger.error_detail(reason)
-        logger.info("Tip: run 'apm outdated' to see what changed, then 'apm update'.")
+        logger.info(_frozen_install_tip(e))
         command_result = (
             transaction.fail(e)
             if transaction is not None
@@ -1634,6 +1658,20 @@ def install(  # noqa: PLR0913
 # ---------------------------------------------------------------------------
 
 
+def _frozen_install_tip(error: FrozenInstallError) -> str:
+    """Return recovery guidance tailored to package or MCP lock drift."""
+    has_mcp_drift = any("MCP server" in reason for reason in error.reasons)
+    has_package_drift = any("MCP server" not in reason for reason in error.reasons)
+    if has_mcp_drift and has_package_drift:
+        return (
+            "Tip: run 'apm outdated' to inspect package drift, then run "
+            "'apm install' without --frozen to repair package and MCP lock state."
+        )
+    if has_mcp_drift:
+        return "Tip: run 'apm install' without --frozen to create or repair MCP lock state."
+    return "Tip: run 'apm outdated' to see what changed, then 'apm update'."
+
+
 def _install_apm_packages(ctx, outcome):
     """Execute the APM + transitive MCP installation pipeline.
 
@@ -1658,6 +1696,8 @@ def _install_apm_packages(ctx, outcome):
     # Parse apm.yml to get both APM and MCP dependencies
     try:
         apm_package = APMPackage.from_apm_yml(ctx.manifest_path)
+    except click.UsageError:
+        raise
     except Exception as e:
         logger.error(f"Failed to parse {ctx.manifest_display}: {e}")
         raise InstallFailureAlreadyRendered("Failed to parse install manifest") from e
@@ -1667,6 +1707,9 @@ def _install_apm_packages(ctx, outcome):
     prod_mcp_deps = apm_package.get_mcp_dependencies()
     dev_mcp_deps = apm_package.get_dev_mcp_dependencies()
     mcp_deps = apm_package.get_all_mcp_dependencies()
+    if not isinstance(mcp_deps, builtins.list):
+        logger.verbose_detail("MCP dependencies were not a list; defaulting to empty")
+        mcp_deps = []
 
     logger.verbose_detail(
         f"Parsed {APM_YML_FILENAME}: {len(apm_deps)} APM deps, "
@@ -1680,10 +1723,22 @@ def _install_apm_packages(ctx, outcome):
     all_apm_deps = list(apm_deps) + list(dev_apm_deps)
     _check_insecure_dependencies(all_apm_deps, ctx.allow_insecure, logger)
 
+    if ctx.frozen is True:
+        from apm_cli.install.request import InstallRequest
+        from apm_cli.install.service import InstallService
+
+        InstallService.enforce_frozen(
+            InstallRequest(
+                apm_package=apm_package,
+                frozen=True,
+                scope=ctx.scope,
+                trust_transitive_mcp=ctx.trust_transitive_mcp,
+            )
+        )
+
     # Determine what to install based on install mode
     should_install_apm = ctx.install_mode != InstallMode.MCP
     should_install_mcp = ctx.install_mode != InstallMode.APM
-    should_install_lsp = should_install_mcp
 
     # Show what will be installed if dry run
     if ctx.dry_run:
@@ -1746,7 +1801,6 @@ def _install_apm_packages(ctx, outcome):
 
     # Enter the APM install path when there are deps, local .apm/ primitives
     # (#714), OR orphan deps in the lockfile to clean up (manifest emptied).
-    from apm_cli.core.scope import InstallScope
     from apm_cli.core.scope import get_deploy_root as _get_deploy_root
     from apm_cli.deps.lockfile import _SELF_KEY as _LOCK_SELF_KEY
 
@@ -1783,7 +1837,7 @@ def _install_apm_packages(ctx, outcome):
                 logger=logger,
                 scope=ctx.scope,
                 auth_resolver=ctx.auth_resolver,
-                target=ctx.target,
+                target=ctx.target or ctx.runtime,
                 allow_insecure=ctx.allow_insecure,
                 allow_insecure_hosts=ctx.allow_insecure_hosts,
                 marketplace_provenance=(
@@ -1794,6 +1848,7 @@ def _install_apm_packages(ctx, outcome):
                 no_policy=ctx.no_policy,
                 audit_override=ctx.audit_override,
                 legacy_skill_paths=ctx.legacy_skill_paths,
+                trust_transitive_mcp=ctx.trust_transitive_mcp,
                 frozen=ctx.frozen,
                 plan_callback=ctx.plan_callback,
                 skill_subset=ctx.skill_subset,
@@ -1808,6 +1863,7 @@ def _install_apm_packages(ctx, outcome):
                 )
             apm_count = install_result.installed_count
             apm_diagnostics = install_result.diagnostics
+            ctx.target_decision = install_result.target_decision
             if install_result.disposition not in {
                 InstallDisposition.SUCCESS,
                 InstallDisposition.PARTIAL_SUCCESS,
@@ -1827,9 +1883,11 @@ def _install_apm_packages(ctx, outcome):
             logger.error(str(e))
             for reason in e.reasons:
                 logger.error_detail(reason)
-            logger.info("Tip: run 'apm outdated' to see what changed, then 'apm update'.")
+            logger.info(_frozen_install_tip(e))
             raise InstallFailureAlreadyRendered(str(e)) from e
         except InstallFailureAlreadyRendered:
+            raise
+        except click.UsageError:
             raise
         except Exception as e:
             # #832: surface PolicyViolationError verbatim (no double-nesting).
@@ -1845,46 +1903,29 @@ def _install_apm_packages(ctx, outcome):
     elif should_install_apm and not has_any_apm_deps:
         logger.verbose_detail("No APM dependencies found in apm.yml")
 
-    # When --update is used, package files on disk may have changed.
-    # Clear the parse cache so transitive MCP collection reads fresh data.
     if ctx.update:
         from apm_cli.models.apm_package import clear_apm_yml_cache
 
         clear_apm_yml_cache()
 
-    # -------------------------------------------------------------------------
-    # MCP integration (extracted to install/mcp/integration.py)
-    # -------------------------------------------------------------------------
-    from apm_cli.install.mcp import run_mcp_integration
+    from apm_cli.install.service_integration import run_service_integrations
     from apm_cli.policy.install_preflight import PolicyBlockError
 
-    from ..core.scope import get_modules_dir
-
-    apm_modules_path = get_modules_dir(ctx.scope)
-
     try:
-        mcp_count, mcp_apm_config = run_mcp_integration(
+        service_result = run_service_integrations(
+            ctx,
             apm_package=apm_package,
             mcp_deps=mcp_deps,
-            apm_modules_path=apm_modules_path,
             lock_path=_lock_path,
+            existing_lock=_existing_lock,
             old_mcp_servers=old_mcp_servers,
             old_mcp_configs=old_mcp_configs,
             old_mcp_provenance=old_mcp_provenance,
             old_mcp_target_servers=old_mcp_target_servers,
             old_mcp_target_servers_present=old_mcp_target_servers_present,
-            project_root=ctx.project_root,
-            user_scope=(ctx.scope is InstallScope.USER),
-            should_install=should_install_mcp,
-            logger=logger,
             diagnostics=apm_diagnostics,
-            runtime=ctx.runtime,
-            exclude=ctx.exclude,
-            trust_transitive_mcp=ctx.trust_transitive_mcp,
-            no_policy=ctx.no_policy,
-            verbose=ctx.verbose,
-            explicit_target=ctx.target,
-            scope=ctx.scope,
+            explicit_target=ctx.target or ctx.runtime,
+            target_decision=ctx.target_decision,
         )
     except PolicyBlockError:
         logger.error(
@@ -1893,30 +1934,16 @@ def _install_apm_packages(ctx, outcome):
         )
         logger.render_summary()
         raise InstallFailureAlreadyRendered("MCP server(s) blocked by org policy") from None
+    except RequiredIntegrationError as exc:
+        logger.error(str(exc))
+        logger.render_summary()
+        raise InstallFailureAlreadyRendered(str(exc)) from exc
 
-    # -------------------------------------------------------------------------
-    # LSP integration (extracted to install/lsp/integration.py)
-    # -------------------------------------------------------------------------
-    from apm_cli.install.lsp import run_lsp_integration
+    ctx.target_decision = service_result.target_decision
+    mcp_count = service_result.mcp_count
+    lsp_count = service_result.lsp_count
 
-    lsp_count = run_lsp_integration(
-        apm_package=apm_package,
-        apm_modules_path=apm_modules_path,
-        lock_path=_lock_path,
-        existing_lock=_existing_lock,
-        project_root=ctx.project_root,
-        user_scope=(ctx.scope is InstallScope.USER),
-        should_install=should_install_lsp,
-        logger=logger,
-        diagnostics=apm_diagnostics,
-        target_context=(mcp_apm_config, ctx.target, ctx.scope),
-    )
-
-    # Local .apm/ content integration is now handled inside the
-    # install pipeline (phases/integrate.py + phases/post_deps_local.py,
-    # refactor F3).  The duplicate target resolution, integrator
-    # initialization, and inline stale-cleanup block that lived here
-    # have been removed.
+    # Local .apm/ integration already ran inside the package pipeline.
 
     from apm_cli.install.outcome import finalize_install_result
 
@@ -1989,6 +2016,7 @@ def _install_apm_dependencies(  # noqa: PLR0913
     scope=None,
     auth_resolver: "AuthResolver" = None,
     target: str | None = None,
+    target_decision: "EffectiveTargetDecision | None" = None,
     allow_insecure: bool = False,
     allow_insecure_hosts=(),
     marketplace_provenance: dict = None,
@@ -1999,6 +2027,7 @@ def _install_apm_dependencies(  # noqa: PLR0913
     skill_subset: "builtins.tuple | None" = None,
     skill_subset_from_cli: bool = False,
     legacy_skill_paths: bool = False,
+    trust_transitive_mcp: bool = False,
     frozen: bool = False,
     plan_callback=None,
     refresh: bool = False,
@@ -2030,6 +2059,7 @@ def _install_apm_dependencies(  # noqa: PLR0913
         scope=scope,
         auth_resolver=auth_resolver,
         target=target,
+        target_decision=target_decision,
         allow_insecure=allow_insecure,
         allow_insecure_hosts=allow_insecure_hosts,
         marketplace_provenance=marketplace_provenance,
@@ -2040,6 +2070,7 @@ def _install_apm_dependencies(  # noqa: PLR0913
         skill_subset=skill_subset,
         skill_subset_from_cli=skill_subset_from_cli,
         legacy_skill_paths=legacy_skill_paths,
+        trust_transitive_mcp=trust_transitive_mcp,
         frozen=frozen,
         plan_callback=plan_callback,
         refresh=refresh,

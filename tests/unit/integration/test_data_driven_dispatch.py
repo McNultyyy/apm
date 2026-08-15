@@ -309,6 +309,7 @@ class TestExhaustivenessChecks:
             "agents_github",  # was agents_copilot, aliased
             "agents_claude",
             "agents_cursor",
+            "agents_kiro",
             "agents_opencode",
             "agents_codex",
             # NOTE: windsurf no longer exposes an 'agents' primitive
@@ -326,6 +327,9 @@ class TestExhaustivenessChecks:
             "rules_claude",  # was instructions_claude, aliased
             "skills",  # cross-target bucket
             "hooks",  # cross-target bucket
+            "agents_grok-build",
+            "commands_grok-build",
+            "instructions_grok-build",
             "prompts_copilot-app",  # copilot-app uses dedicated prompts bucket
             "canvas_copilot",  # canvas extensions (copilot-only, experimental)
         }
@@ -618,7 +622,16 @@ class TestGetIntegrationPrefixesTargetsParam:
 
         prefixes = get_integration_prefixes()
         assert ".github/" in prefixes
+        assert ".copilot/" not in prefixes
         assert ".claude/" in prefixes
+
+    def test_user_scope_prefixes_include_copilot_user_root(self):
+        """User cleanup may validate static Copilot user-scope paths."""
+        from apm_cli.integration.targets import get_integration_prefixes
+
+        prefixes = get_integration_prefixes(user_scope=True)
+        assert ".github/" in prefixes
+        assert ".copilot/" in prefixes
 
 
 # ===================================================================
@@ -689,6 +702,11 @@ class TestScopeResolvedPartition:
         assert not BaseIntegrator.validate_deploy_path(
             ".copilot/agents/my-agent.md",
             root,
+        )
+        assert BaseIntegrator.validate_deploy_path(
+            ".copilot/agents/my-agent.md",
+            root,
+            user_scope=True,
         )
 
     def test_validate_deploy_path_backward_compat(self):

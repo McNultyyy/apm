@@ -96,6 +96,127 @@ def _patch_mcp_install(
     return mock_integrator_cls, mock_manager
 
 
+def test_self_defined_partial_runtime_failure_is_explicit() -> None:
+    """A selected runtime failure must not be hidden by a sibling success."""
+    from apm_cli.integration.mcp_integrator import MCPIntegrator
+    from apm_cli.integration.mcp_integrator_install import _install_self_defined_deps
+
+    dependency = _make_self_defined_dep("managed-server", transport="http")
+    managed: dict[str, set[str]] = {}
+    logger = MagicMock()
+
+    with (
+        patch.object(
+            MCPIntegrator,
+            "_check_self_defined_servers_needing_installation",
+            return_value=["managed-server"],
+        ),
+        patch.object(MCPIntegrator, "_build_self_defined_info", return_value={}),
+        patch.object(
+            MCPIntegrator,
+            "_install_for_runtime",
+            side_effect=lambda runtime, *_args, **_kwargs: runtime == "claude",
+        ) as install_runtime,
+        pytest.raises(RuntimeError, match=r"managed-server \(intellij\)"),
+    ):
+        _install_self_defined_deps(
+            self_defined_deps=[dependency],
+            target_runtimes=["claude", "intellij"],
+            stored_mcp_configs={},
+            servers_to_update=set(),
+            successful_updates=set(),
+            project_root=None,
+            user_scope=False,
+            verbose=False,
+            console=None,
+            logger=logger,
+            managed_target_servers=managed,
+        )
+
+    assert install_runtime.call_count == 2
+    assert managed == {"claude": {"managed-server"}}
+    logger.error.assert_any_call(
+        "MCP configuration failed for selected runtime(s): managed-server (intellij). "
+        "Fix the failed runtime MCP config and rerun apm install."
+    )
+
+
+def test_registry_group_partial_runtime_failure_is_explicit() -> None:
+    """Registry installs enforce the same strict IntelliJ failure contract."""
+    from apm_cli.integration.mcp_integrator import MCPIntegrator
+    from apm_cli.integration.mcp_integrator_install import _install_registry_group
+
+    operations = MagicMock()
+    operations.validate_servers_exist.return_value = (["managed-server"], [])
+    operations.check_servers_needing_installation.return_value = ["managed-server"]
+    operations.batch_fetch_server_info.return_value = {"managed-server": {}}
+    operations.collect_environment_variables.return_value = {}
+    operations.collect_runtime_variables.return_value = {}
+    managed: dict[str, set[str]] = {}
+    logger = MagicMock()
+
+    with (
+        patch.object(
+            MCPIntegrator,
+            "_install_for_runtime",
+            side_effect=lambda runtime, *_args, **_kwargs: runtime == "claude",
+        ) as install_runtime,
+        pytest.raises(RuntimeError, match=r"managed-server \(intellij\)"),
+    ):
+        _install_registry_group(
+            operations=operations,
+            group_dep_names=["managed-server"],
+            group_dep_map={},
+            group_deps=["managed-server"],
+            target_runtimes=["claude", "intellij"],
+            stored_mcp_configs={},
+            servers_to_update=set(),
+            successful_updates=set(),
+            project_root=None,
+            user_scope=False,
+            verbose=False,
+            console=None,
+            logger=logger,
+            managed_target_servers=managed,
+        )
+
+    assert install_runtime.call_count == 2
+    assert managed == {"claude": {"managed-server"}}
+    logger.error.assert_any_call(
+        "MCP configuration failed for selected runtime(s): managed-server (intellij). "
+        "Fix the failed runtime MCP config and rerun apm install."
+    )
+
+
+def test_intellij_migration_error_is_already_rendered() -> None:
+    """Migration errors preserve their actionable message without generic wrapping."""
+    from apm_cli.adapters.client.intellij import IntelliJConfigError
+    from apm_cli.install.errors import InstallFailureAlreadyRendered
+    from apm_cli.integration.mcp_integrator_install import _migrate_intellij_managed_config
+
+    client = MagicMock()
+    client.migrate_legacy_managed_servers.side_effect = IntelliJConfigError(
+        "Fix the legacy IntelliJ config, then rerun apm install."
+    )
+    logger = MagicMock()
+    with (
+        patch("apm_cli.factory.ClientFactory.create_client", return_value=client),
+        pytest.raises(
+            InstallFailureAlreadyRendered,
+            match="Fix the legacy IntelliJ config",
+        ),
+    ):
+        _migrate_intellij_managed_config(
+            ["intellij"],
+            {"intellij": {"managed-server"}},
+            project_root=None,
+            user_scope=False,
+            logger=logger,
+        )
+
+    logger.error.assert_called_once_with("Fix the legacy IntelliJ config, then rerun apm install.")
+
+
 # ---------------------------------------------------------------------------
 # Empty deps
 # ---------------------------------------------------------------------------

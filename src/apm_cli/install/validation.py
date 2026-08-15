@@ -281,13 +281,26 @@ def _validate_virtual_package(
             )
         return True
 
-    ctx = auth_resolver.resolve_for_dep(dep_ref)
     host = dep_ref.host or default_host()
     org = dep_ref.repo_url.split("/")[0] if dep_ref.repo_url and "/" in dep_ref.repo_url else None
     if verbose_log:
-        verbose_log(
-            f"Auth resolved: host={host}, org={org}, source={ctx.source}, type={ctx.token_type}"
-        )
+        if (
+            auth_resolver.uses_public_github_anonymous_first(
+                host,
+                port=dep_ref.port,
+                host_type=dep_ref.host_type,
+            )
+            is True
+        ):
+            verbose_log(
+                f"Auth deferred: host={host}, org={org} -- "
+                "anonymous probe before credential resolution"
+            )
+        else:
+            ctx = auth_resolver.resolve_for_dep(dep_ref)
+            verbose_log(
+                f"Auth resolved: host={host}, org={org}, source={ctx.source}, type={ctx.token_type}"
+            )
     virtual_downloader = GitHubPackageDownloader(auth_resolver=auth_resolver)
 
     def _warn(msg: str) -> None:
@@ -321,7 +334,19 @@ def _validate_virtual_package(
         verbose_callback=verbose_log,
         warn_callback=_warn,
     )
-    if not result and verbose_log:
+    public_github = auth_resolver.uses_public_github_anonymous_first(
+        host,
+        port=dep_ref.port,
+        host_type=dep_ref.host_type,
+    )
+    auth_was_resolved = auth_resolver.has_cached_resolution(
+        host,
+        org,
+        port=dep_ref.port,
+        host_type=dep_ref.host_type,
+        path=dep_ref.repo_url,
+    )
+    if not result and verbose_log and (public_github is not True or auth_was_resolved):
         try:
             err_ctx = auth_resolver.build_error_context(
                 host,
@@ -357,7 +382,6 @@ def _validate_ado_git_package(
     Returns True when the repo is reachable, False otherwise.
     Raises ``AuthenticationError`` for auth failures on non-generic managed hosts.
     """
-    import os
     import subprocess
 
     from apm_cli.deps.github_downloader import GitHubPackageDownloader
@@ -451,11 +475,14 @@ def _validate_ado_git_package(
             suppress_credential_helpers=is_insecure,
         )
     else:
-        # #1015: merge _dep_ctx.git_env (bearer-aware GIT_CONFIG_*
-        # overrides) into the subprocess env so `git ls-remote`
-        # actually sends the Authorization header for AAD tokens.
-        _ctx_git_env = getattr(_dep_ctx, "git_env", {}) if _dep_ctx else {}
-        validate_env = {**os.environ, **ado_downloader.git_env, **_ctx_git_env}
+        validate_env = (
+            auth_resolver.git_env_for_context(
+                _dep_ctx,
+                base_env=ado_downloader.git_env,
+            )
+            if _dep_ctx is not None
+            else dict(ado_downloader.git_env)
+        )
 
     # Build the probe order. Non-generic hosts (GHES/ADO) always probe
     # a single authenticated URL. Generic hosts:
@@ -542,6 +569,7 @@ def _validate_ado_git_package(
         result is not None
         and result.returncode != 0
         and dep_ref.is_azure_devops()
+        and auth_resolver._supports_ado_bearer(dep_ref.host or "")
         and _url_token is not None  # we had a PAT
         and is_ado_auth_failure_signal(result.stderr or "")
     ):
@@ -568,7 +596,10 @@ def _validate_ado_git_package(
                     # explicitly skips GIT_TOKEN for scheme="bearer" and emits
                     # only the bearer-specific GIT_CONFIG_* injection.
                     bearer_env = auth_resolver._build_git_env(
-                        bearer, scheme="bearer", host_kind="ado"
+                        bearer,
+                        scheme="bearer",
+                        host_kind="ado",
+                        base_env=ado_downloader.git_env,
                     )
                     cmd = ["git", "ls-remote", "--heads", "--exit-code", bearer_url]
                     bearer_result = subprocess.run(
@@ -654,11 +685,17 @@ def _validate_github_package(
         return True
 
     if verbose_log:
-        ctx = auth_resolver.resolve(host, org=org, port=port)
-        verbose_log(
-            f"Auth resolved: host={host_info.display_name}, org={org}, "
-            f"source={ctx.source}, type={ctx.token_type}"
-        )
+        if auth_resolver.uses_public_github_anonymous_first(host, port=port) is True:
+            verbose_log(
+                f"Auth deferred: host={host_info.display_name}, org={org} -- "
+                "anonymous probe before credential resolution"
+            )
+        else:
+            ctx = auth_resolver.resolve(host, org=org, port=port)
+            verbose_log(
+                f"Auth resolved: host={host_info.display_name}, org={org}, "
+                f"source={ctx.source}, type={ctx.token_type}"
+            )
 
     def _check_repo(token, git_env) -> bool:
         """Check repo accessibility via GitHub API."""
@@ -697,6 +734,7 @@ def _validate_github_package(
             # DependencyReference invariant); forwarded as path= so GCM
             # multi-account users get per-URL credential matching.
             path=dep_ref.repo_url,
+            host_type=dep_ref.host_type,
             unauth_first=True,
             verbose_callback=verbose_log,
         )

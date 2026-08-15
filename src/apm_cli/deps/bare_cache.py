@@ -749,6 +749,10 @@ def _is_ssh_key_auth_failure(error_text: str, last_attempt_scheme: str | None) -
         "bad passphrase",
         "read_passphrase",
         "permission denied (publickey)",
+        # OpenSSH BatchMode=yes output when all keys are skipped (e.g. an
+        # encrypted key with no ssh-agent loaded).
+        "no supported authentication methods remain",
+        "no more authentication methods to try",
     )
     return any(marker in text for marker in markers)
 
@@ -788,6 +792,7 @@ def build_clone_failure_message(
     last_error: Exception | None,
     last_attempt_scheme: str | None,
     sanitize_git_error: Callable[[str], str],
+    public_github_non_auth_failure: bool = False,
 ) -> str:
     """Build the aggregate ``RuntimeError`` message for a failed transport plan.
 
@@ -838,6 +843,13 @@ def build_clone_failure_message(
             f"(without a hostname) resolve against that host. "
             f"If this package lives on a different server (e.g., github.com), "
             f"use the full hostname in apm.yml: {suggested}"
+        )
+    elif public_github_non_auth_failure:
+        error_msg += (
+            f"Could not connect to {dep_host or default_host_fn()} "
+            "(network error, not an auth failure). "
+            "Check your internet connection and proxy settings. "
+            "Run with --verbose for details."
         )
     elif not has_token:
         host = dep_host or default_host_fn()

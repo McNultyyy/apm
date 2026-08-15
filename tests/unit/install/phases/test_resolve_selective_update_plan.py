@@ -32,7 +32,7 @@ def test_run_records_complete_keys_before_only_filter(monkeypatch):
     monkeypatch.setattr(
         resolve,
         "_resolve_dependencies",
-        lambda target_ctx, _staging: setattr(
+        lambda target_ctx, _staging, _reader: setattr(
             target_ctx,
             "deps_to_install",
             [selected, unselected],

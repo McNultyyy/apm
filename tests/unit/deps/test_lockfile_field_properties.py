@@ -100,6 +100,7 @@ def locked_dependency_kwargs(draw: st.DrawFn) -> dict[str, Any]:
         return draw(st.one_of(st.just(default), value))
 
     kwargs: dict[str, Any] = {"repo_url": _repo_url(draw)}
+    kwargs["materialization_repo_url"] = None
     kwargs["host"] = maybe(None, st.sampled_from(["gitlab.example.invalid", "git.example.invalid"]))
     kwargs["host_type"] = maybe(None, st.just("gitlab"))
     kwargs["port"] = maybe(None, st.integers(min_value=1, max_value=65535))

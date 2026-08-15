@@ -8,6 +8,20 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def migrate_legacy_project_target_servers(
+    target_servers: dict[str, set[str]],
+    *,
+    active_runtimes: set[str],
+    user_scope: bool,
+) -> None:
+    """Move legacy project Copilot ownership to the VS Code runtime key."""
+    if user_scope or "vscode" not in active_runtimes or "copilot" in active_runtimes:
+        return
+    legacy_servers = target_servers.pop("copilot", set())
+    if legacy_servers:
+        target_servers.setdefault("vscode", set()).update(legacy_servers)
+
+
 def adopt_legacy_mcp_target_servers(
     *,
     server_names: set[str],
@@ -45,7 +59,13 @@ def adopt_legacy_mcp_target_servers(
                 project_root=project_root,
                 user_scope=user_scope,
             )
-            existing = MCPConflictDetector(client).get_existing_server_configs()
+            existing_configs = [MCPConflictDetector(client).get_existing_server_configs()]
+            legacy_reader = getattr(client, "get_legacy_current_config", None)
+            if callable(legacy_reader):
+                legacy_config = legacy_reader()
+                legacy_servers = legacy_config.get(client.mcp_servers_key)
+                if isinstance(legacy_servers, dict):
+                    existing_configs.append(legacy_servers)
         except Exception:
             logger.debug("Could not inspect legacy MCP target %s", runtime, exc_info=True)
             continue
@@ -63,6 +83,6 @@ def adopt_legacy_mcp_target_servers(
                     exc_info=True,
                 )
                 continue
-            if existing.get(name) == expected:
+            if any(existing.get(name) == expected for existing in existing_configs):
                 adopted.setdefault(runtime, set()).add(name)
     return adopted

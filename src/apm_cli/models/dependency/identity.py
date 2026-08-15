@@ -7,7 +7,7 @@ file-length guardrail. These are pure, stateless helpers with no dependency on
 without collapsing their distinct local-detection semantics.
 
 ``normalize_package_repo_url`` is the single casing-normalization boundary for
-package identity. Callers must not lowercase repository paths independently.
+comparison identity. It must never be used as a display or filesystem path.
 """
 
 import re
@@ -64,17 +64,29 @@ def normalize_package_repo_url(
     """
     if is_local or source == "local" or is_marketplace:
         return repo_url
-
     if source == "registry" or registry_prefix:
         return repo_url.lower()
-
-    configured_default_host = default_host()
-    effective_host = host or configured_default_host
-    if effective_host.lower() == configured_default_host.lower() or is_github_hostname(
-        effective_host
-    ):
+    effective_host = host or default_host()
+    if is_github_hostname(effective_host):
         return repo_url.lower()
     return repo_url
+
+
+def is_case_insensitive_package_identity(
+    *,
+    host: str | None = None,
+    source: str | None = None,
+    registry_prefix: str | None = None,
+    is_local: bool = False,
+    is_marketplace: bool = False,
+) -> bool:
+    """Return whether repository casing is excluded from package identity."""
+    if is_local or source == "local" or is_marketplace:
+        return False
+    if source == "registry" or registry_prefix:
+        return True
+    effective_host = host or default_host()
+    return is_github_hostname(effective_host)
 
 
 def build_dependency_unique_key(
@@ -88,6 +100,7 @@ def build_dependency_unique_key(
     registry_prefix: str | None = None,
     declaring_parent: str | None = None,
     anchored_local_path: str | None = None,
+    is_marketplace: bool = False,
 ) -> str:
     """Return the lockfile/dedup key for a dependency identity.
 
@@ -109,7 +122,14 @@ def build_dependency_unique_key(
             return f"local:{anchored_local_path}"
         return local_path
 
-    key = repo_url
+    key = normalize_package_repo_url(
+        repo_url,
+        host=host,
+        source=source,
+        registry_prefix=registry_prefix,
+        is_local=source == "local",
+        is_marketplace=is_marketplace,
+    )
     if is_virtual and virtual_path:
         key = f"{key}/{virtual_path}"
 
