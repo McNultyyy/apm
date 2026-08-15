@@ -214,6 +214,22 @@ def _warn_target_reconcile_failure(
     )
 
 
+def _resolve_bin_skip(
+    bin_approved: bool,
+    trust_bin: bool | None,
+    *,
+    non_interactive: bool = False,
+) -> tuple[bool, str | None]:
+    """Combine executable approval with explicit or non-interactive bin trust."""
+    if not bin_approved:
+        return True, "not_approved"
+    if trust_bin is False:
+        return True, "not_trusted"
+    if trust_bin is None and non_interactive:
+        return True, "not_trusted"
+    return False, None
+
+
 def integrate_package_primitives(  # noqa: PLR0913
     package_info: Any,
     project_root: Path,
@@ -233,6 +249,7 @@ def integrate_package_primitives(  # noqa: PLR0913
     is_first_party: bool = False,
     allow_executables: builtins.dict[str, builtins.dict[str, bool]] | None = None,
     dep_target_subset: list[str] | None = None,
+    trust_bin: bool | None = None,
 ) -> dict:
     """Run the full integration pipeline for a single package.
 
@@ -252,6 +269,14 @@ def integrate_package_primitives(  # noqa: PLR0913
     bin/, MCP servers, canvas extensions) are only deployed for packages
     whose key appears in the dict with the matching type set to ``True``.
     Local project content (``package_name == "_local"``) is always trusted.
+
+    When *trust_bin* is ``False`` (``--no-trust-bin``), bin/ deployment
+    is skipped with reason ``"not_trusted"`` only when ``allowExecutables``
+    would otherwise permit deployment.  When ``allowExecutables`` blocks
+    deployment first, the skip reason is ``"not_approved"`` regardless of
+    *trust_bin*.  When *trust_bin* is ``True`` (``--trust-bin``), the
+    trust-posture warning is suppressed.  When ``None`` (default), bin/
+    deploys but a prominent warning is emitted.
 
     Returns a dict with integration counters and the list of deployed file paths.
     """
@@ -551,6 +576,12 @@ def integrate_package_primitives(  # noqa: PLR0913
             )
         _emit_integration_hints(_prim_name, _info, _log_integration)
 
+    import sys
+
+    _skip_bin, _bin_skip_reason_override = _resolve_bin_skip(
+        _bin_approved, trust_bin, non_interactive=not sys.stdout.isatty()
+    )
+
     skill_result = integrators.skill.integrate_package_skill(
         package_info,
         project_root,
@@ -561,7 +592,9 @@ def integrate_package_primitives(  # noqa: PLR0913
         skill_subset=skill_subset,
         scope=scope,
         policy=policy,
-        skip_bin=not _bin_approved,
+        skip_bin=_skip_bin,
+        bin_skip_reason_override=_bin_skip_reason_override,
+        trust_bin=trust_bin,
     )
     _skill_target_dirs: set = builtins.set()
     for tp in skill_result.target_paths:

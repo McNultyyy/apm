@@ -11,11 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - BREAKING: `apm pack` and `apm plugin init` now default to Agent Plugins v1. Repack current bundles with `apm pack`; keep the historical Claude layout only with `--claude-plugin`; keep `--format apm` only for legacy bundle consumers. `apm install` still requires plugin-format bundles. In CI, run `apm pack --check-versions --check-clean` and `apm audit --ci`. Migration warnings stay on for 0.29.0-0.33.x and are removed in 0.34.0. See [Agent Plugins v1 migration](https://microsoft.github.io/apm/getting-started/agent-plugins-v1-migration/).
 
+### Added
+
+- `apm install` now accepts `--trust-bin` / `--no-trust-bin` for per-invocation
+  consent over marketplace-plugin `bin/` executable deployment. `--trust-bin`
+  approves deployment silently; `--no-trust-bin` skips `bin/` even when policy
+  permits it. The `allowExecutables` policy gate still takes precedence. (closes #1620)
+
 ### Fixed
 
+- Windows binary is now Authenticode-signed in the release workflow, eliminating
+  the `Trojan:Script/Wacatac.H!ml` Windows Defender false positive on unsigned
+  PyInstaller bundles. (#2435)
 - Multi-target `apm compile` now avoids repeating expensive project analysis
   for each target, making multi-target runs scale like single-target runs
   without changing generated output. (closes #2482)
+- `deployed-files-present` no longer false-positives on gitignored deploy
+  paths (e.g. `.agents/`), enabling `apm audit --ci` to pass on a fresh
+  checkout when deployed outputs are intentionally not committed. (closes
+  #2452, thanks @sergio-sisternes-epam)
+- YAML expansion guard no longer rejects large anchor-free lockfiles (150K+
+  entries) with a false-positive "billion-laughs" error. APM-generated
+  lockfiles with no anchors or aliases now load without error. (#2389)
+
+### Changed
+
+- `apm install` now emits a trust-posture warning (via `[!]`) when a marketplace
+  plugin deploys executables to Claude Code's PATH without an explicit `--trust-bin`
+  flag. In non-interactive (non-TTY) contexts the default is `--no-trust-bin`.
+  Pass `--trust-bin` to suppress the warning and deploy, or `apm approve` for
+  persistent per-package approval.
 
 ## [0.28.0] - 2026-08-04
 
