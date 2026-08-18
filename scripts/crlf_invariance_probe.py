@@ -12,10 +12,20 @@ committed sample with ``\\r\\n``; on POSIX (``core.autocrlf=input``) it stays
 The companion workflow (.github/workflows/crlf-invariance.yml) runs this on
 ubuntu/windows/macos and asserts all three emitted hashes match byte-for-byte.
 
+Also probes the apm#2619 fix: marketplace-plugin installs synthesize an
+``apm.yml`` (``synthesize_apm_yml_from_plugin``) and rewrite it with the short
+commit SHA (``stamp_plugin_version``). Those files are written by APM itself --
+not checked out by git -- into the tree :func:`compute_package_hash` hashes
+raw, so platform-native newlines made the lockfile ``content_hash`` diverge
+across OSes. The probe runs the REAL synthesize+stamp chain and emits the
+package hash alongside the file hash; the gather job asserts both are
+byte-identical on ubuntu/windows/macos.
+
 Also asserts in-process invariants as a local defense:
   * CRLF text and LF text hash equal
   * a bare CR still changes the hash (smuggling vector stays caught)
   * binary (NUL byte) content is hashed raw
+  * the synthesized+stamped apm.yml contains no CR bytes
 
 Usage:
     python scripts/crlf_invariance_probe.py --out hash.txt
@@ -79,6 +89,39 @@ def _autocrlf_roundtrip_hash(work: Path) -> tuple[str, bytes]:
     return compute_file_hash(sample), on_disk
 
 
+def _synthetic_manifest_package_hash(work: Path) -> str:
+    """Run the REAL marketplace-plugin synthesize+stamp chain, hash the tree.
+
+    apm#2619: the synthetic ``apm.yml`` is written by APM itself (not
+    materialized by git), so ``compute_package_hash`` -- which hashes raw
+    bytes -- diverged across OSes while the writers used platform-native
+    newlines. Every file the fixture itself creates is written with
+    ``write_bytes`` so the only platform-sensitive writes are the product
+    code paths under test.
+    """
+    from apm_cli.deps.package_validator import stamp_plugin_version
+    from apm_cli.models.validation import validate_apm_package
+    from apm_cli.utils.content_hash import compute_package_hash
+
+    pkg = work / "pkg"
+    skill = pkg / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (pkg / "plugin.json").write_bytes(b'{"name": "demo-plugin", "description": "Demo"}\n')
+    (skill / "SKILL.md").write_bytes(b"---\nname: demo\ndescription: Demo skill\n---\n\n# Demo\n")
+
+    result = validate_apm_package(pkg)
+    assert result.is_valid, f"probe fixture invalid: {result.errors}"
+    stamp_plugin_version(
+        result.package,
+        result.package_type,
+        "2c7ec5e78b8e5d43ea02e90bb8826f6b9f147b0c",
+        pkg,
+    )
+    manifest = (pkg / "apm.yml").read_bytes()
+    assert b"\r" not in manifest, "synthesized apm.yml must be LF-only (apm#2619)"
+    return compute_package_hash(pkg)
+
+
 def _assert_in_process_invariants(work: Path) -> None:
     lf = work / "lf.md"
     lf.write_bytes(b"# H\n\ntext\n")
@@ -117,11 +160,23 @@ def main() -> int:
         repo = work / "repo"
         repo.mkdir()
         envelope, on_disk = _autocrlf_roundtrip_hash(repo)
+        synth = work / "synth"
+        synth.mkdir()
+        package_envelope = _synthetic_manifest_package_hash(synth)
 
     eol = "CRLF" if b"\r\n" in on_disk else "LF"
-    print(f"os={platform.system()} on_disk_eol={eol} hash={envelope}")
+    print(
+        f"os={platform.system()} on_disk_eol={eol} "
+        f"file_hash={envelope} synthetic_pkg_hash={package_envelope}"
+    )
     if args.out is not None:
-        args.out.write_text(envelope + "\n", encoding="utf-8", newline="")
+        # Single line so the gather job's whole-file uniqueness check covers
+        # both the per-file (apm#1952) and package-tree (apm#2619) envelopes.
+        args.out.write_text(
+            f"{envelope}|{package_envelope}\n",
+            encoding="utf-8",
+            newline="",
+        )
     return 0
 
 

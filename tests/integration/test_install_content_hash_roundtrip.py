@@ -322,3 +322,46 @@ def test_virtual_lock_replays_across_synthetic_manifest_newline_domains(
     assert audit_payload["passed"] is True
     checks = {check["name"]: check for check in audit_payload["checks"]}
     assert checks["content-integrity"]["passed"] is True
+
+
+def test_marketplace_plugin_synthetic_manifest_hash_is_newline_invariant(
+    tmp_path: Path,
+) -> None:
+    """apm#2619: the synthesize + stamp chain must yield an LF manifest.
+
+    Marketplace-plugin downloads (both ``download_package`` and
+    ``download_subdirectory_package``) run ``validate_apm_package`` --
+    which synthesizes ``apm.yml`` -- and then ``stamp_plugin_version`` --
+    which rewrites it with the short commit SHA. Both writes land inside
+    the tree ``compute_package_hash`` hashes raw, so platform-native line
+    endings made the lockfile ``content_hash`` differ between Windows
+    (CRLF) and POSIX (LF) for byte-identical upstream content.
+    """
+    from apm_cli.deps.package_validator import stamp_plugin_version
+    from apm_cli.models.validation import PackageType, validate_apm_package
+
+    pkg = tmp_path / "pkg"
+    skill = pkg / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (pkg / "plugin.json").write_bytes(b'{"name": "demo-plugin", "description": "Demo"}\n')
+    (skill / "SKILL.md").write_bytes(b"---\nname: demo\ndescription: Demo skill\n---\n\n# Demo\n")
+
+    result = validate_apm_package(pkg)
+    assert result.is_valid, result.errors
+    assert result.package_type == PackageType.MARKETPLACE_PLUGIN
+    stamp_plugin_version(
+        result.package,
+        result.package_type,
+        "2c7ec5e78b8e5d43ea02e90bb8826f6b9f147b0c",
+        pkg,
+    )
+    assert result.package.version == "2c7ec5e"
+
+    manifest = (pkg / "apm.yml").read_bytes()
+    assert b"\r" not in manifest  # LF-deterministic on every OS
+
+    lf_hash = compute_package_hash(pkg)
+    # The manifest is hash-visible: CRLF-ifying it changes the package
+    # hash. This is exactly why the production writers must emit LF bytes.
+    (pkg / "apm.yml").write_bytes(manifest.replace(b"\n", b"\r\n"))
+    assert compute_package_hash(pkg) != lf_hash

@@ -71,7 +71,7 @@ class TestDependenciesAggregator(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(set(servers), {"server1", "server2", "server3"})
         self.assertEqual(mock_scan.call_count, 1)
-        mock_file.assert_called_once_with("test.yml", "w", encoding="utf-8")
+        mock_file.assert_called_once_with("test.yml", "w", encoding="utf-8", newline="")
         mock_yaml_dump.assert_called_once()
 
 

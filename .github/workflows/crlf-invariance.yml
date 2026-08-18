@@ -6,6 +6,11 @@ name: CRLF Invariance (apm#1952)
 # `apm install` record and `apm audit` verify call), so a Windows checkout
 # (CRLF on disk) and a POSIX checkout (LF on disk) MUST yield the identical
 # hash. The gather job fails if the three OS hashes are not byte-identical.
+#
+# Also probes apm#2619: the marketplace-plugin synthesize+stamp chain writes a
+# synthetic apm.yml INSIDE the tree compute_package_hash hashes raw, so those
+# writers must emit LF bytes on every OS or the lockfile content_hash (and
+# `apm install --frozen`) breaks across platforms.
 
 on:
   pull_request:
@@ -13,6 +18,10 @@ on:
     paths:
       - 'src/apm_cli/utils/content_hash.py'
       - 'src/apm_cli/utils/atomic_io.py'
+      - 'src/apm_cli/utils/yaml_io.py'
+      - 'src/apm_cli/deps/plugin_parser.py'
+      - 'src/apm_cli/deps/package_validator.py'
+      - 'src/apm_cli/models/validation.py'
       - 'scripts/crlf_invariance_probe.py'
       - '.github/workflows/crlf-invariance.yml'
   workflow_dispatch: {}
