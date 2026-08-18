@@ -150,7 +150,10 @@ def main() -> int:
         "--out",
         type=Path,
         default=None,
-        help="write the autocrlf-roundtrip envelope to this file",
+        help=(
+            "write the combined envelope to this file: "
+            "'<autocrlf-roundtrip file hash>|<synthetic-manifest package hash>'"
+        ),
     )
     args = parser.parse_args()
 
