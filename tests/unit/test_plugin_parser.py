@@ -1411,3 +1411,49 @@ class TestSynthesizePreservesExistingManifest:
         # Fallback still produces a usable apm.yml from plugin metadata.
         result = self._read_apm_yml(tmp_path)
         assert result["name"] == "bad-pkg"
+
+
+@pytest.mark.windows_compat
+class TestSyntheticManifestLineEndings:
+    """apm#2619: synthetic apm.yml bytes must be platform-invariant (LF).
+
+    The synthesized manifest is written by APM itself (not checked out by
+    git) into a package tree that ``compute_package_hash`` hashes raw. A
+    platform-native text-mode write (CRLF on Windows) made the lockfile
+    ``content_hash`` diverge across OSes for byte-identical upstream
+    content. Same bug class as #2187 / PR #2223, which only covered
+    ``download_virtual_file_package``.
+    """
+
+    def test_synthesized_apm_yml_is_lf_only(self, tmp_path):
+        plugin = tmp_path / "plug"
+        skill = plugin / "skills" / "demo"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(
+            b"---\nname: demo\ndescription: Demo skill\n---\n\n# Demo\n"
+        )
+
+        apm_yml_path = synthesize_apm_yml_from_plugin(plugin, {"name": "plug"})
+
+        raw = apm_yml_path.read_bytes()
+        assert b"\r" not in raw
+        assert raw.endswith(b"\n")
+
+    def test_inline_hooks_json_is_lf_only(self, tmp_path):
+        """Inline plugin.json hooks are serialized into the hashed tree as
+        .apm/hooks/hooks.json -- the bytes must be LF-only and UTF-8."""
+        plugin = tmp_path / "plug"
+        plugin.mkdir()
+        apm_dir = plugin / ".apm"
+        apm_dir.mkdir()
+        hooks = {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]}
+            ]
+        }
+
+        _map_plugin_artifacts(plugin, apm_dir, {"name": "plug", "hooks": hooks})
+
+        raw = (apm_dir / "hooks" / "hooks.json").read_bytes()
+        assert b"\r" not in raw
+        assert json.loads(raw.decode("utf-8")) == hooks
