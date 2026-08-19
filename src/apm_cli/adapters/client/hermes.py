@@ -168,8 +168,11 @@ class HermesClientAdapter(CopilotClientAdapter):
             data[self.mcp_servers_key] = servers
             path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(path, yaml_to_str(data), new_file_mode=_CONFIG_FILE_MODE)
-            # Tighten perms even when the file pre-existed with a looser mode
-            # (atomic_write_text only applies new_file_mode on first create).
+            # Normalize perms to exactly _CONFIG_FILE_MODE. atomic_write_text
+            # caps an existing file's mode at new_file_mode (existing & mode)
+            # but deliberately never LOOSENS a stricter pre-existing mode and
+            # skips mode bits entirely on Windows; this chmod pins the exact
+            # documented mode for the config regardless of prior state.
             with contextlib.suppress(OSError, NotImplementedError):
                 os.chmod(path, _CONFIG_FILE_MODE)
             return True

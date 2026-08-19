@@ -226,5 +226,14 @@ def converge_apm_authored_files(
             continue
         # atomic_write_text normalizes CRLF -> LF and writes LF bytes.
         atomic_write_text(candidate, text)
+        if candidate.name == "apm.yml":
+            # Uniform invariant: every apm.yml rewrite inside a package
+            # tree drops stale from_apm_yml cache entries. The parsed
+            # content is unchanged here (CRLF -> LF only), so a stale hit
+            # is currently harmless -- but keeping the rule unconditional
+            # prevents silent divergence if that ever stops being true.
+            from apm_cli.models.apm_package import invalidate_apm_yml_cache_entry
+
+            invalidate_apm_yml_cache_entry(candidate)
         changed.append(rel)
     return changed

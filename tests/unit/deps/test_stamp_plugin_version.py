@@ -233,4 +233,53 @@ def test_cache_invalidation_is_safe_under_concurrent_inserts(tmp_path):
         stop.set()
         thread.join(timeout=10)
 
+    assert not thread.is_alive(), "inserter thread wedged"
     assert not errors, errors
+    # Drop the many unique-keyed entries this test added.
+    from apm_cli.models.apm_package import clear_apm_yml_cache
+
+    clear_apm_yml_cache()
+
+
+def test_in_flight_parse_cannot_repoison_cache_after_invalidation(tmp_path):
+    """Round-4 review: invalidation is a barrier for in-flight parses.
+
+    A thread that read PRE-rewrite bytes must not insert its stale result
+    into the cache AFTER a rewrite's invalidation ran -- otherwise the
+    exact staleness the invalidation exists to fix comes back, dependent
+    on thread interleaving. from_apm_yml snapshots a generation counter
+    before reading the file and skips the insert if it moved.
+    """
+    from unittest.mock import patch
+
+    from apm_cli.models.apm_package import (
+        APMPackage,
+        invalidate_apm_yml_cache_entry,
+    )
+
+    apm_yml = tmp_path / "apm.yml"
+    apm_yml.write_bytes(b"name: foo\nversion: 0.0.0\n")
+
+    import apm_cli.utils.yaml_io as yaml_io_mod
+
+    real_load = yaml_io_mod.load_yaml
+
+    def load_with_concurrent_rewrite(path):
+        data = real_load(path)
+        # Simulate a concurrent rewrite + invalidation landing while this
+        # "thread" is still holding the pre-rewrite parse result.
+        apm_yml.write_bytes(b"name: foo\nversion: 2c7ec5e\n")
+        invalidate_apm_yml_cache_entry(apm_yml)
+        return data
+
+    with patch(
+        "apm_cli.utils.yaml_io.load_yaml",
+        side_effect=load_with_concurrent_rewrite,
+    ):
+        stale = APMPackage.from_apm_yml(apm_yml)
+    assert stale.version == "0.0.0"  # the in-flight parse itself is fine
+
+    # The stale result must NOT have been cached: a fresh load sees the
+    # rewritten bytes.
+    fresh = APMPackage.from_apm_yml(apm_yml)
+    assert fresh.version == "2c7ec5e"

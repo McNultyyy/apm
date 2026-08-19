@@ -82,10 +82,22 @@ _apm_yml_cache: dict[tuple[Path, Path | None], "APMPackage"] = {}
 # Lock-free ``dict.get`` reads stay safe (single-opcode, GIL-atomic).
 _apm_yml_cache_lock = threading.Lock()
 
+# Bumped under the lock by every invalidation/clear. ``from_apm_yml``
+# snapshots it BEFORE reading the file and skips its insert (still
+# returning the parsed result) when the generation moved: an in-flight
+# parse that read PRE-rewrite bytes must not re-poison the cache AFTER
+# the rewrite's invalidation ran. Global (not per-path) on purpose --
+# the cost of over-invalidation is one extra parse on the next load,
+# and a per-path map would reintroduce the iteration/mutation problem
+# the lock exists to solve.
+_apm_yml_cache_generation = 0
+
 
 def clear_apm_yml_cache() -> None:
     """Clear the from_apm_yml parse cache. Call in tests for isolation."""
+    global _apm_yml_cache_generation
     with _apm_yml_cache_lock:
+        _apm_yml_cache_generation += 1
         _apm_yml_cache.clear()
 
 
@@ -103,8 +115,10 @@ def invalidate_apm_yml_cache_entry(apm_yml_path: Path) -> None:
     skipped, leaving an unstamped tree on disk whose content hash matched
     neither the lockfile record nor a fresh install's tree.
     """
+    global _apm_yml_cache_generation
     resolved = apm_yml_path.resolve()
     with _apm_yml_cache_lock:
+        _apm_yml_cache_generation += 1
         for key in [k for k in _apm_yml_cache if k[0] == resolved]:
             _apm_yml_cache.pop(key, None)
 
@@ -476,6 +490,13 @@ class APMPackage:
         if cached is not None:
             return cached
 
+        # Snapshot BEFORE reading the file: if an invalidation lands while
+        # this thread parses (a concurrent rewrite of the manifest), the
+        # insert below is skipped so pre-rewrite bytes cannot re-poison
+        # the cache. Plain int read is GIL-atomic; writers bump under the
+        # lock.
+        generation_snapshot = _apm_yml_cache_generation
+
         try:
             from ..utils.yaml_io import load_yaml
 
@@ -636,7 +657,8 @@ class APMPackage:
             allow_executables=allow_executables,
         )
         with _apm_yml_cache_lock:
-            _apm_yml_cache[cache_key] = result
+            if _apm_yml_cache_generation == generation_snapshot:
+                _apm_yml_cache[cache_key] = result
         return result
 
     def get_apm_dependencies(self) -> list[DependencyReference]:
