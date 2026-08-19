@@ -136,6 +136,32 @@ def apm_authored_files(
     return files
 
 
+def _safe_authored_file(install_path: Path, rel: str) -> Path | None:
+    """Resolve an authored relative path, mirroring the hash's symlink rules.
+
+    ``compute_package_hash`` never descends symlinked directories and skips
+    symlinked files, so a candidate behind a symlinked component is
+    invisible to the hash -- touching it could not converge anything and,
+    for a repo-shipped symlinked ``.apm``/``.apm/hooks`` directory, would
+    rewrite a file OUTSIDE the package tree. Returns None unless every
+    component from *install_path* down to the file is a real (non-symlink)
+    directory entry and the candidate is a regular file.
+    """
+    candidate = install_path / rel
+    parent = candidate.parent
+    while parent != install_path:
+        if parent.is_symlink():
+            return None
+        next_parent = parent.parent
+        if next_parent == parent:
+            # Walked off the top without meeting install_path -- refuse.
+            return None
+        parent = next_parent
+    if not candidate.is_file() or candidate.is_symlink():
+        return None
+    return candidate
+
+
 def _crlf_expand(data: bytes) -> bytes:
     """Return *data* as a pre-fix Windows text-mode write would have produced it.
 
@@ -159,8 +185,8 @@ def legacy_crlf_hash(
     """
     overrides: dict[str, bytes] = {}
     for rel in apm_authored_files(install_path, package_type, dep_ref):
-        candidate = install_path / rel
-        if not candidate.is_file() or candidate.is_symlink():
+        candidate = _safe_authored_file(install_path, rel)
+        if candidate is None:
             continue
         raw = candidate.read_bytes()
         if b"\x00" in raw:
@@ -188,8 +214,8 @@ def converge_apm_authored_files(
     """
     changed: list[str] = []
     for rel in apm_authored_files(install_path, package_type, dep_ref):
-        candidate = install_path / rel
-        if not candidate.is_file() or candidate.is_symlink():
+        candidate = _safe_authored_file(install_path, rel)
+        if candidate is None:
             continue
         raw = candidate.read_bytes()
         if b"\r\n" not in raw or b"\x00" in raw:
@@ -198,7 +224,7 @@ def converge_apm_authored_files(
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             continue
-        # atomic_write_text normalizes CRLF -> LF and writes newline="".
+        # atomic_write_text normalizes CRLF -> LF and writes LF bytes.
         atomic_write_text(candidate, text)
         changed.append(rel)
     return changed

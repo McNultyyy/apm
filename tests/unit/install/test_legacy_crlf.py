@@ -157,3 +157,49 @@ class TestConvergeApmAuthoredFiles:
         pkg = tmp_path / "pkg"
         pkg.mkdir()
         assert converge_apm_authored_files(pkg, PackageType.MARKETPLACE_PLUGIN, None) == []
+
+
+class TestSymlinkedParentGuard:
+    """apm#2619 round-3: authored paths behind symlinked directories are
+    invisible to compute_package_hash (rglob does not descend symlinked
+    dirs), so the migration must never read or rewrite through them --
+    for a repo-shipped symlinked .apm the write would land OUTSIDE the
+    package tree."""
+
+    def _tree_with_symlinked_apm_dir(self, tmp_path: Path) -> tuple[Path, Path]:
+        outside = tmp_path / "outside"
+        (outside / "hooks").mkdir(parents=True)
+        (outside / "hooks" / "hooks.json").write_bytes(b"{\r\n}\r\n")
+
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "plugin.json").write_bytes(
+            b'{"name": "demo-plugin", "hooks": {"PreToolUse": []}, "description": "Demo"}\n'
+        )
+        (pkg / "apm.yml").write_bytes(b"name: demo-plugin\r\nversion: 2c7ec5e\r\n")
+        try:
+            (pkg / ".apm").symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("Symlinks not supported on this platform")
+        return pkg, outside
+
+    def test_converge_never_writes_through_symlinked_parent(self, tmp_path: Path) -> None:
+        pkg, outside = self._tree_with_symlinked_apm_dir(tmp_path)
+        before = (outside / "hooks" / "hooks.json").read_bytes()
+
+        changed = converge_apm_authored_files(pkg, PackageType.MARKETPLACE_PLUGIN, None)
+
+        # apm.yml (real file at the root) converges; the symlinked
+        # hooks.json is skipped and the out-of-tree file is untouched.
+        assert changed == ["apm.yml"]
+        assert (outside / "hooks" / "hooks.json").read_bytes() == before
+
+    def test_legacy_hash_ignores_symlinked_parent(self, tmp_path: Path) -> None:
+        pkg, _outside = self._tree_with_symlinked_apm_dir(tmp_path)
+
+        computed = legacy_crlf_hash(pkg, PackageType.MARKETPLACE_PLUGIN, None)
+
+        # Only apm.yml contributes an override; the hash matches a tree
+        # where just apm.yml is LF vs CRLF -- i.e. it must not be None
+        # (apm.yml has CRLF) and must not read through the symlink.
+        assert computed is not None

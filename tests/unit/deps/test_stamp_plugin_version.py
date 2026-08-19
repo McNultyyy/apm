@@ -188,3 +188,49 @@ def test_restamp_after_resynthesis_is_not_skipped_by_stale_cache(tmp_path):
     stamp_plugin_version(fresh, PackageType.MARKETPLACE_PLUGIN, sha, plugin)
     assert fresh.version == "2c7ec5e"
     assert b"version: 2c7ec5e" in apm_yml.read_bytes()
+
+
+def test_cache_invalidation_is_safe_under_concurrent_inserts(tmp_path):
+    """apm#2619 round-3: invalidate_apm_yml_cache_entry iterates the shared
+    manifest cache while parallel download/resolver worker threads insert
+    into it. Without the module lock this raised 'RuntimeError: dictionary
+    changed size during iteration' and failed installs intermittently."""
+    import threading
+
+    from apm_cli.models.apm_package import (
+        APMPackage,
+        invalidate_apm_yml_cache_entry,
+    )
+
+    apm_yml = tmp_path / "apm.yml"
+    apm_yml.write_bytes(b"name: foo\nversion: 0.0.0\n")
+
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def inserter() -> None:
+        # Distinct source_path anchors create distinct cache keys, growing
+        # the dict while the main thread iterates it.
+        i = 0
+        while not stop.is_set():
+            i += 1
+            anchor = tmp_path / f"anchor-{i}"
+            anchor.mkdir(exist_ok=True)
+            try:
+                APMPackage.from_apm_yml(apm_yml, source_path=anchor)
+            except BaseException as exc:  # pragma: no cover - failure capture
+                errors.append(exc)
+                return
+
+    thread = threading.Thread(target=inserter, daemon=True)
+    thread.start()
+    try:
+        for _ in range(300):
+            invalidate_apm_yml_cache_entry(apm_yml)
+    except BaseException as exc:  # pragma: no cover - failure capture
+        errors.append(exc)
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+
+    assert not errors, errors

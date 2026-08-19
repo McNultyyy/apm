@@ -7,6 +7,7 @@ compatibility.
 """
 
 import logging
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,11 +74,19 @@ __all__ = [  # noqa: RUF022
 # declared them. Sharing one APMPackage instance across both would let the
 # resolver mutate ``source_path`` and poison the cache for the other consumer.
 _apm_yml_cache: dict[tuple[Path, Path | None], "APMPackage"] = {}
+# Guards every structural mutation of ``_apm_yml_cache``. The parallel
+# pre-download executor and the BFS resolver pool both insert entries from
+# worker threads while ``invalidate_apm_yml_cache_entry`` iterates the dict;
+# an unguarded concurrent insert would raise ``RuntimeError: dictionary
+# changed size during iteration`` and fail the install intermittently.
+# Lock-free ``dict.get`` reads stay safe (single-opcode, GIL-atomic).
+_apm_yml_cache_lock = threading.Lock()
 
 
 def clear_apm_yml_cache() -> None:
     """Clear the from_apm_yml parse cache. Call in tests for isolation."""
-    _apm_yml_cache.clear()
+    with _apm_yml_cache_lock:
+        _apm_yml_cache.clear()
 
 
 def invalidate_apm_yml_cache_entry(apm_yml_path: Path) -> None:
@@ -95,8 +104,9 @@ def invalidate_apm_yml_cache_entry(apm_yml_path: Path) -> None:
     neither the lockfile record nor a fresh install's tree.
     """
     resolved = apm_yml_path.resolve()
-    for key in [k for k in _apm_yml_cache if k[0] == resolved]:
-        _apm_yml_cache.pop(key, None)
+    with _apm_yml_cache_lock:
+        for key in [k for k in _apm_yml_cache if k[0] == resolved]:
+            _apm_yml_cache.pop(key, None)
 
 
 def _parse_v01_registries_block(
@@ -625,7 +635,8 @@ class APMPackage:
             manifest_contract=manifest_contract.value,
             allow_executables=allow_executables,
         )
-        _apm_yml_cache[cache_key] = result
+        with _apm_yml_cache_lock:
+            _apm_yml_cache[cache_key] = result
         return result
 
     def get_apm_dependencies(self) -> list[DependencyReference]:

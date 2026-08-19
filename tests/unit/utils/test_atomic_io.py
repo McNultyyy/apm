@@ -113,18 +113,37 @@ class TestAtomicWriteText:
         assert not target.exists()
 
         with patch("apm_cli.utils.atomic_io.os.fchmod", create=True) as mock_fchmod:
-            with patch("apm_cli.utils.atomic_io.hasattr", return_value=True):
+            with patch("apm_cli.utils.atomic_io._POSIX_MODES", True):
                 atomic_write_text(target, "data", new_file_mode=0o600)
 
         mock_fchmod.assert_called_once()
         _fd, mode = mock_fchmod.call_args[0]
         assert mode == 0o600
 
-    def test_existing_file_keeps_its_mode_not_new_file_mode(self, tmp_path: Path) -> None:
-        """An existing target keeps ITS mode: fchmod copies the destination's
-        current mode onto the temp (never ``new_file_mode``), so the
-        ``os.replace`` inode swap neither downgrades to mkstemp's 0600 nor
-        applies the new-file-only mode hint (apm#2619 review)."""
+    def test_new_file_mode_caps_existing_loose_mode(self, tmp_path: Path) -> None:
+        """A 0o600-intent caller rewriting an existing 0o644 file heals it to
+        0o600 (existing & new_file_mode): the mode is preserved but capped at
+        the caller's ceiling, so security-sensitive config writers never
+        perpetuate a pre-existing loose mode (apm#2619 round-3 review)."""
+        target = tmp_path / "existing.txt"
+        target.write_text("existing", encoding="utf-8")
+
+        with patch("apm_cli.utils.atomic_io.os.fchmod", create=True) as mock_fchmod:
+            with patch("apm_cli.utils.atomic_io._POSIX_MODES", True):
+                with patch(
+                    "apm_cli.utils.atomic_io.stat.S_IMODE",
+                    return_value=0o644,
+                ):
+                    atomic_write_text(target, "data", new_file_mode=0o600)
+
+        mock_fchmod.assert_called_once()
+        assert mock_fchmod.call_args.args[1] == 0o644 & 0o600
+
+    def test_existing_file_mode_preserved_when_no_mode_hint(self, tmp_path: Path) -> None:
+        """Without new_file_mode, an existing target keeps ITS mode: fchmod
+        copies the destination's current mode onto the temp so the
+        ``os.replace`` inode swap does not downgrade to mkstemp's 0600
+        (multi-uid readers of apm_modules, apm#2619 review)."""
         import os as _os
         import stat as _stat
 
@@ -133,17 +152,34 @@ class TestAtomicWriteText:
         existing_mode = _stat.S_IMODE(_os.stat(target).st_mode)
 
         with patch("apm_cli.utils.atomic_io.os.fchmod", create=True) as mock_fchmod:
-            atomic_write_text(target, "data", new_file_mode=0o600)
+            with patch("apm_cli.utils.atomic_io._POSIX_MODES", True):
+                atomic_write_text(target, "data", new_file_mode=None)
 
         mock_fchmod.assert_called_once()
         assert mock_fchmod.call_args.args[1] == existing_mode
 
-    def test_fchmod_not_called_when_mode_is_none(self, tmp_path: Path) -> None:
-        """fchmod is NOT called when new_file_mode is None."""
+    def test_fchmod_not_called_when_mode_is_none_and_new(self, tmp_path: Path) -> None:
+        """fchmod is NOT called for a new file when new_file_mode is None."""
         target = tmp_path / "out.txt"
 
         with patch("apm_cli.utils.atomic_io.os.fchmod", create=True) as mock_fchmod:
-            atomic_write_text(target, "data", new_file_mode=None)
+            with patch("apm_cli.utils.atomic_io._POSIX_MODES", True):
+                atomic_write_text(target, "data", new_file_mode=None)
+
+        mock_fchmod.assert_not_called()
+
+    def test_mode_bits_never_touched_on_windows(self, tmp_path: Path) -> None:
+        """With _POSIX_MODES False (Windows), fchmod is never called even
+        though Python 3.13 made os.fchmod available there: copying a
+        read-only destination's mode onto the temp would make the replace
+        AND the failure-path unlink fail, stranding a read-only
+        apm-atomic-* file inside the hashed tree (apm#2619 round-3)."""
+        target = tmp_path / "existing.txt"
+        target.write_text("existing", encoding="utf-8")
+
+        with patch("apm_cli.utils.atomic_io.os.fchmod", create=True) as mock_fchmod:
+            with patch("apm_cli.utils.atomic_io._POSIX_MODES", False):
+                atomic_write_text(target, "data", new_file_mode=0o600)
 
         mock_fchmod.assert_not_called()
 
@@ -152,7 +188,7 @@ class TestAtomicWriteText:
     # ------------------------------------------------------------------
 
     def test_tmp_file_cleaned_up_on_write_failure(self, tmp_path: Path) -> None:
-        """When fdopen/write raises, the tmp file is deleted."""
+        """When the raw write raises, the tmp file is deleted."""
         target = tmp_path / "fail.txt"
         tmp_names: list[str] = []
 
@@ -165,21 +201,21 @@ class TestAtomicWriteText:
 
         with patch("apm_cli.utils.atomic_io.tempfile.mkstemp", side_effect=capturing_mkstemp):
             with patch(
-                "apm_cli.utils.atomic_io.os.fdopen",
+                "apm_cli.utils.atomic_io.os.write",
                 side_effect=OSError("disk full"),
             ):
                 with pytest.raises(OSError, match="disk full"):
                     atomic_write_text(target, "data")
 
         # Tmp file must not remain after failure
-        if tmp_names:
-            assert not Path(tmp_names[0]).exists()
+        assert tmp_names
+        assert not Path(tmp_names[0]).exists()
 
     def test_exception_propagates_even_when_unlink_fails(self, tmp_path: Path) -> None:
         """If cleanup unlink fails, the original write exception still propagates."""
         target = tmp_path / "fail_unlink.txt"
 
-        with patch("apm_cli.utils.atomic_io.os.fdopen", side_effect=RuntimeError("boom")):
+        with patch("apm_cli.utils.atomic_io.os.write", side_effect=RuntimeError("boom")):
             with patch("apm_cli.utils.atomic_io.os.unlink", side_effect=OSError("locked")):
                 with pytest.raises(RuntimeError, match="boom"):
                     atomic_write_text(target, "data")
@@ -188,11 +224,36 @@ class TestAtomicWriteText:
         """If write fails, the target path must not be created."""
         target = tmp_path / "ghost.txt"
 
-        with patch("apm_cli.utils.atomic_io.os.fdopen", side_effect=OSError("nope")):
+        with patch("apm_cli.utils.atomic_io.os.write", side_effect=OSError("nope")):
             with pytest.raises(OSError):
                 atomic_write_text(target, "data")
 
         assert not target.exists()
+
+    def test_read_only_temp_is_still_cleaned_up_on_replace_failure(self, tmp_path: Path) -> None:
+        """Cleanup clears a read-only attribute before unlinking, so a
+        failure path can never strand a read-only apm-atomic-* temp inside
+        the (hashed) destination directory (apm#2619 round-3 review)."""
+        import os as _os
+        import stat as _stat
+
+        target = tmp_path / "apm.yml"
+        target.write_bytes(b"name: foo\n")
+
+        def make_source_read_only_and_fail(source: str, destination: Path) -> None:
+            _os.chmod(source, _stat.S_IREAD)
+            raise PermissionError("simulated sharing violation on a read-only temp")
+
+        with patch(
+            "apm_cli.utils.atomic_io._replace_atomic_file",
+            side_effect=make_source_read_only_and_fail,
+        ):
+            with pytest.raises(PermissionError):
+                atomic_write_text(target, "name: bar\n")
+
+        assert target.read_bytes() == b"name: foo\n"
+        strays = list(tmp_path.glob("apm-atomic-*"))
+        assert strays == [], strays
 
     def test_lock_replace_fault_is_narrow_and_preserves_original(
         self,

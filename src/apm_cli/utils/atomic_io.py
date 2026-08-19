@@ -29,6 +29,13 @@ _WIN_REPLACE_INITIAL_DELAY = 0.05
 # Module-level so tests can exercise the retry branch on any OS.
 _IS_WINDOWS = sys.platform == "win32"
 
+# POSIX mode-bit handling only. On Windows (where Python 3.13 gained
+# os.fchmod) mode bits reduce to the read-only attribute: copying a
+# read-only destination's mode onto the temp would make the replace AND
+# the failure-path unlink fail, stranding a read-only apm-atomic-* file
+# inside the tree. Module-level so tests can exercise both branches.
+_POSIX_MODES = os.name == "posix" and hasattr(os, "fchmod")
+
 
 def _replace_atomic_file(source: str, destination: Path) -> None:
     """Replace one atomic temp file, with a narrow installed-binary test seam."""
@@ -73,41 +80,59 @@ def write_text_lf(path: Path, data: str) -> None:
 
 
 def atomic_write_text(path: Path, data: str, *, new_file_mode: int | None = None) -> None:
-    """Atomically write ``data`` (UTF-8) to ``path``.
+    """Atomically write ``data`` (UTF-8, LF-normalized) to ``path``.
 
     The temp file is created in ``path.parent`` so the eventual
     ``os.replace`` is a same-filesystem rename. Caller is responsible
     for ensuring the parent directory exists.
 
-    If ``new_file_mode`` is given and ``path`` does not yet exist,
-    the temp file's POSIX mode bits are set to that value before
-    the rename so the destination is created with the requested
-    permissions. When ``path`` already exists, its current mode bits are
-    copied onto the temp file first, so the ``os.replace`` inode swap
-    does not silently downgrade the destination to mkstemp's 0600 (we
-    do not downgrade nor upgrade perms). Both mode adjustments are
-    silently skipped on platforms where ``os.fchmod`` is unavailable
-    (e.g. Windows), where POSIX mode bits are not enforced anyway.
+    POSIX mode handling (skipped entirely on Windows -- copying mode bits
+    there would set FILE_ATTRIBUTE_READONLY on the temp for a read-only
+    destination, making both the replace and the failure-path unlink fail
+    and stranding a read-only ``apm-atomic-*`` file inside the tree):
+
+    * ``new_file_mode`` given, ``path`` new: the destination is created
+      with exactly that mode.
+    * ``new_file_mode`` given, ``path`` exists: the destination gets
+      ``existing_mode & new_file_mode`` -- it keeps its mode but is capped
+      at the caller's ceiling, so security-sensitive callers (0o600-intent
+      config writers) still heal a pre-existing loose 0o644 down to 0o600
+      instead of preserving it forever.
+    * ``new_file_mode`` omitted, ``path`` exists: the existing mode is
+      preserved across the ``os.replace`` inode swap (we do not downgrade
+      to mkstemp's 0600 -- multi-uid readers of apm_modules keep working).
+    * ``new_file_mode`` omitted, ``path`` new: mkstemp's 0600 applies.
 
     On any failure -- including ``KeyboardInterrupt`` mid-write -- the
     temp file is removed and the original target file (if any) remains
-    untouched.
+    untouched. The write goes through the raw descriptor (``os.write``)
+    rather than an ``os.fdopen`` wrapper so descriptor ownership is
+    unambiguous: the fd is closed exactly once, with no window where an
+    async exception could trigger a double close of a reused fd number.
     """
     existed = path.exists()
     fd, tmp_name = tempfile.mkstemp(prefix="apm-atomic-", dir=str(path.parent))
-    fd_wrapped = False
     try:
-        if hasattr(os, "fchmod"):
-            if new_file_mode is not None and not existed:
-                with contextlib.suppress(OSError):
-                    os.fchmod(fd, new_file_mode)
-            elif existed:
-                with contextlib.suppress(OSError):
-                    os.fchmod(fd, stat.S_IMODE(os.stat(path).st_mode))
-        fh = os.fdopen(fd, "w", encoding="utf-8", newline="")
-        fd_wrapped = True
-        with fh:
-            fh.write(normalize_crlf_to_lf(data))
+        try:
+            if _POSIX_MODES:
+                if new_file_mode is not None:
+                    mode = new_file_mode
+                    if existed:
+                        with contextlib.suppress(OSError):
+                            mode = stat.S_IMODE(os.stat(path).st_mode) & new_file_mode
+                    with contextlib.suppress(OSError):
+                        os.fchmod(fd, mode)
+                elif existed:
+                    with contextlib.suppress(OSError):
+                        os.fchmod(fd, stat.S_IMODE(os.stat(path).st_mode))
+            payload = memoryview(normalize_crlf_to_lf(data).encode("utf-8"))
+            while payload:
+                written = os.write(fd, payload)
+                payload = payload[written:]
+        finally:
+            # Exactly-once close for every path through the inner block,
+            # and before os.replace (Windows requires the handle released).
+            os.close(fd)
         _replace_atomic_file(tmp_name, path)
     except BaseException:
         # BaseException, not Exception: a Ctrl+C (KeyboardInterrupt) mid-write
@@ -115,11 +140,10 @@ def atomic_write_text(path: Path, data: str, *, new_file_mode: int | None = None
         # an installed package tree (synthetic apm.yml, inline hooks.json --
         # apm#2619), a stranded apm-atomic-* file would be swept into
         # compute_package_hash and permanently poison the recorded hash.
-        if not fd_wrapped:
-            # fdopen never took ownership of the descriptor; close it so
-            # Windows can release its lock and the tmp file can be unlinked.
-            with contextlib.suppress(OSError):
-                os.close(fd)
+        # Clear any read-only attribute first so the unlink cannot itself
+        # fail and strand the temp (Windows cannot unlink read-only files).
+        with contextlib.suppress(OSError):
+            os.chmod(tmp_name, 0o600)
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
