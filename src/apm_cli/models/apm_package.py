@@ -62,6 +62,7 @@ __all__ = [  # noqa: RUF022
     "PackageInfo",
     "build_installed_package_info",
     "clear_apm_yml_cache",
+    "invalidate_apm_yml_cache_entry",
     "surviving_dependency_refs_for_reintegration",
 ]
 
@@ -77,6 +78,25 @@ _apm_yml_cache: dict[tuple[Path, Path | None], "APMPackage"] = {}
 def clear_apm_yml_cache() -> None:
     """Clear the from_apm_yml parse cache. Call in tests for isolation."""
     _apm_yml_cache.clear()
+
+
+def invalidate_apm_yml_cache_entry(apm_yml_path: Path) -> None:
+    """Drop every cache entry for *apm_yml_path* (all source_path variants).
+
+    MUST be called after rewriting an ``apm.yml`` on disk within a run
+    (marketplace-plugin synthesis, ``stamp_plugin_version``). The cache
+    assumes file content is stable for the process lifetime; a rewrite
+    breaks that. Concretely (apm#2619 migration surfaced this): when a
+    same-process re-download re-synthesized a marketplace plugin's
+    ``apm.yml`` at ``version: 0.0.0``, ``from_apm_yml`` returned the STALE
+    cached instance -- already stamped to the short commit SHA earlier in
+    the run -- so ``stamp_plugin_version``'s ``version == "0.0.0"`` guard
+    skipped, leaving an unstamped tree on disk whose content hash matched
+    neither the lockfile record nor a fresh install's tree.
+    """
+    resolved = apm_yml_path.resolve()
+    for key in [k for k in _apm_yml_cache if k[0] == resolved]:
+        _apm_yml_cache.pop(key, None)
 
 
 def _parse_v01_registries_block(

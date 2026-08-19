@@ -1,6 +1,7 @@
 """Deterministic SHA-256 content hashing for package integrity verification."""
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
 
 from apm_cli.install.cache_pin import MARKER_FILENAME as _APM_PIN_MARKER
@@ -22,34 +23,15 @@ _EXCLUDED_ROOT_FILES = {_APM_PIN_MARKER}
 _EMPTY_HASH = "sha256:" + hashlib.sha256(b"").hexdigest()
 
 
-def compute_package_hash(package_path: Path) -> str:
-    """Compute a deterministic SHA-256 hash of a package's file tree.
+def _iter_package_files(package_path: Path) -> list[Path]:
+    """Enumerate the hashable files of a package tree.
 
-    The hash is computed over sorted file paths and their contents,
-    making it independent of filesystem ordering and metadata (timestamps,
-    permissions).
-
-    Note: this whole-tree hash intentionally hashes raw file bytes, unlike
-    the per-file :func:`compute_file_hash` which normalizes CRLF->LF for
-    text (apm#1952). The package tree is hashed at the git-checkout
-    boundary where content is already platform-canonical, and the path is
-    bound into the digest, so cross-platform line-ending identity is
-    unnecessary here. Do not unify the two without re-checking that
-    invariant.
-
-    Args:
-        package_path: Root directory of the installed package.
-
-    Returns:
-        Hash string in format ``"sha256:<hex_digest>"``.
+    Shared by :func:`compute_package_hash` and
+    :func:`compute_package_hash_with_overrides` so both digest exactly the
+    same file set: regular files only, symlinks skipped, excluded
+    directories pruned, root-level excluded files dropped, sorted
+    lexicographically by POSIX relative path for determinism.
     """
-    if not package_path.is_dir():
-        return _EMPTY_HASH
-
-    hasher = hashlib.sha256()
-    file_count = 0
-
-    # Collect all regular files, skipping excluded dirs and symlinks
     regular_files: list[Path] = []
     for item in package_path.rglob("*"):
         # Skip symlinks
@@ -64,13 +46,93 @@ def compute_package_hash(package_path: Path) -> str:
                 continue
             regular_files.append(rel)
 
-    # Sort lexicographically by POSIX path for determinism
     regular_files.sort(key=lambda p: p.as_posix())
+    return regular_files
 
-    for rel_path in regular_files:
+
+def compute_package_hash(package_path: Path) -> str:
+    """Compute a deterministic SHA-256 hash of a package's file tree.
+
+    The hash is computed over sorted file paths and their contents,
+    making it independent of filesystem ordering and metadata (timestamps,
+    permissions).
+
+    Note: this whole-tree hash intentionally hashes raw file bytes, unlike
+    the per-file :func:`compute_file_hash` which normalizes CRLF->LF for
+    text (apm#1952). For the raw hash to be platform-invariant, EVERY file
+    in the tree must therefore carry platform-canonical bytes:
+    git-materialized content already does (identical bytes at a pinned
+    commit on every OS), and every file APM itself writes into the tree
+    MUST be written LF-deterministically (``atomic_write_text`` /
+    ``write_text_lf`` / ``dump_yaml``). apm#2187/PR #2223 and apm#2619 are
+    the incidents where platform-native in-tree writers broke that
+    invariant and made lockfiles non-portable. Do not add an in-tree
+    writer that uses platform-native newlines, and do not normalize line
+    endings HERE instead: that would silently change the recorded hash of
+    every package whose upstream content legitimately contains CRLF,
+    invalidating existing correct lockfiles.
+
+    Args:
+        package_path: Root directory of the installed package.
+
+    Returns:
+        Hash string in format ``"sha256:<hex_digest>"``.
+    """
+    if not package_path.is_dir():
+        return _EMPTY_HASH
+
+    hasher = hashlib.sha256()
+    file_count = 0
+
+    for rel_path in _iter_package_files(package_path):
         # Hash the relative path then the file contents
         hasher.update(rel_path.as_posix().encode("utf-8"))
         hasher.update((package_path / rel_path).read_bytes())
+        file_count += 1
+
+    if file_count == 0:
+        return _EMPTY_HASH
+
+    return f"sha256:{hasher.hexdigest()}"
+
+
+def compute_package_hash_with_overrides(
+    package_path: Path,
+    overrides: Mapping[str, bytes],
+) -> str:
+    """Compute the package hash as if selected files held different bytes.
+
+    Identical to :func:`compute_package_hash` -- same file enumeration,
+    same digest layout -- except that for every file whose POSIX relative
+    path appears in ``overrides``, the mapped bytes are hashed in place of
+    the on-disk content. Files named in ``overrides`` that do not exist in
+    the enumerated tree contribute nothing (they are not phantom-added).
+
+    Used by the apm#2619 migration path
+    (:mod:`apm_cli.install.legacy_crlf`) to answer "would this tree match
+    the locked hash if the APM-authored synthetic files still carried
+    their legacy CRLF bytes?" without mutating the tree.
+
+    Args:
+        package_path: Root directory of the installed package.
+        overrides: POSIX relative path -> replacement bytes.
+
+    Returns:
+        Hash string in format ``"sha256:<hex_digest>"``.
+    """
+    if not package_path.is_dir():
+        return _EMPTY_HASH
+
+    hasher = hashlib.sha256()
+    file_count = 0
+
+    for rel_path in _iter_package_files(package_path):
+        posix = rel_path.as_posix()
+        hasher.update(posix.encode("utf-8"))
+        if posix in overrides:
+            hasher.update(overrides[posix])
+        else:
+            hasher.update((package_path / rel_path).read_bytes())
         file_count += 1
 
     if file_count == 0:

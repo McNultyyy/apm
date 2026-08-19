@@ -21,9 +21,27 @@ on:
       - 'src/apm_cli/utils/yaml_io.py'
       - 'src/apm_cli/deps/plugin_parser.py'
       - 'src/apm_cli/deps/package_validator.py'
+      - 'src/apm_cli/deps/github_downloader.py'
       - 'src/apm_cli/models/validation.py'
+      - 'src/apm_cli/install/legacy_crlf.py'
       - 'scripts/crlf_invariance_probe.py'
       - '.github/workflows/crlf-invariance.yml'
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/apm_cli/utils/content_hash.py'
+      - 'src/apm_cli/utils/atomic_io.py'
+      - 'src/apm_cli/utils/yaml_io.py'
+      - 'src/apm_cli/deps/plugin_parser.py'
+      - 'src/apm_cli/deps/package_validator.py'
+      - 'src/apm_cli/deps/github_downloader.py'
+      - 'src/apm_cli/models/validation.py'
+      - 'src/apm_cli/install/legacy_crlf.py'
+      - 'scripts/crlf_invariance_probe.py'
+      - '.github/workflows/crlf-invariance.yml'
+  # Merge queues do not support path filtering; run unconditionally there so
+  # a regression cannot slip through the queue unprobed.
+  merge_group: {}
   workflow_dispatch: {}
 
 permissions:

@@ -1413,6 +1413,7 @@ class TestSynthesizePreservesExistingManifest:
         assert result["name"] == "bad-pkg"
 
 
+@pytest.mark.windows_compat
 class TestSyntheticManifestLineEndings:
     """apm#2619: synthetic apm.yml bytes must be platform-invariant (LF).
 

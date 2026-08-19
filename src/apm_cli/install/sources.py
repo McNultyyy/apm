@@ -582,6 +582,21 @@ class CachedDependencySource(DependencySource):
             )
         )
         if install_path.is_dir():
+            # apm#2619 migration: a warm tree materialized by a pre-fix APM
+            # (on Windows) may still hold CRLF bytes in the files APM itself
+            # authored (synthetic apm.yml, inline hooks.json). Converge them
+            # to the LF domain BEFORE recording, or the stale CRLF-domain
+            # hash would be copied into every regenerated lockfile forever,
+            # keeping installs broken for POSIX teammates even after both
+            # sides upgraded.
+            from apm_cli.install.legacy_crlf import converge_apm_authored_files
+
+            _converged = converge_apm_authored_files(install_path, pkg_type, dep_ref)
+            if _converged and logger:
+                logger.verbose_detail(
+                    f"  Normalized legacy CRLF line endings in {', '.join(_converged)} "
+                    f"for {dep_key} (apm#2619 migration)"
+                )
             ctx.package_hashes[dep_key] = _compute_hash(install_path)
         if cached_package_info.package_type:
             ctx.package_types[dep_key] = cached_package_info.package_type.value
@@ -849,14 +864,42 @@ class FreshDependencySource(DependencySource):
             ):
                 _fresh_hash = ctx.package_hashes[dep_key]
                 if _fresh_hash != dep_locked_chk.content_hash:
-                    safe_rmtree(install_path, ctx.apm_modules_dir)
-                    raise DirectDependencyError(
-                        f"Content hash mismatch for {dep_key}: "
-                        f"expected {dep_locked_chk.content_hash}, got {_fresh_hash}. "
-                        "The downloaded content differs from the lockfile record. "
-                        "This may indicate a supply-chain attack. Use "
-                        "'apm install --update' to accept new content and update the lockfile."
+                    # apm#2619 migration: lockfiles recorded by a pre-fix APM
+                    # on Windows carry the CRLF-domain hash of the files APM
+                    # itself authored (synthetic apm.yml, inline hooks.json).
+                    # If the locked hash equals the fresh tree re-hashed with
+                    # ONLY those files CRLF-expanded, the difference is
+                    # exactly that benign legacy line-ending domain -- accept
+                    # the already-recorded LF hash so the lockfile converges,
+                    # instead of hard-failing as a supply-chain event. The
+                    # equivalence is as strong as the hash itself: every
+                    # other byte of the tree must match the locked record.
+                    from apm_cli.install.legacy_crlf import legacy_crlf_hash
+
+                    _legacy_hash = legacy_crlf_hash(
+                        install_path,
+                        getattr(package_info, "package_type", None),
+                        dep_ref,
                     )
+                    if _legacy_hash is not None and _legacy_hash == dep_locked_chk.content_hash:
+                        diagnostics.warn(
+                            f"Lockfile content_hash for {dep_key} was recorded by an "
+                            "older APM on Windows (legacy CRLF line-ending domain, "
+                            "apm#2619). Content verified equivalent; re-recording the "
+                            "platform-independent hash. Run 'apm install' (or "
+                            "'apm lock') once and commit the updated apm.lock.yaml "
+                            "to stop this warning.",
+                            package=dep_key,
+                        )
+                    else:
+                        safe_rmtree(install_path, ctx.apm_modules_dir)
+                        raise DirectDependencyError(
+                            f"Content hash mismatch for {dep_key}: "
+                            f"expected {dep_locked_chk.content_hash}, got {_fresh_hash}. "
+                            "The downloaded content differs from the lockfile record. "
+                            "This may indicate a supply-chain attack. Use "
+                            "'apm install --update' to accept new content and update the lockfile."
+                        )
 
             if hasattr(package_info, "package_type") and package_info.package_type:
                 ctx.package_types[dep_key] = package_info.package_type.value

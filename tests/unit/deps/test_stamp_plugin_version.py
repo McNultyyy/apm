@@ -89,6 +89,7 @@ def test_no_op_when_apm_yml_is_missing(tmp_path):
     assert not (tmp_path / "apm.yml").exists()
 
 
+@pytest.mark.windows_compat
 def test_stamped_manifest_bytes_are_lf_only(tmp_path):
     """The stamped apm.yml lands inside a package tree hashed raw by
     ``compute_package_hash``, so its bytes must be LF-only on every OS
@@ -124,3 +125,66 @@ def test_no_op_when_package_is_none(tmp_path):
     )
 
     assert "version: 0.0.0" in apm_yml.read_text(encoding="utf-8")
+
+
+@pytest.mark.windows_compat
+def test_stamp_invalidates_from_apm_yml_cache(tmp_path):
+    """Stamping rewrites apm.yml, so cached from_apm_yml instances for that
+    path must be dropped -- a stale pre-stamp instance elsewhere in the run
+    would disagree with the on-disk bytes (apm#2619 migration fallout)."""
+    from apm_cli.models.apm_package import APMPackage
+
+    apm_yml = tmp_path / "apm.yml"
+    apm_yml.write_bytes(b"name: foo\nversion: 0.0.0\n")
+    first = APMPackage.from_apm_yml(apm_yml)  # populate the cache
+    assert first.version == "0.0.0"
+
+    stamp_plugin_version(
+        _pkg("0.0.0"),
+        PackageType.MARKETPLACE_PLUGIN,
+        "abcdef1234567890aabbccddeeff00112233abcd",
+        tmp_path,
+    )
+
+    reloaded = APMPackage.from_apm_yml(apm_yml)
+    assert reloaded is not first
+    assert reloaded.version == "abcdef1"
+
+
+@pytest.mark.windows_compat
+def test_restamp_after_resynthesis_is_not_skipped_by_stale_cache(tmp_path):
+    """The apm#2619 double-download interplay, distilled.
+
+    Real flow: download #1 synthesizes apm.yml (0.0.0), stamps it to the
+    short SHA; a content-hash mismatch forces a re-download in the SAME
+    process; download #2 re-synthesizes a fresh 0.0.0 manifest. Without
+    cache invalidation, from_apm_yml returned the STALE stamped instance,
+    the ``version == "0.0.0"`` stamp guard skipped, and the tree stayed
+    unstamped on disk -- hashing to a value no lockfile ever recorded.
+    """
+    from apm_cli.deps.plugin_parser import synthesize_apm_yml_from_plugin
+    from apm_cli.models.apm_package import APMPackage
+
+    sha = "2c7ec5e78b8e5d43ea02e90bb8826f6b9f147b0c"
+    plugin = tmp_path / "plug"
+    skill = plugin / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_bytes(b"---\nname: demo\ndescription: Demo\n---\n\n# Demo\n")
+
+    # Download #1: synthesize + stamp.
+    apm_yml = synthesize_apm_yml_from_plugin(plugin, {"name": "plug"})
+    pkg = APMPackage.from_apm_yml(apm_yml)
+    stamp_plugin_version(pkg, PackageType.MARKETPLACE_PLUGIN, sha, plugin)
+    assert b"version: 2c7ec5e" in apm_yml.read_bytes()
+
+    # Re-download: pristine tree, fresh synthesis (no existing manifest).
+    apm_yml.unlink()
+    synthesize_apm_yml_from_plugin(plugin, {"name": "plug"})
+
+    fresh = APMPackage.from_apm_yml(apm_yml)
+    assert fresh.version == "0.0.0"  # stale cache would still say 2c7ec5e
+
+    # The second stamp must therefore actually run.
+    stamp_plugin_version(fresh, PackageType.MARKETPLACE_PLUGIN, sha, plugin)
+    assert fresh.version == "2c7ec5e"
+    assert b"version: 2c7ec5e" in apm_yml.read_bytes()

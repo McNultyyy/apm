@@ -14,6 +14,8 @@ Covers:
 
 from __future__ import annotations
 
+import os
+import stat
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -118,15 +120,23 @@ class TestAtomicWriteText:
         _fd, mode = mock_fchmod.call_args[0]
         assert mode == 0o600
 
-    def test_fchmod_not_called_when_file_exists(self, tmp_path: Path) -> None:
-        """fchmod is NOT called when the file already exists."""
+    def test_existing_file_keeps_its_mode_not_new_file_mode(self, tmp_path: Path) -> None:
+        """An existing target keeps ITS mode: fchmod copies the destination's
+        current mode onto the temp (never ``new_file_mode``), so the
+        ``os.replace`` inode swap neither downgrades to mkstemp's 0600 nor
+        applies the new-file-only mode hint (apm#2619 review)."""
+        import os as _os
+        import stat as _stat
+
         target = tmp_path / "existing.txt"
         target.write_text("existing", encoding="utf-8")
+        existing_mode = _stat.S_IMODE(_os.stat(target).st_mode)
 
         with patch("apm_cli.utils.atomic_io.os.fchmod", create=True) as mock_fchmod:
             atomic_write_text(target, "data", new_file_mode=0o600)
 
-        mock_fchmod.assert_not_called()
+        mock_fchmod.assert_called_once()
+        assert mock_fchmod.call_args.args[1] == existing_mode
 
     def test_fchmod_not_called_when_mode_is_none(self, tmp_path: Path) -> None:
         """fchmod is NOT called when new_file_mode is None."""
@@ -252,3 +262,92 @@ class TestWriteTextLf:
         target = tmp_path / "u.md"
         write_text_lf(target, "café ☕ 日本語\r\n")
         assert target.read_text(encoding="utf-8") == "café ☕ 日本語\n"
+
+
+class TestAtomicWriteHardening:
+    """apm#2619 review hardening: mode preservation, interrupt cleanup, AV retry."""
+
+    @pytest.mark.skipif(
+        os.name == "nt" or not hasattr(os, "fchmod"),
+        reason="POSIX mode-bit semantics (Windows chmod only toggles read-only)",
+    )
+    def test_existing_file_mode_is_preserved(self, tmp_path: Path) -> None:
+        """os.replace swaps inodes, so the temp must inherit the target's mode.
+
+        Without this, every rewrite of an existing file silently downgrades
+        it to mkstemp's 0600 -- breaking multi-uid readers of apm_modules.
+        """
+        target = tmp_path / "apm.yml"
+        target.write_bytes(b"name: foo\n")
+        os.chmod(target, 0o644)
+
+        atomic_write_text(target, "name: bar\n")
+
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o644
+        assert target.read_bytes() == b"name: bar\n"
+
+    def test_keyboard_interrupt_mid_write_removes_temp_file(self, tmp_path: Path) -> None:
+        """Ctrl+C mid-write must not strand an apm-atomic-* temp file.
+
+        When the destination directory is an installed package tree
+        (synthetic apm.yml, inline hooks.json -- apm#2619), a stranded temp
+        would be swept into compute_package_hash and permanently poison the
+        recorded hash. BaseException (not just Exception) must trigger the
+        cleanup path.
+        """
+        target = tmp_path / "apm.yml"
+        target.write_bytes(b"name: foo\n")
+
+        with (
+            patch(
+                "apm_cli.utils.atomic_io._replace_atomic_file",
+                side_effect=KeyboardInterrupt,
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            atomic_write_text(target, "name: bar\n")
+
+        assert target.read_bytes() == b"name: foo\n"  # original intact
+        strays = list(tmp_path.glob("apm-atomic-*"))
+        assert strays == [], strays
+
+    def test_windows_replace_retries_transient_permission_error(self, tmp_path: Path) -> None:
+        """A transient PermissionError (AV/indexer holding the target) is retried."""
+        target = tmp_path / "apm.yml"
+        real_replace = os.replace
+        failures = {"remaining": 2}
+
+        def flaky_replace(src: object, dst: object) -> None:
+            if failures["remaining"] > 0:
+                failures["remaining"] -= 1
+                raise PermissionError("sharing violation")
+            real_replace(src, dst)
+
+        with (
+            patch("apm_cli.utils.atomic_io._IS_WINDOWS", True),
+            patch("apm_cli.utils.atomic_io.os.replace", side_effect=flaky_replace),
+            patch("apm_cli.utils.atomic_io.time.sleep") as fake_sleep,
+        ):
+            atomic_write_text(target, "name: bar\n")
+
+        assert target.read_bytes() == b"name: bar\n"
+        assert failures["remaining"] == 0
+        assert fake_sleep.call_count == 2
+
+    def test_windows_replace_gives_up_after_bounded_retries(self, tmp_path: Path) -> None:
+        """A persistent PermissionError still surfaces (bounded retry, no hang)."""
+        target = tmp_path / "apm.yml"
+
+        with (
+            patch("apm_cli.utils.atomic_io._IS_WINDOWS", True),
+            patch(
+                "apm_cli.utils.atomic_io.os.replace",
+                side_effect=PermissionError("sharing violation"),
+            ),
+            patch("apm_cli.utils.atomic_io.time.sleep"),
+            pytest.raises(PermissionError),
+        ):
+            atomic_write_text(target, "name: bar\n")
+
+        strays = list(tmp_path.glob("apm-atomic-*"))
+        assert strays == [], strays

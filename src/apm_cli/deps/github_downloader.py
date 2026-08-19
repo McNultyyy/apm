@@ -24,7 +24,6 @@ from ..models.apm_package import (
     DependencyReference,
     GitReferenceType,
     PackageInfo,
-    PackageType,
     RemoteRef,
     ResolvedReference,
     validate_apm_package,
@@ -1822,20 +1821,17 @@ class GitHubPackageDownloader:
                     package = validation_result.package
                     package.source = dep_ref.to_github_url()
                     package.resolved_commit = resolved_ref.resolved_commit
-                    if (
-                        validation_result.package_type == PackageType.MARKETPLACE_PLUGIN
-                        and package.version == "0.0.0"
-                        and resolved_ref.resolved_commit
-                    ):
-                        short_sha = resolved_ref.resolved_commit[:7]
-                        package.version = short_sha
-                        apm_yml_path = target_path / "apm.yml"
-                        if apm_yml_path.exists():
-                            from ..utils.yaml_io import dump_yaml, load_yaml
+                    # Single stamping implementation (shared with the clone
+                    # paths): also invalidates the from_apm_yml cache entry
+                    # after rewriting apm.yml (apm#2619 migration fallout).
+                    from .package_validator import stamp_plugin_version
 
-                            _data = load_yaml(apm_yml_path) or {}
-                            _data["version"] = short_sha
-                            dump_yaml(_data, apm_yml_path)
+                    stamp_plugin_version(
+                        package,
+                        validation_result.package_type,
+                        resolved_ref.resolved_commit,
+                        target_path,
+                    )
                     return PackageInfo(
                         package=package,
                         install_path=target_path,

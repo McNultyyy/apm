@@ -115,6 +115,7 @@ class TestDumpYaml:
         assert "- a" in raw
         assert "{" not in raw
 
+    @pytest.mark.windows_compat
     def test_dump_writes_lf_only_bytes(self, tmp_path):
         """On-disk bytes use LF exclusively on every platform (apm#2619).
 
