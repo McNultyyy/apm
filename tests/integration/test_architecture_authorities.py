@@ -68,6 +68,24 @@ def test_install_request_defaults_have_single_owner() -> None:
     )
 
 
+def test_git_semver_preflight_eligibility_has_single_owner() -> None:
+    """Positional ingress must consume, not duplicate, git-semver eligibility."""
+    root = Path(__file__).parents[2]
+    owner = (root / "src/apm_cli/install/helpers/ref_reuse.py").read_text(encoding="utf-8")
+    ingress = (root / "src/apm_cli/commands/install.py").read_text(encoding="utf-8")
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
+    architecture = (root / ".github/instructions/architecture.instructions.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert owner.count("def is_git_semver_resolution_eligible(") == 1
+    assert "if not is_git_semver_resolution_eligible(dep_ref):" in owner
+    assert "is_git_semver_resolution_eligible(dep_ref)" in ingress
+    assert 'dep_ref.ref_kind == "semver"' not in ingress
+    assert "Git semver preflight eligibility must route through ref_reuse.py" in guard
+    assert "| Git semver preflight eligibility and resolution |" in architecture
+
+
 @pytest.mark.parametrize(
     ("relative_path", "source", "expected"),
     [

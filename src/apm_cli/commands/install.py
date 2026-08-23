@@ -30,6 +30,7 @@ from apm_cli.install.errors import (
     RequiredIntegrationError,
 )
 from apm_cli.install.gitlab_resolver import _try_resolve_gitlab_direct_shorthand
+from apm_cli.install.helpers.ref_reuse import is_git_semver_resolution_eligible
 
 if TYPE_CHECKING:
     from apm_cli.core.target_detection import EffectiveTargetDecision
@@ -446,7 +447,8 @@ def _resolve_package_references(
         already_in_deps = identity in existing_identities
 
         verbose = bool(logger and logger.verbose)
-        # An already-known registry identity also skips the probe.
+        # Registry routing is authoritative: it validates its own version
+        # selectors before git semver eligibility can defer the raw-ref probe.
         if existing_source_is_registry or should_skip_github_probe_for_dep(
             dep_ref, default_registry
         ):
@@ -456,6 +458,8 @@ def _resolve_package_references(
                 if logger:
                     logger.validation_fail(package, ref_err)
                 continue
+            package_accessible = True
+        elif is_git_semver_resolution_eligible(dep_ref):
             package_accessible = True
         else:
             package_accessible = _validate_package_exists(

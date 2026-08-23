@@ -63,6 +63,7 @@ semicolon-delimited, and specific to the file(s) that own the fact.
 | CI audit scratch materialization | install/audit_replay.py (prepare_ci_audit_replay) | `src/apm_cli/install/audit_replay.py` |
 | GitHub API throttle classification | deps/github_rate_limit.py | `src/apm_cli/deps/github_rate_limit.py` |
 | Git ref freshness and cache eligibility | deps/tiered_ref_resolver.py (RefFreshnessPolicy) | `src/apm_cli/deps/tiered_ref_resolver.py` |
+| Git semver preflight eligibility and resolution | install/helpers/ref_reuse.py (is_git_semver_resolution_eligible / maybe_resolve_git_semver) | `src/apm_cli/install/helpers/ref_reuse.py` |
 | Root vs dependency MCP declaration scope | integration/mcp_config_view.py (CurrentMcpConfigView) | `src/apm_cli/integration/mcp_config_view.py` |
 | MCP package launcher selection and argv shape (container and non-container) | adapters/client/base.py (MCPClientAdapter) | `src/apm_cli/adapters/client/base.py` |
 | Dependency CLI identifier parsing + uninstall selection | models/dependency/selection.py (via DependencyReference) | `src/apm_cli/models/dependency/selection.py` |

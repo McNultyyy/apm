@@ -958,6 +958,17 @@ if ! grep -q 'transport_plan = transport_selector.select(' "$semver_transport_ro
     echo "[x] Git ref transport must route through TransportSelector into RefResolver"
     violations=$((violations + 1))
 fi
+git_semver_eligibility_owner="src/apm_cli/install/helpers/ref_reuse.py"
+git_semver_ingress="src/apm_cli/commands/install.py"
+if [ "$(grep -Ec '^def is_git_semver_resolution_eligible\(' "$git_semver_eligibility_owner")" -ne 1 ] \
+    || ! grep -q 'if not is_git_semver_resolution_eligible(dep_ref):' \
+        "$git_semver_eligibility_owner" \
+    || ! grep -q 'is_git_semver_resolution_eligible(dep_ref)' "$git_semver_ingress" \
+    || grep -Eq 'dep_ref\.ref_kind[[:space:]]*==[[:space:]]*["'\'']semver["'\'']' \
+        "$git_semver_ingress"; then
+    echo "[x] Git semver preflight eligibility must route through ref_reuse.py"
+    violations=$((violations + 1))
+fi
 
 echo "[*] AC14: ADO lock-coordinate authority"
 if ! grep -q 'with_derived_provider_coordinates' \
