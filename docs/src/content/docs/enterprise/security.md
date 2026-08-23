@@ -456,6 +456,9 @@ use `apm approve` or `apm deny`.
 
 APM integrates MCP (Model Context Protocol) server configurations from packages. Trust is explicit and scoped by dependency depth.
 
+For Codex remote transport requirements, see
+[stdio vs HTTP servers](../../consumer/install-mcp-servers/#stdio-vs-http-servers).
+
 ### Direct dependencies
 
 MCP servers declared by your direct dependencies (packages listed in your `apm.yml`) are auto-trusted. You explicitly chose to depend on these packages, so their MCP server declarations are accepted.
