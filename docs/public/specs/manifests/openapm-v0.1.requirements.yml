@@ -417,6 +417,11 @@ requirements:
     section: "8.5.5"
     conformance_class: consumer
     notes: "a schema-bearing Agent Plugins v1 dependency is undeployable until a native lifecycle is machine-verifiable; the consumer fails closed with one diagnostic and an unchanged tree, uniformly across solo, mixed-batch, and dry-run installs"
+  - id: req-tg-012
+    keyword: MUST
+    section: "8.5.6"
+    conformance_class: consumer
+    notes: "implementation-defined plugin-root placeholders preserve balanced expandable double quoting across split-quote forward- or backslash path spelling and unresolved placeholders emit a default-visible diagnostic"
   - id: req-sc-001
     keyword: MUST
     section: "10.4"

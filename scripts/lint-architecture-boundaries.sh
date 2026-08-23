@@ -955,6 +955,17 @@ if ! grep -q '^def dependency_hook_source_marker(' "$hook_ownership_owner" \
     violations=$((violations + 1))
 fi
 
+echo "[*] AC15d: plugin-root hook command parsing authority"
+plugin_root_owner="src/apm_cli/integration/hook_command_paths.py"
+plugin_root_consumer="src/apm_cli/integration/hook_integrator.py"
+if ! grep -q '^PLUGIN_ROOT_NAMES = (' "$plugin_root_owner" \
+    || grep -Eq 'CLAUDE_PLUGIN_ROOT|CURSOR_PLUGIN_ROOT|KIRO_PLUGIN_ROOT' \
+        "$plugin_root_consumer" \
+    || grep -Fq '"PLUGIN_ROOT"' "$plugin_root_consumer"; then
+    echo "[x] Plugin-root hook command parsing must route through hook_command_paths.py"
+    violations=$((violations + 1))
+fi
+
 echo "[*] AC16: post-uninstall reachability owner authority"
 if ! grep -Eq 'reachability\.compute_forward_reachable_keys|from \.\.\.deps\.reachability import|from apm_cli\.deps\.reachability import' \
     src/apm_cli/commands/uninstall/engine.py; then

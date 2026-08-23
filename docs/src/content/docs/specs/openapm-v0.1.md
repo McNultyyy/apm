@@ -136,7 +136,7 @@ between the companion corpus and the implementation.
 
 ### 1.3 Document conventions
 
-- OpenAPM v0.1 carries **110 normative statements** indexed in
+- OpenAPM v0.1 carries **114 normative statements** indexed in
   [Appendix C](#appendix-c-index-of-normative-statements).
 - All on-disk files defined by this specification are **YAML 1.2**
   parsed under the safe subset defined in
@@ -2493,6 +2493,27 @@ closed rather than partially projecting the package.
 > future revision once a consumer implementation demonstrates a
 > qualified, machine-verifiable binary lifecycle.
 
+#### 8.5.6 Plugin-root hook command resolution
+
+<a id="req-tg-012"></a>
+**[req-tg-012]** When a conforming **consumer** implementation resolves an
+implementation-defined plugin-root placeholder in a hook command, it MUST treat
+a placeholder enclosed in matching quotation marks and followed by a forward
+slash (`/`) or backslash (`\`) path separator outside the closing quote as
+equivalent to the placeholder and path enclosed together in one double-quoted
+span, regardless of the source quote character. The generated command MUST
+preserve balanced quoting, and any environment-variable expression retained in
+that command MUST remain live for target expansion. If any
+implementation-defined plugin-root placeholder remains unresolved, the consumer
+MUST emit a default-visible diagnostic before the operation returns; it MUST
+NOT silently deploy the unresolved command.
+
+> **Editorial note.** A plugin-root placeholder has the form `${NAME}`; each
+> consumer documents the fixed set of names it recognizes for its targets.
+> `${PLUGIN_ROOT}` is an illustrative spelling. For example,
+> `"${PLUGIN_ROOT}"/hooks/probe.py` normalizes to
+> `"${PLUGIN_ROOT}/hooks/probe.py"`.
+
 ### 8.6 Per-target primitive support (informational)
 
 The matrix of which primitive types each target supports is
@@ -2508,7 +2529,8 @@ without a spec revision. The current matrix is in the companion
   [req-tg-004](#req-tg-004), [req-tg-005](#req-tg-005),
   [req-tg-006](#req-tg-006), [req-tg-007](#req-tg-007),
   [req-tg-008](#req-tg-008), [req-tg-009](#req-tg-009),
-  [req-tg-010](#req-tg-010), [req-tg-011](#req-tg-011).
+  [req-tg-010](#req-tg-010), [req-tg-011](#req-tg-011),
+  [req-tg-012](#req-tg-012).
 
 ---
 
@@ -3070,7 +3092,8 @@ conformance statement identifying:
 [req-tg-004](#req-tg-004), [req-tg-005](#req-tg-005),
 [req-tg-006](#req-tg-006), [req-tg-007](#req-tg-007),
 [req-tg-008](#req-tg-008), [req-tg-009](#req-tg-009),
-[req-tg-010](#req-tg-010), [req-sc-001](#req-sc-001),
+[req-tg-010](#req-tg-010), [req-tg-011](#req-tg-011),
+[req-tg-012](#req-tg-012), [req-sc-001](#req-sc-001),
 [req-sc-002](#req-sc-002), [req-sc-003](#req-sc-003),
 [req-sc-004](#req-sc-004), [req-sc-005](#req-sc-005),
 [req-sc-006](#req-sc-006), [req-sc-007](#req-sc-007),
@@ -3504,6 +3527,7 @@ renumbering of conformance classes.
 | [req-tg-009](#req-tg-009)                | MUST    | 8.5.1   | consumer    |
 | [req-tg-010](#req-tg-010)                | MUST    | 8.5.4   | consumer    |
 | [req-tg-011](#req-tg-011)                | MUST    | 8.5.5   | consumer    |
+| [req-tg-012](#req-tg-012)                | MUST    | 8.5.6   | consumer    |
 | [req-sc-001](#req-sc-001)                | MUST    | 10.4    | consumer    |
 | [req-sc-002](#req-sc-002)                | MUST    | 10.9    | consumer    |
 | [req-sc-003](#req-sc-003)                | MUST    | 10.3    | consumer    |
@@ -3522,7 +3546,7 @@ renumbering of conformance classes.
 | [req-cf-001](#req-cf-001)                | MUST    | 12.5    | consumer    |
 | [req-cf-002](#req-cf-002)                | MUST    | 12.3    | consumer    |
 
-**Total normative statements: 113** (108 MUST, 5 SHOULD).
+**Total normative statements: 114** (109 MUST, 5 SHOULD).
 
 ---
 
@@ -3561,6 +3585,7 @@ renumbering of conformance classes.
 | 0.1.27  | 2026-08-03 | Spec-citation fold for object-form registry identity preservation on CLI-driven manifest updates (closes the PR #2166 Mode-B silent-extension gate). Added [req-mf-024] (Section 4.3.2, consumer MUST): a consumer MUST NOT silently rewrite an existing `id:`-form (registry-sourced) manifest entry into a `git:`-form entry when persisting a subsequent CLI-driven update (e.g. an additive `--skill` pin) for the same dependency identity; when a CLI-parsed reference is ambiguous about its source but an existing manifest entry for the same identity already resolves to the `registry` source, the existing entry's source MUST be honored, and an update that would otherwise replace a registry-sourced entry with a non-registry-shaped entry MUST be rejected with a diagnostic naming the identity. Section 4.9 and Section 11.3.2 Consumer enumerations and Appendix C updated. Statement count: 110 -> 111 (106 MUST, 5 SHOULD). |
 | 0.1.28  | 2026-08-06 | Spec-citation fold for per-invocation executable consent in non-interactive contexts (closes #1620 Mode-B silent-extension gate). Added [req-sc-014] (Section 10.15, consumer MUST): a consumer that supports a per-invocation consent flag for bin/ executable deployment MUST deny deployment by default when stdout is not a TTY, unless the operator has explicitly opted in for that invocation; an explicit opt-in overrides the non-interactive default and permits deployment; an explicit opt-out overrides the default and denies deployment even in a terminal; the allowExecutables policy gate [req-sc-009] is evaluated first and always takes precedence. Added row 19 to the Section 10.11 summary table. Section 11.3.2 Consumer enumeration and Appendix C updated. Statement count: 111 -> 112 (107 MUST, 5 SHOULD). |
 | 0.1.29  | 2026-08-22 | Spec-citation fold for the Agent Plugins v1 native-lifecycle deployment boundary (closes #2522 Mode-B silent-extension gate). Added [req-tg-011] (Section 8.5.5, consumer MUST): a consumer MUST treat a schema-bearing Agent Plugins v1 dependency as undeployable until it exposes a machine-verifiable native lifecycle for that dependency; before any target handler or primitive integrator runs, the consumer MUST refuse deployment with one actionable diagnostic, MUST leave the project tree unchanged, MUST NOT fall back to legacy primitive projection, and MUST reach the identical single-diagnostic outcome whether the dependency is materialized alone, mixed with ordinary dependencies in the same install, or under `--dry-run`. Section 8.7 and Appendix C updated. Statement count: 112 -> 113 (108 MUST, 5 SHOULD). |
+| 0.1.30  | 2026-08-23 | Spec-citation fold for plugin-root hook command resolution (closes #2639 Mode-B silent-extension gate). Added [req-tg-012] (Section 8.5.6, consumer MUST): a consumer that resolves plugin-root placeholders treats a matching quoted placeholder followed by an outside path separator equivalently to the fully quoted path, preserves balanced expandable quoting, and emits a default-visible diagnostic instead of silently deploying any supported placeholder that remains unresolved. Section 8.7, Section 11.3.2, and Appendix C updated. Statement count: 113 -> 114 (109 MUST, 5 SHOULD). |
 
 Errata (none at publication).
 
