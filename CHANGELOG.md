@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Generated bundle and plugin metadata now uses deterministic LF line endings,
+  keeping generated metadata byte-stable across operating systems. Existing
+  generated plugin manifests on Windows may have a one-time line-ending-only
+  diff on their next forced rewrite; project YAML files are unchanged. (#2624)
 - Lockfiles generated on Windows for marketplace-plugin / skill-subset git
   dependencies now pass `apm install --frozen` on Linux, and vice versa. APM
   writes synthetic `apm.yml` and inline-hooks `.apm/hooks/hooks.json` files

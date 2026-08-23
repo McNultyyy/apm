@@ -171,6 +171,13 @@ if [ "$agent_plugin_component_status" -ne 0 ]; then
 fi
 
 echo "[*] AC2: validate-before-mutate boundaries"
+generated_bundle_writer_output=$(python3 scripts/check_generated_bundle_text_writers.py 2>&1)
+generated_bundle_writer_status=$?
+if [ "$generated_bundle_writer_status" -ne 0 ]; then
+    echo "[x] Generated bundle metadata writes must use deterministic LF"
+    echo "$generated_bundle_writer_output"
+    violations=$((violations + 1))
+fi
 compiled_write_hits=$(
     grep -rEn \
         'write_text_lf|atomic_write_text|\.write_text\(|open\([^)]*["'\'']w' \

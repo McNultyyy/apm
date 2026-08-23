@@ -14,6 +14,21 @@ from types import ModuleType
 import pytest
 
 
+def test_generated_bundle_text_writes_are_lf_deterministic() -> None:
+    """Generated bundle text must route through the checked LF boundary."""
+    root = Path(__file__).parents[2]
+    result = subprocess.run(
+        (sys.executable, "scripts/check_generated_bundle_text_writers.py", "--root", str(root)),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "generated bundle text writers use deterministic LF" in result.stdout
+
+
 def test_removed_agent_plugin_lifecycle_tombstone_passes() -> None:
     root = Path(__file__).parents[2]
     result = subprocess.run(
