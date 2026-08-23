@@ -16,15 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Lockfile `content_hash` for marketplace-plugin / skill-subset git dependencies
-  is now identical on every OS: the synthetic `apm.yml` (and inline-hooks
-  `.apm/hooks/hooks.json`) APM writes into installed package trees is written
-  with deterministic LF line endings instead of platform-native ones, so a
-  lockfile generated on Windows no longer fails `apm install --frozen` on Linux
-  and vice versa. Lockfiles previously generated on Windows recorded the old
-  CRLF-domain hash and need a one-time refresh after upgrading: delete
-  `apm_modules/` AND `apm.lock.yaml`, then run `apm lock` and commit the
-  regenerated lockfile. (closes #2619)
+- Lockfiles generated on Windows for marketplace-plugin / skill-subset git
+  dependencies now pass `apm install --frozen` on Linux, and vice versa. APM
+  writes synthetic `apm.yml` and inline-hooks `.apm/hooks/hooks.json` files
+  with deterministic LF line endings so their `content_hash` is identical on
+  every OS. Existing Windows lockfiles may retain the old CRLF-domain hash;
+  keep the lockfile so its `resolved_commit` pins remain intact while the
+  automatic one-time repair tracked in #2628 lands. (closes #2619)
 - Windows binary is now Authenticode-signed in the release workflow, eliminating
   the `Trojan:Script/Wacatac.H!ml` Windows Defender false positive on unsigned
   PyInstaller bundles. (#2435)
