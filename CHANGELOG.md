@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `apm lock export --timestamp` now rejects malformed or timezone-naive values
+  before they enter CycloneDX or SPDX metadata. (by @manideep-malyala; fixes
+  #2659) (#2660)
 - Generated bundle and plugin metadata now uses deterministic LF line endings,
   keeping generated metadata byte-stable across operating systems. Existing
   generated plugin manifests on Windows may have a one-time line-ending-only
