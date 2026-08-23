@@ -22,12 +22,12 @@ CONTRACTS = (
     WriterContract(
         "src/apm_cli/deps/plugin_parser.py",
         "synthesize_apm_yml_from_plugin",
-        "atomic_write_text",
+        "write_text_lf",
     ),
     WriterContract(
         "src/apm_cli/deps/plugin_parser.py",
         "_map_plugin_artifacts",
-        "atomic_write_text",
+        "write_text_lf",
     ),
     WriterContract(
         "src/apm_cli/utils/yaml_io.py",

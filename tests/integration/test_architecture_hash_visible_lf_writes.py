@@ -44,7 +44,7 @@ def test_hash_visible_write_guard_rejects_platform_native_bypass(
 
     parser_path = sandbox / "src/apm_cli/deps/plugin_parser.py"
     source = parser_path.read_text(encoding="utf-8")
-    expected = "atomic_write_text(apm_yml_path, apm_yml_content)"
+    expected = "write_text_lf(apm_yml_path, apm_yml_content)"
     assert expected in source
     parser_path.write_text(
         source.replace(
@@ -64,7 +64,5 @@ def test_hash_visible_write_guard_rejects_platform_native_bypass(
     )
 
     assert result.returncode == 1
-    assert (
-        "synthesize_apm_yml_from_plugin must call atomic_write_text exactly once" in result.stdout
-    )
+    assert "synthesize_apm_yml_from_plugin must call write_text_lf exactly once" in result.stdout
     assert "bypasses canonical LF writer via write_text" in result.stdout

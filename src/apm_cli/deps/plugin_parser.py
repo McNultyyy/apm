@@ -20,7 +20,7 @@ from typing import Any
 
 import yaml
 
-from ..utils.atomic_io import atomic_write_text
+from ..utils.atomic_io import write_text_lf
 from ..utils.console import _rich_warning
 from ..utils.path_security import PathTraversalError, ensure_path_within
 
@@ -325,7 +325,7 @@ def synthesize_apm_yml_from_plugin(plugin_path: Path, manifest: dict[str, Any]) 
     # platform-native text-mode write (CRLF on Windows) would make the
     # lockfile content_hash diverge across OSes. Mirrors the #2223 fix for
     # download_virtual_file_package().
-    atomic_write_text(apm_yml_path, apm_yml_content)
+    write_text_lf(apm_yml_path, apm_yml_content)
 
     return apm_yml_path
 
@@ -875,7 +875,7 @@ def _map_plugin_artifacts(
         target_hooks = apm_dir / "hooks"
         _assert_no_symlink_descendants(target_hooks)
         target_hooks.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(target_hooks / "hooks.json", json.dumps(hooks_value, indent=2))
+        write_text_lf(target_hooks / "hooks.json", json.dumps(hooks_value, indent=2))
     elif isinstance(hooks_value, str) and (plugin_path / hooks_value).is_file():
         # Config file path (e.g. "hooks": "hooks.json")
         src_file = plugin_path / hooks_value
