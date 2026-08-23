@@ -1552,6 +1552,12 @@ if [ "$mcp_runtime_variable_owner_defs" -ne 1 ] \
     violations=$((violations + 1))
 fi
 
+echo "[*] AC34: hash-visible generated files use canonical LF writers"
+if ! python3 scripts/check_hash_visible_lf_writes.py; then
+    echo "[x] Hash-visible generated files must route through canonical LF writers"
+    violations=$((violations + 1))
+fi
+
 echo "[*] AC18: bootstrap project-name authority"
 if ! uv run --extra dev python scripts/lint-bootstrap-project-name.py; then
     echo "[x] Manifest bootstrap names must route through core/project_name.py"
