@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `apm install --frozen` no longer fails on a cold cache when git-sourced
+  `apm_package` dependencies declare MCP servers; frozen hydration now
+  succeeds as expected before any packages are fetched. (closes #2456)
 - `apm install` now accepts `--trust-bin` / `--no-trust-bin` for per-invocation
   consent over marketplace-plugin `bin/` executable deployment. `--trust-bin`
   approves deployment silently; `--no-trust-bin` skips `bin/` even when policy
