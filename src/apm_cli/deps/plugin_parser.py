@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ _logger = logging.getLogger(__name__)
 # Cap the file size first, then funnel every parse failure into a single
 # ``ValueError`` so callers fail closed with one except type.
 _MAX_PLUGIN_JSON_BYTES = 5 * 1024 * 1024
+_PLUGIN_SKILL_SOURCES_FILE = ".plugin-skill-sources.json"
 
 
 def _bounded_read_json(path: Path) -> Any:
@@ -133,6 +135,255 @@ def _is_within_plugin(candidate: Path, plugin_root: Path, *, component: str) -> 
         )
         return False
     return True
+
+
+def _has_symlink_component(candidate: Path, plugin_root: Path) -> bool:
+    """Return True when a candidate reaches its target through a symlink."""
+    try:
+        relative = candidate.relative_to(plugin_root)
+    except ValueError:
+        return True
+    current = plugin_root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _holds_skill_dirs(candidate: Path) -> bool:
+    """Return True iff *candidate* is a container of skills, not a skill itself.
+
+    A directory carrying its own ``SKILL.md`` is the skill, however deep it
+    sits in the plugin (``skills/engineering/tdd``). Anything else that has at
+    least one immediate child carrying ``SKILL.md`` is a container holding
+    them (the conventional ``skills/``). Directories matching neither shape
+    are not containers, so a declared entry keeps its own name rather than
+    spilling unrecognized contents into the shared skills root.
+    """
+    if (candidate / "SKILL.md").is_file() and not (candidate / "SKILL.md").is_symlink():
+        return False
+    try:
+        return any(
+            (child / "SKILL.md").is_file()
+            and not child.is_symlink()
+            and not (child / "SKILL.md").is_symlink()
+            for child in candidate.iterdir()
+            if child.is_dir() and not child.is_symlink()
+        )
+    except OSError:
+        return False
+
+
+def _immediate_skill_dirs(candidate: Path) -> list[Path]:
+    """Return direct non-symlink skill children in a declared container."""
+    try:
+        return sorted(
+            (
+                child
+                for child in candidate.iterdir()
+                if child.is_dir()
+                and not child.is_symlink()
+                and (child / "SKILL.md").is_file()
+                and not (child / "SKILL.md").is_symlink()
+            ),
+            key=lambda child: child.name,
+        )
+    except OSError:
+        return []
+
+
+def _map_plugin_skills(
+    plugin_path: Path,
+    apm_dir: Path,
+    manifest: dict[str, Any],
+    resolve_sources: Callable[[str, str], list[Path]],
+    is_same_path: Callable[[Path, Path], bool],
+    ignore_non_content: Callable[..., set[str]],
+) -> None:
+    """Materialize parser-authorized plugin skills and persist their receipt."""
+    skill_sources = resolve_sources("skills", "skills")
+    declared_skills = isinstance(manifest.get("skills"), (list, str))
+    normalized_skill_sources: dict[str, Path] = {}
+    duplicate_skill_names: set[str] = set()
+
+    def add_normalized_skill_source(name: str, source: Path) -> None:
+        """Keep ambiguous declared leaf names out of the deployable receipt."""
+        if name in duplicate_skill_names:
+            return
+        existing = normalized_skill_sources.get(name)
+        if existing is not None and existing != source:
+            duplicate_skill_names.add(name)
+            normalized_skill_sources.pop(name)
+            return
+        normalized_skill_sources[name] = source
+
+    target_skills = apm_dir / "skills"
+    _assert_no_symlink_descendants(target_skills)
+    skill_dirs = [source for source in skill_sources if source.is_dir()]
+    skill_files = [source for source in skill_sources if source.is_file()]
+
+    for directory in skill_dirs:
+        if declared_skills and not _holds_skill_dirs(directory):
+            if (directory / "SKILL.md").is_file() and not (directory / "SKILL.md").is_symlink():
+                add_normalized_skill_source(directory.name, directory)
+            continue
+        for child in _immediate_skill_dirs(directory):
+            add_normalized_skill_source(child.name, child)
+
+    # A declaration may change from a container to a file-only entry. Remove
+    # the parser-owned former entries before handling either source shape.
+    _remove_stale_normalized_skills(plugin_path, target_skills, normalized_skill_sources)
+
+    if skill_dirs or skill_files:
+        target_skills.mkdir(parents=True, exist_ok=True)
+    for directory in skill_dirs:
+        if declared_skills and not _holds_skill_dirs(directory):
+            dest = target_skills / directory.name
+            if not (directory / "SKILL.md").is_file():
+                _warn_skills_entry_holds_no_skill(directory, plugin_path)
+        else:
+            dest = target_skills
+        if is_same_path(directory, dest):
+            continue
+        shutil.copytree(directory, dest, dirs_exist_ok=True, ignore=ignore_non_content)
+    for source_file in skill_files:
+        destination = target_skills / source_file.name
+        if is_same_path(source_file, destination):
+            continue
+        shutil.copy2(source_file, destination)
+
+    _write_plugin_skill_sources(
+        plugin_path,
+        apm_dir,
+        normalized_skill_sources,
+        declared=declared_skills,
+    )
+
+
+def _read_plugin_skill_sources(plugin_path: Path) -> tuple[dict[str, str], bool]:
+    """Read parser-owned normalized skill sources without trusting their paths."""
+    receipt = plugin_path / ".apm" / _PLUGIN_SKILL_SOURCES_FILE
+    if not receipt.is_file() or receipt.is_symlink():
+        return {}, False
+    try:
+        data = _bounded_read_json(receipt)
+    except (OSError, ValueError):
+        return {}, False
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return {}, False
+    raw_sources = data.get("sources")
+    if not isinstance(raw_sources, dict):
+        return {}, False
+    sources = {
+        name: source
+        for name, source in raw_sources.items()
+        if isinstance(name, str)
+        and name
+        and Path(name).name == name
+        and isinstance(source, str)
+        and source
+    }
+    return sources, data.get("declared") is True
+
+
+def normalized_plugin_skill_sources(plugin_path: Path) -> tuple[dict[str, Path], bool]:
+    """Return parser-authorized normalized skill names and their byte sources.
+
+    The receipt is written only by ``_map_plugin_artifacts`` after it validates
+    declared plugin paths and materializes the matching flat ``.apm/skills``
+    entries. Consumers must not recover membership by scanning raw ``skills/``.
+    """
+    plugin_path = plugin_path.resolve()
+    raw_sources, declared = _read_plugin_skill_sources(plugin_path)
+    normalized_root = plugin_path / ".apm" / "skills"
+    resolved: dict[str, Path] = {}
+    for name, relative_source in raw_sources.items():
+        normalized = normalized_root / name
+        source = plugin_path / relative_source
+        try:
+            ensure_path_within(normalized, plugin_path)
+            ensure_path_within(source, plugin_path)
+        except PathTraversalError:
+            continue
+        if (
+            normalized.is_dir()
+            and not normalized.is_symlink()
+            and (normalized / "SKILL.md").is_file()
+            and not (normalized / "SKILL.md").is_symlink()
+            and source.is_dir()
+            and not source.is_symlink()
+            and (source / "SKILL.md").is_file()
+            and not (source / "SKILL.md").is_symlink()
+        ):
+            resolved[name] = source
+    return resolved, declared
+
+
+def _write_plugin_skill_sources(
+    plugin_path: Path,
+    apm_dir: Path,
+    sources: dict[str, Path],
+    *,
+    declared: bool,
+) -> None:
+    """Persist parser-owned membership and original byte sources for a plugin."""
+    serialized = {
+        name: source.relative_to(plugin_path).as_posix() for name, source in sorted(sources.items())
+    }
+    if apm_dir.is_symlink():
+        raise PluginIntegrityError(
+            f"Refusing to write plugin receipt through symlinked directory: {apm_dir}"
+        )
+    apm_dir.mkdir(parents=True, exist_ok=True)
+    receipt = apm_dir / _PLUGIN_SKILL_SOURCES_FILE
+    if receipt.is_symlink():
+        raise PluginIntegrityError(f"Refusing to write symlinked plugin receipt: {receipt}")
+    receipt.write_text(
+        json.dumps({"version": 1, "declared": declared, "sources": serialized}, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _remove_stale_normalized_skills(
+    plugin_path: Path,
+    target_skills: Path,
+    current_sources: dict[str, Path],
+) -> None:
+    """Remove only prior parser-generated skill entries no longer declared."""
+    previous_sources, _ = _read_plugin_skill_sources(plugin_path)
+    for name in previous_sources.keys() - current_sources.keys():
+        stale = target_skills / name
+        if stale.exists():
+            ensure_path_within(stale, plugin_path)
+            if stale.is_symlink():
+                raise PluginIntegrityError(
+                    f"Refusing to remove symlinked plugin skill destination: {stale}"
+                )
+            shutil.rmtree(stale)
+
+
+def _warn_skills_entry_holds_no_skill(entry: Path, plugin_path: Path) -> None:
+    """Warn that a declared ``skills`` entry can never yield a skill.
+
+    An entry with no ``SKILL.md`` at its root and none in any immediate child
+    is neither a skill nor a container of them: it is copied under its own
+    name, but nothing inside reaches ``.apm/skills/<name>/SKILL.md``, so it
+    stays invisible to deployment and to ``--skill``. Silence here is what
+    made #2530 expensive to diagnose -- the manifest looked wrong when only
+    the directory depth was -- so say it once, at normalization time.
+    """
+    try:
+        declared = entry.relative_to(plugin_path).as_posix()
+    except ValueError:  # pragma: no cover - entries are verified inside the plugin
+        declared = entry.name
+    _surface_warning(
+        f"Plugin skills entry '{declared}' has no SKILL.md at its root or in "
+        f"any immediate subdirectory; nothing under it will deploy or be "
+        f"selectable with --skill. Declare each skill directory, or place "
+        f"skills one level below the declared container.",
+        _logger,
+    )
 
 
 def parse_plugin_manifest(plugin_json_path: Path) -> dict[str, Any]:
@@ -724,6 +975,12 @@ def _map_plugin_artifacts(
 
     from apm_cli.security.gate import ignore_non_content
 
+    if apm_dir.is_symlink():
+        raise PluginIntegrityError(
+            f"Refusing to map plugin artifacts through symlinked destination: {apm_dir}"
+        )
+    plugin_path = plugin_path.resolve()
+
     # Resolve source paths  -- use manifest arrays if present, else defaults.
     # Custom paths may be directories OR individual files.
     #
@@ -736,35 +993,39 @@ def _map_plugin_artifacts(
     def _resolve_sources(component: str, default_dir: str):
         """Return list of existing source paths (dirs or files) for a component."""
         custom = manifest.get(component)
+        if component == "skills" and component in manifest and not isinstance(custom, (list, str)):
+            return []
         if isinstance(custom, list):
             paths = []
             for p in custom:
-                raw = str(p)
+                if not isinstance(p, str):
+                    continue
+                raw = p
                 src = plugin_path / raw
                 if (
                     src.exists()
-                    and not src.is_symlink()
+                    and not _has_symlink_component(src, plugin_path)
                     and _is_within_plugin(src, plugin_path, component=component)
                 ):
-                    paths.append(src)
+                    paths.append(src.resolve())
             return paths
         elif isinstance(custom, str):
             src = plugin_path / custom
             if (
                 src.exists()
-                and not src.is_symlink()
+                and not _has_symlink_component(src, plugin_path)
                 and _is_within_plugin(src, plugin_path, component=component)
             ):
-                return [src]
+                return [src.resolve()]
             return []
         default = plugin_path / default_dir
         if (
             default.exists()
-            and not default.is_symlink()
+            and not _has_symlink_component(default, plugin_path)
             and default.is_dir()
             and _is_within_plugin(default, plugin_path, component=component)
         ):
-            return [default]
+            return [default.resolve()]
         return []
 
     # Helper: True when *src* and *dst* resolve to the same filesystem path
@@ -799,39 +1060,14 @@ def _map_plugin_artifacts(
                     continue
                 shutil.copy2(f, dst)
 
-    # Map skills/
-    skill_sources = _resolve_sources("skills", "skills")
-    if skill_sources:
-        target_skills = apm_dir / "skills"
-        _assert_no_symlink_descendants(target_skills)
-        skill_dirs = [s for s in skill_sources if s.is_dir()]
-        skill_files = [s for s in skill_sources if s.is_file()]
-
-        is_custom_list = isinstance(manifest.get("skills"), list)
-        if is_custom_list and skill_dirs:
-            target_skills.mkdir(parents=True, exist_ok=True)
-            for d in skill_dirs:
-                nested = target_skills / d.name
-                if _is_same_path(d, nested):
-                    continue
-                shutil.copytree(
-                    d,
-                    nested,
-                    ignore=ignore_non_content,
-                    dirs_exist_ok=True,
-                )
-        elif skill_dirs:
-            for d in skill_dirs:
-                if _is_same_path(d, target_skills):
-                    continue
-                shutil.copytree(d, target_skills, dirs_exist_ok=True, ignore=ignore_non_content)
-        if skill_files:
-            target_skills.mkdir(parents=True, exist_ok=True)
-            for f in skill_files:
-                dst = target_skills / f.name
-                if _is_same_path(f, dst):
-                    continue
-                shutil.copy2(f, dst)
+    _map_plugin_skills(
+        plugin_path,
+        apm_dir,
+        manifest,
+        _resolve_sources,
+        _is_same_path,
+        ignore_non_content,
+    )
 
     # Map commands/ -> .apm/prompts/ (normalize .md -> .prompt.md)
     command_sources = _resolve_sources("commands", "commands")

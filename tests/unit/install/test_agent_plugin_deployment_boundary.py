@@ -388,9 +388,12 @@ def test_skill_integrator_direct_entry_points_reject_native_package(tmp_path: Pa
 
 
 def test_marketplace_plugin_remains_on_legacy_skill_route(tmp_path: Path) -> None:
-    normalized_skill = tmp_path / ".apm" / "skills" / "legacy"
-    normalized_skill.mkdir(parents=True)
-    (normalized_skill / "SKILL.md").write_text("legacy\n", encoding="utf-8")
+    from apm_cli.deps.plugin_parser import _map_plugin_artifacts
+
+    skill = tmp_path / "skills" / "legacy"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("legacy\n", encoding="utf-8")
+    _map_plugin_artifacts(tmp_path, tmp_path / ".apm", {"skills": ["./skills/legacy"]})
     package_info = PackageInfo(
         package=APMPackage(name="legacy", version="1.0.0"),
         install_path=tmp_path,

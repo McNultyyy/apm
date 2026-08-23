@@ -427,6 +427,11 @@ requirements:
     section: "8.5.6"
     conformance_class: consumer
     notes: "implementation-defined plugin-root placeholders preserve balanced expandable double quoting across split-quote forward- or backslash path spelling and unresolved placeholders emit a default-visible diagnostic"
+  - id: req-pr-006
+    keyword: MUST
+    section: "8.1"
+    conformance_class: consumer
+    notes: "legacy plugin skills declarations replace discovery; invalid, escaping, symlinked, and duplicate-derived entries fail closed"
   - id: req-sc-001
     keyword: MUST
     section: "10.4"

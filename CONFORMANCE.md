@@ -19,7 +19,7 @@ All four conformance classes (Producer, Consumer, Registry, Governance) carry ac
 | Class | Active | Skipped | Xfail | Unbound |
 |-------|-------:|--------:|------:|--------:|
 | Producer | 12 | 0 | 0 | 0 |
-| Consumer | 84 | 1 | 0 | 0 |
+| Consumer | 85 | 1 | 0 | 0 |
 | Registry | 1 | 0 | 0 | 0 |
 | Governance | 17 | 0 | 0 | 0 |
 
@@ -74,7 +74,7 @@ All four conformance classes (Producer, Consumer, Registry, Governance) carry ac
 | [req-mf-019](docs/src/content/docs/specs/openapm-v0.1.md#req-mf-019) | MUST | 4.2.4 | consumer | active | 1 |
 | [req-mf-020](docs/src/content/docs/specs/openapm-v0.1.md#req-mf-020) | MUST | 4.1 | consumer | active | 1 |
 | [req-mf-021](docs/src/content/docs/specs/openapm-v0.1.md#req-mf-021) | MUST | 4.8 | producer | active | 1 |
-| [req-mf-022](docs/src/content/docs/specs/openapm-v0.1.md#req-mf-022) | MUST | 4.3.2 | consumer | active | 1 |
+| [req-mf-022](docs/src/content/docs/specs/openapm-v0.1.md#req-mf-022) | MUST | 4.3.2 | consumer | active | 2 |
 | [req-mf-023](docs/src/content/docs/specs/openapm-v0.1.md#req-mf-023) | MUST | 4.5 | consumer | active | 1 |
 | [req-mf-024](docs/src/content/docs/specs/openapm-v0.1.md#req-mf-024) | MUST | 4.3.2 | consumer | active | 1 |
 | [req-pl-001](docs/src/content/docs/specs/openapm-v0.1.md#req-pl-001) | MUST | 6.1 | governance | active | 1 |
@@ -99,6 +99,7 @@ All four conformance classes (Producer, Consumer, Registry, Governance) carry ac
 | [req-pr-003](docs/src/content/docs/specs/openapm-v0.1.md#req-pr-003) | MUST | 8.3 | consumer | active | 1 |
 | [req-pr-004](docs/src/content/docs/specs/openapm-v0.1.md#req-pr-004) | MUST | 7.8 | producer | active | 10 |
 | [req-pr-005](docs/src/content/docs/specs/openapm-v0.1.md#req-pr-005) | SHOULD | 7.8 | producer | active | 1 |
+| [req-pr-006](docs/src/content/docs/specs/openapm-v0.1.md#req-pr-006) | MUST | 8.1 | consumer | active | 1 |
 | [req-rg-001](docs/src/content/docs/specs/openapm-v0.1.md#req-rg-001) | MUST | 11.3.3 | registry | active | 1 |
 | [req-rs-001](docs/src/content/docs/specs/openapm-v0.1.md#req-rs-001) | MUST | 7.2 | consumer | active | 1 |
 | [req-rs-002](docs/src/content/docs/specs/openapm-v0.1.md#req-rs-002) | MUST | 7.3 | consumer | active | 1 |

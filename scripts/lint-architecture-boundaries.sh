@@ -51,6 +51,9 @@ fi
 if ! python3 scripts/check_removed_agent_plugin_lifecycle.py --root "$ROOT"; then
     violations=$((violations + 1))
 fi
+if ! python3 scripts/check_plugin_skill_declaration_authority.py "$ROOT"; then
+    violations=$((violations + 1))
+fi
 install_wrapper_defaults=$(python3 - <<'PY'
 import ast
 from pathlib import Path

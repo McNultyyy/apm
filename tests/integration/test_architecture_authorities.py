@@ -212,6 +212,79 @@ def test_agent_plugin_contract_has_single_owner() -> None:
     )
 
 
+def test_plugin_skill_declaration_membership_has_single_owner() -> None:
+    """Legacy plugin parsing owns membership; integration only consumes it."""
+    root = Path(__file__).parents[2]
+    parser = (root / "src/apm_cli/deps/plugin_parser.py").read_text(encoding="utf-8")
+    integrator = root / "src/apm_cli/integration/skill_integrator.py"
+    guard = root / "scripts/check_plugin_skill_declaration_authority.py"
+    architecture = (root / ".github/instructions/architecture.instructions.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert parser.count("def normalized_plugin_skill_sources(") == 1
+    assert "normalized_plugin_skill_sources(package_path)" in integrator.read_text(encoding="utf-8")
+    assert "Legacy plugin declared-skill membership" in architecture
+
+    result = subprocess.run(
+        (sys.executable, str(guard), str(root)),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "old", "new"),
+    [
+        (
+            "src/apm_cli/integration/skill_integrator.py",
+            "resolved, _ = normalized_plugin_skill_sources(package_path)",
+            'resolved = {name: package_path / "skills" / name for name in ()}',
+        ),
+        (
+            "src/apm_cli/integration/skill_integrator.py",
+            "resolved, _ = normalized_plugin_skill_sources(package_path)",
+            "resolved, _ = normalized_plugin_skill_sources(package_path)\n"
+            '            root_bundle = package_path / "skills"',
+        ),
+    ],
+)
+def test_plugin_skill_declaration_owner_guard_kills_mutations(
+    tmp_path: Path,
+    relative_path: str,
+    old: str,
+    new: str,
+) -> None:
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    for path in (
+        "src/apm_cli/deps/plugin_parser.py",
+        "src/apm_cli/integration/skill_integrator.py",
+    ):
+        destination = sandbox / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / path, destination)
+    mutation_path = sandbox / relative_path
+    source = mutation_path.read_text(encoding="utf-8")
+    assert old in source
+    mutation_path.write_text(source.replace(old, new, 1), encoding="utf-8")
+
+    result = subprocess.run(
+        (
+            sys.executable,
+            str(root / "scripts/check_plugin_skill_declaration_authority.py"),
+            str(sandbox),
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "Plugin skill declaration membership" in result.stdout
+
+
 @pytest.mark.parametrize(
     ("relative_path", "old", "new"),
     [
@@ -343,6 +416,12 @@ def test_agent_plugin_component_ir_mutations_are_killed(
             "    normalize_plugin_directory(package_path, plugin_json_path)\n"
             "    result.agent_plugin = plugin",
             "Agent Plugin classification must route through its loader, not Claude normalization",
+        ),
+        (
+            "src/apm_cli/install/drift.py",
+            "if detect_agent_plugin(install_path) is not None:",
+            "if False:",
+            "Agent Plugin projection AST boundary failed",
         ),
         (
             "src/apm_cli/agent_plugins/projection.py",
@@ -652,6 +731,7 @@ def test_agent_plugin_projection_guard_rejects_bypass(
         "src/apm_cli/deps/apm_resolver.py",
         "src/apm_cli/deps/github_downloader.py",
         "src/apm_cli/deps/registry/resolver.py",
+        "src/apm_cli/install/drift.py",
         "src/apm_cli/install/services.py",
         "src/apm_cli/install/sources.py",
         "src/apm_cli/install/template.py",

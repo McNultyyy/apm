@@ -48,6 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows binary is now Authenticode-signed in the release workflow, eliminating
   the `Trojan:Script/Wacatac.H!ml` Windows Defender false positive on unsigned
   PyInstaller bundles. (#2435)
+- `apm install --skill <name>` now matches on plugins whose manifest declares
+  the conventional skills container (`"skills": ["./skills/"]`). The declared
+  container was normalized under its own name, burying every skill at
+  `.apm/skills/skills/<name>/` -- one level below the depth `--skill`
+  enumeration, deployment, the `bin/` security scan and primitive counting all
+  read, so selection reported `Available: (none)` even though a bare install
+  deployed those same skills. A declared entry that is itself a skill
+  (`"skills": "./skills/engineering/tdd"`) still lands under its own leaf name
+  instead of spilling a bare `SKILL.md` into the shared skills root.
+  (closes #2530)
 - Multi-target `apm compile` now avoids repeating expensive project analysis
   for each target, making multi-target runs scale like single-target runs
   without changing generated output. (closes #2482)
@@ -68,6 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING:** A plugin `skills` declaration now exclusively controls which
+  skills deploy. Declare every intended skill (or its immediate container), or
+  remove the key to retain conventional `skills/` discovery; undeclared
+  siblings no longer deploy. An explicit `"skills": []` deploys no skills and
+  reports one actionable migration diagnostic when it shadows root skills.
+  (closes #2537)
 - `apm install` now emits a trust-posture warning (via `[!]`) when a marketplace
   plugin deploys executables to Claude Code's PATH without an explicit `--trust-bin`
   flag. In non-interactive (non-TTY) contexts the default is `--no-trust-bin`.

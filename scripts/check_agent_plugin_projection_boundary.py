@@ -378,8 +378,7 @@ def check(root: Path) -> list[str]:  # noqa: C901, PLR0912, PLR0915
         "preflight_agent_plugin_materializations",
     )
     if len(batch_preflight_defs) != 1 or (
-        "enforce_agent_plugin_deployment_boundary"
-        not in _function_calls(batch_preflight_defs[0])
+        "enforce_agent_plugin_deployment_boundary" not in _function_calls(batch_preflight_defs[0])
     ):
         violations.append(
             f"{template_path}: native batch preflight must use the deployment boundary owner"
@@ -473,15 +472,9 @@ def check(root: Path) -> list[str]:  # noqa: C901, PLR0912, PLR0915
             for node in ast.walk(install_helpers[0])
             if isinstance(node, ast.Call)
         ]
-        dry_run_gates = [
-            line for name, line in calls if name == "preflight_agent_plugin_dry_run"
-        ]
+        dry_run_gates = [line for name, line in calls if name == "preflight_agent_plugin_dry_run"]
         dry_run_exits = [line for name, line in calls if name == "render_and_exit"]
-        if (
-            len(dry_run_gates) != 1
-            or not dry_run_exits
-            or dry_run_gates[0] >= min(dry_run_exits)
-        ):
+        if len(dry_run_gates) != 1 or not dry_run_exits or dry_run_gates[0] >= min(dry_run_exits):
             violations.append(
                 f"{install_command_path}: dry-run native preflight must run before "
                 "rendering success"
@@ -496,8 +489,7 @@ def check(root: Path) -> list[str]:  # noqa: C901, PLR0912, PLR0915
             typed_handlers = [
                 handler
                 for handler in node.handlers
-                if isinstance(handler.type, ast.Name)
-                and handler.type.id == "AgentPluginError"
+                if isinstance(handler.type, ast.Name) and handler.type.id == "AgentPluginError"
             ]
             generic_handlers = [
                 handler
@@ -916,10 +908,15 @@ def check(root: Path) -> list[str]:  # noqa: C901, PLR0912, PLR0915
         relative = path.relative_to(root).as_posix()
         for function in _functions(tree):
             calls = _function_calls(function)
-            if "normalize_plugin_directory" in calls and not (
+            legacy_normalization_owner = (
                 relative == "src/apm_cli/models/validation.py"
                 and function.name == "_validate_marketplace_plugin"
-            ):
+            ) or (
+                relative == "src/apm_cli/install/drift.py"
+                and function.name == "_normalize_legacy_local_plugin_for_replay"
+                and "detect_agent_plugin" in calls
+            )
+            if "normalize_plugin_directory" in calls and not legacy_normalization_owner:
                 violations.append(
                     f"{relative}:{function.lineno}: Claude normalization call outside "
                     "_validate_marketplace_plugin"

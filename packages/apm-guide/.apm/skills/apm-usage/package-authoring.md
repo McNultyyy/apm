@@ -523,6 +523,12 @@ for the portable format.
 
 When `apm.yml` declares `target: claude` or `target: copilot` (or the plural `targets:` equivalent), `apm pack` also generates an ecosystem-specific `plugin.json` automatically -- authors no longer need to maintain this file manually. The manifest is synthesised from `apm.yml` identity fields (`name`, `version`, `description`, `author`, `license`). See the apm pack reference (reference/cli/pack/#plugin-manifests) for output paths, credential stripping, and per-ecosystem differences, or run `apm pack --help`.
 
+When a marketplace `plugin.json` declares `skills`, that declaration is the
+complete deploy list: declare each skill directory or an immediate container.
+An omitted key discovers root `skills/`; an explicit `[]` deploys none. If APM
+reports `plugin.json declares no deployable skills`, add the intended paths or
+remove the key to restore discovery.
+
 #### Shipping `bin/` executables (Claude Code only)
 
 A marketplace plugin may ship a root `bin/` directory of executable

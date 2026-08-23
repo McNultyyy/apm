@@ -163,7 +163,6 @@ if [ -f "$agent_plugin_owner" ]; then
         echo "[x] Agent Plugin classification must route through its loader, not Claude normalization"
         exit 1
     fi
-
     for ingress_requirement in \
         "$repo_root/src/apm_cli/install/sources.py:4" \
         "$repo_root/src/apm_cli/install/template.py:2" \
@@ -224,6 +223,7 @@ if [ -f "$agent_plugin_owner" ]; then
             "$repo_root/src/apm_cli" \
             | grep -v '/src/apm_cli/deps/plugin_parser.py:.*def normalize_plugin_directory(' \
             | grep -v '/src/apm_cli/models/validation.py:' \
+            | grep -v '/src/apm_cli/install/drift.py:' \
             || true
     )
     raw_agent_package_construction=$(

@@ -73,7 +73,8 @@ Steps APM runs:
 3. **Verify integrity.** Hash every file listed in `pack.bundle_files`;
    reject any symlink, hash mismatch, or unlisted file.
 4. **Deploy.** Map `agents/`, `skills/`, `commands/`, `hooks/` into the
-   harness layout for each `--target` you passed.
+   harness layout for each `--target` you passed. For plugin skill declaration
+   precedence, see [Package Types](../../reference/package-types/#plugin-collection-pluginjson).
 5. **Record.** Write a lockfile entry under the project's `apm.lock.yaml`
    so [drift detection](../drift-and-secure-by-default/) can audit the
    deployed files later.
