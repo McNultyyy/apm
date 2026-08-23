@@ -2030,6 +2030,50 @@ def _load_skill_subset_owner_checker() -> ModuleType:
     return module
 
 
+def _load_agents_source_attribution_owner_checker(root: Path) -> ModuleType:
+    """Import the AGENTS.md attribution authority checker as a module."""
+    module_name = "check_agents_source_attribution_owner"
+    script_path = root / "scripts" / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(module_name, script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_agents_source_attribution_uses_the_canonical_config_boolean() -> None:
+    """AGENTS.md cosmetics must not derive their flag from the source map."""
+    root = Path(__file__).parents[2]
+    checker = _load_agents_source_attribution_owner_checker(root)
+    compiler = root / "src/apm_cli/compilation/distributed_compiler.py"
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
+
+    assert checker.find_violations(compiler) == []
+    assert "AGENTS.md cosmetics must use the canonical source_attribution config boolean" in guard
+
+
+def test_agents_source_attribution_guard_rejects_placement_source_map(tmp_path: Path) -> None:
+    """The authority guard rejects restoring the source-map/config conflation."""
+    root = Path(__file__).parents[2]
+    checker = _load_agents_source_attribution_owner_checker(root)
+    compiler = root / "src/apm_cli/compilation/distributed_compiler.py"
+    mutated = tmp_path / "distributed_compiler.py"
+    mutated.write_text(
+        compiler.read_text(encoding="utf-8").replace(
+            "source_attribution=source_attribution,",
+            "source_attribution=p.source_attribution,",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    assert checker.find_violations(mutated) == [
+        f"{mutated}: compile_distributed must pass source_attribution=source_attribution to "
+        "_generate_agents_content, not the placement source map"
+    ]
+
+
 def _load_windows_stable_path_checker(root: Path) -> ModuleType:
     """Import scripts/check_windows_stable_path_owner.py as a module.
 
