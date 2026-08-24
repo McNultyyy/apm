@@ -251,6 +251,25 @@ class TestLoadYamlRoundtrip:
         assert "# deps note" in rendered
         assert "github:owner/new-skill@v1" in rendered
 
+    @pytest.mark.windows_compat
+    def test_dump_roundtrip_writes_deterministic_lf(self, tmp_path):
+        """Rewrites land as LF bytes on every OS -- no CRLF flip-flop (apm#2624).
+
+        Project-file rewrite paths (install / uninstall / package
+        resolution) previously wrote platform-native newlines here while
+        other commands wrote LF, so a Windows apm.yml alternated line
+        endings between consecutive commands and churned git diffs.
+        """
+        p = tmp_path / "apm.yml"
+        p.write_bytes(b"# note\r\nname: demo\r\ndependencies: []\r\n")
+
+        data = load_yaml_roundtrip(p)
+        dump_yaml_roundtrip(data, p)
+
+        raw = p.read_bytes()
+        assert b"\r" not in raw
+        assert b"# note\n" in raw
+
     def test_alias_expansion_bomb_fails_closed(self, tmp_path):
         """The round-trip path keeps the bounded-loader expansion guard."""
         p = tmp_path / "apm.yml"
@@ -386,6 +405,18 @@ class TestWriteYamlTextAtomic:
         target.write_text("old: 1\n", encoding="utf-8")
         write_yaml_text_atomic(target, "new: 2\n")
         assert target.read_text(encoding="utf-8") == "new: 2\n"
+
+    @pytest.mark.windows_compat
+    def test_atomic_write_is_lf_deterministic(self, tmp_path):
+        """On-disk bytes are LF regardless of platform or input domain (apm#2624)."""
+        from apm_cli.utils.yaml_io import write_yaml_text_atomic
+
+        target = tmp_path / "out.yml"
+        write_yaml_text_atomic(target, "a: 1\nb: 2\n")
+        assert target.read_bytes() == b"a: 1\nb: 2\n"
+
+        write_yaml_text_atomic(target, "a: 1\r\nb: 2\r\n")
+        assert target.read_bytes() == b"a: 1\nb: 2\n"
 
     def test_atomic_write_leaves_original_on_replace_failure(self, tmp_path, monkeypatch):
         """If os.replace fails, the original file is untouched and temp cleaned."""

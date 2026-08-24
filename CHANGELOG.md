@@ -110,6 +110,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside #2707's scope. (by @MohammedAlkindi, closes #2707, #2710)
 
 ## [0.29.0] - 2026-08-30
+### Fixed
+
+- Project YAML writers now use deterministic LF line endings: rewriting
+  `apm.yml` (install, uninstall, dependency resolution) and the revision-pin
+  update path no longer flip-flops a Windows file's line endings between
+  consecutive commands, ending the resulting git diff churn. A Windows
+  `apm.yml` already in the CRLF domain has a one-time line-ending-only diff
+  on its next rewrite. (closes #2624; group 1 landed in #2638)
+
+## [0.29.0] - 2026-08-26
 
 ### Added
 

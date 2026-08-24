@@ -408,15 +408,24 @@ def load_yaml_roundtrip(path: str | Path) -> Any:
 
 
 def dump_yaml_roundtrip(data: Any, path: str | Path) -> None:
-    """Write ruamel round-trip YAML data with explicit UTF-8 encoding."""
+    """Write ruamel round-trip YAML data with explicit UTF-8 encoding.
+
+    Deterministic LF line endings (apm#2624): the project-file rewrite
+    paths that use this (install / uninstall / package-resolution
+    rewriting ``apm.yml``) previously wrote platform-native newlines, so
+    on Windows the file flip-flopped between CRLF and LF depending on
+    which command last touched it, churning git diffs. Windows files
+    already in the CRLF domain incur a one-time line-ending-only diff on
+    their next rewrite.
+    """
+    from .atomic_io import write_text_lf
+
     stream = StringIO()
     try:
         _roundtrip_yaml().dump(data, stream)
     except Exception as exc:
         _raise_as_pyyaml_error(exc)
-    text = stream.getvalue()
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    write_text_lf(Path(path), stream.getvalue())
 
 
 class _BoundedYAMLHandler(_FrontmatterYAMLHandler):
@@ -570,7 +579,14 @@ def write_yaml_text_atomic(
     The replacement is written to a sibling file first and then moved into
     place with ``os.replace``. If the write or replace fails, the original
     file remains untouched.
+
+    Deterministic LF line endings (apm#2624): ``newline=""`` disables the
+    platform newline translation and the content is CRLF-normalized, so
+    the on-disk bytes are identical on every OS instead of following the
+    writing platform.
     """
+    from .atomic_io import normalize_crlf_to_lf
+
     target = Path(path)
     tmp_path: Path | None = None
     try:
@@ -585,8 +601,8 @@ def write_yaml_text_atomic(
             break
         else:
             raise FileExistsError(f"Could not create a unique temp file for {target}")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(normalize_crlf_to_lf(content))
         os.replace(tmp_path, target)
         tmp_path = None
     except Exception:
