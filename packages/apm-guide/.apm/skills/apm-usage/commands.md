@@ -111,12 +111,17 @@ writes only `.vscode/mcp.json`.
 
 | Command | Purpose | Key flags |
 |---------|---------|-----------|
-| `apm compile` | Compile agent context; after a successful write, reconcile deployed artifacts, lockfile ownership, and merge-hook config/sidecar entries when the declared target set contracts | `-o` output, `-t` target (comma-separated; resolution chain `--target` > apm.yml `targets:` > auto-detect), `--all` compile for every canonical target (preferred over deprecated `--target all`), `-g`/`--global` (read global instructions from `~/.apm/apm_modules/`, write user-scope root files; cannot combine with project-output flags such as `--target`, `--all`, `--watch`, `--root`, or `--output`; critical hidden-character findings stop the write and exit 1), `--chatmode`, `--dry-run`, `--no-links`, `--watch`, `--validate`, `--single-agents`, `-v` verbose, `--local-only`, `--clean`, `--with-constitution/--no-constitution`, `--force-instructions` / `--no-dedup` (opt out of Claude/Copilot deduplication), `--root DIR` redirect generated artifacts under DIR while sources resolve from `$PWD` (mirrors `pip install --target`; not valid with `--watch`) |
+| `apm compile` | Compile agent context; after a successful write, reconcile deployed artifacts, lockfile ownership, and merge-hook config/sidecar entries when the declared target set contracts | `-o` output, `-t` target (comma-separated; resolution chain `--target` > apm.yml `targets:` > auto-detect), `--all` compile for every canonical target (preferred over deprecated `--target all`), `-g`/`--global` (read global instructions from `~/.apm/apm_modules/`, write user-scope root files; OpenCode also retains its `applyTo` sections in `~/.config/opencode/AGENTS.md`; cannot combine with project-output flags such as `--target`, `--all`, `--watch`, `--root`, or `--output`; critical hidden-character findings stop the write and exit 1), `--chatmode`, `--dry-run`, `--no-links`, `--watch`, `--validate`, `--single-agents`, `-v` verbose, `--local-only`, `--clean`, `--with-constitution/--no-constitution`, `--force-instructions` / `--no-dedup` (opt out of Claude/Copilot deduplication), `--root DIR` redirect generated artifacts under DIR while sources resolve from `$PWD` (mirrors `pip install --target`; not valid with `--watch`) |
 
 `apm install` deploys individual primitives but does not generate aggregate
 root context files. Run `apm compile` explicitly for `AGENTS.md`, `CLAUDE.md`,
 or `GEMINI.md`; `apm run` separately compiles referenced prompt files at
 execution time.
+
+For OpenCode user scope, first create or open an OpenCode config directory.
+Then run `apm install -g --target opencode` to deploy skills to
+`~/.config/opencode/skills/`, followed by `apm compile -g` to update
+`~/.config/opencode/AGENTS.md` with scoped instruction sections.
 
 After a project install stages dependency instructions for Gemini, Codex,
 OpenCode, or experimental Hermes, `apm install` prints an `[i]` hint naming

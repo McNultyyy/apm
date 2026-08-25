@@ -123,6 +123,14 @@ check_pattern \
     'name == "copilot-(app|cowork)"|name in \{.*copilot-(app|cowork)' \
     src/apm_cli/install/deployed_paths.py \
     src/apm_cli/install/manifest_reconcile.py
+user_root_context_owner="src/apm_cli/integration/targets.py"
+user_root_context_consumer="src/apm_cli/compilation/user_root_context.py"
+if ! grep -q 'include_scoped_in_user_root_context: bool = False' "$user_root_context_owner" \
+    || ! grep -q 'scoped.include_scoped_in_user_root_context' "$user_root_context_consumer" \
+    || grep -Eq 'scoped\.name[[:space:]]*==[[:space:]]*["'\'']opencode["'\'']' "$user_root_context_consumer"; then
+    echo "[x] User-root scoped instruction eligibility must come from TargetProfile metadata"
+    violations=$((violations + 1))
+fi
 experimental_hint_owner="src/apm_cli/install/target_hints.py"
 experimental_hint_definition_count=$(grep -Ec \
     '^def emit_disabled_experimental_target_hint\(' "$experimental_hint_owner" || true)

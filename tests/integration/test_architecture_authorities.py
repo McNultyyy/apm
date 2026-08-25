@@ -782,6 +782,43 @@ def test_policy_cache_metadata_redaction_has_single_owner() -> None:
     assert "Policy cache metadata must redact URL credentials at its canonical writer" in guard
 
 
+def test_user_root_scoped_instruction_eligibility_has_single_owner(tmp_path: Path) -> None:
+    """Profile metadata, not a target-name branch, owns root-context eligibility."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git", ".venv", ".pytest_cache", "__pycache__", "build", "dist", "node_modules"
+        ),
+    )
+    consumer = sandbox / "src/apm_cli/compilation/user_root_context.py"
+    consumer.write_text(
+        consumer.read_text(encoding="utf-8").replace(
+            "preserve_scoped_sections = scoped.include_scoped_in_user_root_context",
+            'preserve_scoped_sections = scoped.name == "opencode"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert (
+        "User-root scoped instruction eligibility must come from TargetProfile metadata"
+        in result.stdout
+    )
+
+
 @pytest.mark.parametrize(
     ("guard", "replacement"),
     [
