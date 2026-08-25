@@ -949,7 +949,7 @@ When `sourceBase` is set, relative package sources compose onto that base. For e
 
 A relative `source` may use arbitrary path depth. A value whose leading segments form a host-prefixed shape (`<host.tld>/<owner>/<repo>`) or a full `https://` URL is always treated as a per-entry override and ignores `sourceBase`. A value that looks like it is trying to name a host (a dotted, FQDN-like first segment) but does **not** form a valid override shape is rejected at parse time rather than silently composed onto the base -- this avoids a confused-deputy footgun. To target a different host, use an explicit host-prefixed override or a full `https://` URL instead of a relative source.
 
-`sourceBase` must start with `https://`, use a FQDN host, include at least one path segment, and omit userinfo, ports, query strings, fragments, and a trailing `.git`. Each path segment uses letters, digits, `.`, `_`, or `-`; empty, `.` and `..` segments are refused.
+`sourceBase` must start with `https://`, use a FQDN host, include at least one path segment, and omit userinfo, ports, query strings, fragments, and a trailing `.git`. Path segments may percent-encode UTF-8 bytes, such as `My%20Projects`. Empty, `.`, `..`, malformed escapes, encoded separators, and recursive encodings are refused. Full HTTPS `packages[].source` paths follow the same safe percent-encoding rules. APM keeps the encoded URL in generated output while using decoded ADO coordinates for repository and authentication lookup.
 
 Non-default hosts -- GitHub Enterprise, self-hosted GitLab, and Azure DevOps
 -- authenticate via the standard APM token chain -- see the

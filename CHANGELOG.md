@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Marketplace `sourceBase` and full HTTPS repository paths now preserve safe
+  percent-encoded segments, enabling Azure DevOps project names such as
+  `My%20Projects`. (by @aryansk; fixes #2554) (#2584)
 - `apm lock export --timestamp` now rejects malformed or timezone-naive values
   before they enter CycloneDX or SPDX metadata. (by @manideep-malyala; fixes
   #2659) (#2660)

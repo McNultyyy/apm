@@ -869,6 +869,48 @@ if ! printf '%s\n' "$packed_source_body" \
     violations=$((violations + 1))
 fi
 
+marketplace_check_coordinates_body=$(awk '
+    /^def _entry_coordinates\(/ {flag=1}
+    flag && /^def / && !/^def _entry_coordinates\(/ {exit}
+    flag {print}
+' src/apm_cli/commands/marketplace/check.py)
+marketplace_check_parallel_parser_hits=$(printf '%s\n' "$marketplace_check_coordinates_body" \
+    | grep -En 'split_source_base\(|decode_url_path_segments\(|urlparse\(' \
+    | grep -v 'architecture-authority-exempt:' || true)
+if ! printf '%s\n' "$marketplace_check_coordinates_body" \
+        | grep -Fq 'DependencyReference.parse(entry.source_url)' \
+    || ! printf '%s\n' "$marketplace_check_coordinates_body" \
+        | grep -Fq 'DependencyReference.parse(source_url)' \
+    || [ -n "$marketplace_check_parallel_parser_hits" ]; then
+    echo "[x] Marketplace check source coordinates must use DependencyReference parsing"
+    [ -n "$marketplace_check_parallel_parser_hits" ] && echo "$marketplace_check_parallel_parser_hits"
+    violations=$((violations + 1))
+fi
+
+echo "[*] AC10a: strict URL-path decoding authority"
+url_path_owner="src/apm_cli/utils/path_security.py"
+url_path_parallel_decoders=$(
+    grep -REn --include='*.py' 'unquote(_to_bytes)?\(' \
+        src/apm_cli/marketplace/yml_schema.py \
+        src/apm_cli/models/dependency/reference.py \
+        src/apm_cli/commands/marketplace/__init__.py \
+        | grep -v 'architecture-authority-exempt:' || true
+)
+if ! grep -Fq 'def parse_url_path_segments(' "$url_path_owner" \
+    || ! grep -Fq 'decode_url_path_segments(parsed.path, context=context)' \
+        src/apm_cli/marketplace/yml_schema.py \
+    || ! grep -Fq 'decode_url_path_segments(parsed.path, context="sourceBase")' \
+        src/apm_cli/marketplace/yml_schema.py \
+    || ! grep -Fq 'parse_url_path_segments(' \
+        src/apm_cli/models/dependency/reference.py \
+    || ! grep -Fq 'decode_url_path_segments(parsed.path, context="marketplace URL path")' \
+        src/apm_cli/commands/marketplace/__init__.py \
+    || [ -n "$url_path_parallel_decoders" ]; then
+    echo "[x] Strict percent-encoded URL paths must use path_security parsing"
+    [ -n "$url_path_parallel_decoders" ] && echo "$url_path_parallel_decoders"
+    violations=$((violations + 1))
+fi
+
 echo "[*] AC10b: local marketplace audit resolution authority"
 if ! grep -Fq 'resolve_local_plugin_path(' src/apm_cli/marketplace/audit.py \
     || grep -Fq '_resolve_local_relative_source' src/apm_cli/marketplace/audit.py \

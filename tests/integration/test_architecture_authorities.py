@@ -1617,6 +1617,115 @@ def test_packed_marketplace_source_parsing_has_single_owner() -> None:
     assert "Packed marketplace sources must use DependencyReference.parse_from_dict" in guard
 
 
+def test_marketplace_check_source_coordinates_use_single_parser() -> None:
+    """Marketplace check source coordinates must use DependencyReference."""
+    root = Path(__file__).parents[2]
+    check = (root / "src/apm_cli/commands/marketplace/check.py").read_text(encoding="utf-8")
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
+
+    helper = check.split("def _entry_coordinates(", maxsplit=1)[1].split("\ndef ", maxsplit=1)[0]
+    assert "DependencyReference.parse(entry.source_url)" in helper
+    assert "DependencyReference.parse(source_url)" in helper
+    assert "Marketplace check source coordinates must use DependencyReference parsing" in guard
+
+
+def test_marketplace_check_coordinate_guard_rejects_parallel_parser(tmp_path: Path) -> None:
+    """AC10 rejects sourceBase parsing that bypasses DependencyReference."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    check_path = sandbox / "src/apm_cli/commands/marketplace/check.py"
+    check_path.write_text(
+        check_path.read_text(encoding="utf-8").replace(
+            "dependency = DependencyReference.parse(source_url)",
+            "dependency = DependencyReference(repo_url=entry.source)",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Marketplace check source coordinates must use DependencyReference parsing" in (
+        result.stdout
+    )
+
+
+def test_strict_url_path_decoding_has_single_owner() -> None:
+    """AC10a keeps URL structure parsing separate from percent decoding."""
+    root = Path(__file__).parents[2]
+    owner = (root / "src/apm_cli/utils/path_security.py").read_text(encoding="utf-8")
+    schema = (root / "src/apm_cli/marketplace/yml_schema.py").read_text(encoding="utf-8")
+    reference = (root / "src/apm_cli/models/dependency/reference.py").read_text(encoding="utf-8")
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
+
+    assert "def parse_url_path_segments(" in owner
+    assert "decode_url_path_segments(parsed.path, context=context)" in schema
+    assert "parse_url_path_segments(" in reference
+    assert "dependency_str = urllib.parse.unquote(dependency_str)" not in reference
+    assert "Strict percent-encoded URL paths must use path_security parsing" in guard
+
+
+def test_strict_url_path_decoder_guard_rejects_parallel_decoder(tmp_path: Path) -> None:
+    """AC10a catches a mutation that reintroduces a local URL decoder."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    schema_path = sandbox / "src/apm_cli/marketplace/yml_schema.py"
+    schema_path.write_text(
+        schema_path.read_text(encoding="utf-8").replace(
+            "decode_url_path_segments(parsed.path, context=context)",
+            "_urlparse.unquote(parsed.path)",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Strict percent-encoded URL paths must use path_security parsing" in (result.stdout)
+
+
 def test_packed_marketplace_source_owner_guard_rejects_parallel_parser(
     tmp_path: Path,
 ) -> None:
