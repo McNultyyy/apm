@@ -59,6 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (by @MohammedAlkindi; closes #2639) (#2645)
 - `apm install` now resolves positional virtual-subdirectory git semver ranges before literal-ref preflight, while preserving registry version validation. (by @aryansk; closes #2514) (#2590)
 - `apm uninstall --global` now cleans removed-only target files before deleting their ownership state, while preserving files owned by surviving packages. (#2658)
+
+### Fixed
+
+- GitLab (gitlab.com and self-managed) org-policy auto-discovery now uses the valid `apm-policy` project convention instead of GitHub/ADO candidate names; missing policy projects are clean no-policy outcomes, and `APM_GITLAB_POLICY_REPO` overrides the project name. (#2605)
 - Windows binary is now Authenticode-signed in the release workflow, eliminating
   the `Trojan:Script/Wacatac.H!ml` Windows Defender false positive on unsigned
   PyInstaller bundles. (#2435)

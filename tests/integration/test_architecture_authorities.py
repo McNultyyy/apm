@@ -969,6 +969,151 @@ def test_user_root_scoped_instruction_eligibility_has_single_owner(tmp_path: Pat
     )
 
 
+def test_gitlab_policy_discovery_routes_through_private_adapter() -> None:
+    """GitLab policy transport must not bypass the discovery facade's adapter."""
+    root = Path(__file__).parents[2]
+    facade = (root / "src/apm_cli/policy/discovery.py").read_text(encoding="utf-8")
+    adapter = (root / "src/apm_cli/policy/_gitlab.py").read_text(encoding="utf-8")
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
+
+    assert facade.count("_gitlab._fetch_from_gitlab_repo(") == 1
+    assert facade.count("_gitlab._fetch_gitlab_chain_parent(") == 1
+    assert adapter.count("def _fetch_from_gitlab_repo(") == 1
+    assert adapter.count("def _fetch_gitlab_contents(") == 1
+    assert adapter.count("def _gitlab_project_state_via_git(") == 1
+    assert adapter.count("def _fetch_gitlab_chain_parent(") == 1
+    assert "GitLab policy discovery must route through policy/_gitlab.py" in guard
+    assert "GitLab policy cache and transport must remain in policy/_gitlab.py" in guard
+
+
+def test_gitlab_policy_adapter_guard_rejects_facade_bypass(tmp_path: Path) -> None:
+    """The boundary guard rejects removing the GitLab inheritance adapter call."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    facade_path = sandbox / "src/apm_cli/policy/discovery.py"
+    facade_path.write_text(
+        facade_path.read_text(encoding="utf-8").replace(
+            "_gitlab._fetch_from_gitlab_repo(",
+            "_fetch_from_repo(",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "GitLab policy discovery must route through policy/_gitlab.py" in result.stdout
+
+
+def test_gitlab_policy_adapter_guard_rejects_facade_cache_orchestration(tmp_path: Path) -> None:
+    """The facade cannot add GitLab cache work beside the private adapter."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    facade_path = sandbox / "src/apm_cli/policy/discovery.py"
+    marker = "        elif is_gitlab_hostname(host):\n"
+    facade_path.write_text(
+        facade_path.read_text(encoding="utf-8").replace(
+            marker,
+            f"{marker}            _read_cache_entry('gitlab-cache', project_root)\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "GitLab policy cache and transport must remain in policy/_gitlab.py" in result.stdout
+
+
+def test_gitlab_policy_adapter_guard_survives_nested_facade_else(tmp_path: Path) -> None:
+    """A nested branch cannot hide facade-side GitLab cache orchestration."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    facade_path = sandbox / "src/apm_cli/policy/discovery.py"
+    marker = "        elif is_gitlab_hostname(host):\n"
+    facade_path.write_text(
+        facade_path.read_text(encoding="utf-8").replace(
+            marker,
+            (
+                f"{marker}            if True:\n"
+                "                pass\n"
+                "            else:\n"
+                "                pass\n"
+                "            _read_cache_entry('gitlab-cache', project_root)\n"
+            ),
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "GitLab policy cache and transport must remain in policy/_gitlab.py" in result.stdout
+
+
 @pytest.mark.parametrize(
     ("guard", "replacement"),
     [
@@ -3354,7 +3499,8 @@ def test_policy_cache_serializer_boundary_is_registered() -> None:
     root = Path(__file__).parents[2]
     guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
     owner_row = (
-        "| Cached policy shape | policy/discovery.py (_policy_to_dict via _serialize_policy) |"
+        "| Cached policy shape | policy/discovery.py "
+        "(_policy_to_dict via _serialize_policy; ADO_POLICY_PROJECT; ADO_POLICY_REPOSITORY) |"
     )
     assert ("Cached policy shape must route through policy/discovery.py::_policy_to_dict") in guard
     for token in ("_policy_to_dict", "_serialize_policy", "_write_cache"):
@@ -3490,7 +3636,8 @@ def test_windows_owner_row_stays_synced_source_deployed_and_lockfile() -> None:
 
     owner_rows = (
         "| Windows stable executable path | install.ps1 ($currentDir / $currentExe) |",
-        "| Cached policy shape | policy/discovery.py (_policy_to_dict via _serialize_policy) |",
+        "| Cached policy shape | policy/discovery.py "
+        "(_policy_to_dict via _serialize_policy; ADO_POLICY_PROJECT; ADO_POLICY_REPOSITORY) |",
     )
     source_text = source.read_text(encoding="utf-8")
     for owner_row in owner_rows:

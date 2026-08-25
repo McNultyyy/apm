@@ -445,6 +445,47 @@ if [ "$policy_named_defs" -ne 2 ] \
     [ -n "$policy_duplicate_hits" ] && echo "$policy_duplicate_hits"
     violations=$((violations + 1))
 fi
+gitlab_policy_adapter="src/apm_cli/policy/_gitlab.py"
+gitlab_adapter_definition_count=$(grep -Ec \
+    '^def (_fetch_from_gitlab_repo|_fetch_gitlab_contents|_gitlab_project_state_via_git|_fetch_gitlab_chain_parent)\(' \
+    "$gitlab_policy_adapter" || true)
+gitlab_adapter_duplicate_hits=$(
+    grep -rEn --include='*.py' \
+        '^def (_fetch_from_gitlab_repo|_fetch_gitlab_contents|_gitlab_project_state_via_git|_fetch_gitlab_chain_parent)\(' \
+        src/apm_cli/policy \
+        | grep -v "^${gitlab_policy_adapter}:" \
+        | grep -v 'architecture-authority-exempt:' \
+        || true
+)
+gitlab_facade_call_count=$(grep -Ec \
+    '_gitlab\._fetch_(from_gitlab_repo|gitlab_chain_parent)\(' \
+    "$policy_file" || true)
+if [ "$gitlab_adapter_definition_count" -ne 4 ] \
+    || [ -n "$gitlab_adapter_duplicate_hits" ] \
+    || [ "$gitlab_facade_call_count" -ne 2 ]; then
+    echo "[x] GitLab policy discovery must route through policy/_gitlab.py"
+    [ -n "$gitlab_adapter_duplicate_hits" ] && echo "$gitlab_adapter_duplicate_hits"
+    violations=$((violations + 1))
+fi
+gitlab_facade_branch=$(awk '
+    /^[[:space:]]*elif is_gitlab_hostname\(host\):/ {
+        capture=1
+        branch_indent=match($0, /[^[:space:]]/) - 1
+        next
+    }
+    capture && /^[[:space:]]*else:/ && match($0, /[^[:space:]]/) - 1 == branch_indent {exit}
+    capture {print}
+' "$policy_file")
+gitlab_facade_orchestration_hits=$(
+    printf '%s\n' "$gitlab_facade_branch" \
+        | grep -E '(_read_cache_entry|_write_cache|requests\.|AuthResolver|subprocess\.run|_fetch_gitlab_contents|_gitlab_project_state_via_git)' \
+        || true
+)
+if [ -n "$gitlab_facade_orchestration_hits" ]; then
+    echo "[x] GitLab policy cache and transport must remain in policy/_gitlab.py"
+    echo "$gitlab_facade_orchestration_hits"
+    violations=$((violations + 1))
+fi
 local_bundle_handler="src/apm_cli/install/local_bundle_handler.py"
 if ! grep -q \
     'from ..policy.install_preflight import run_policy_preflight' \
