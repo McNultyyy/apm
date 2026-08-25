@@ -432,6 +432,11 @@ requirements:
     section: "8.1"
     conformance_class: consumer
     notes: "legacy plugin skills declarations replace discovery; invalid, escaping, symlinked, and duplicate-derived entries fail closed"
+  - id: req-pr-007
+    keyword: MUST
+    section: "8.1"
+    conformance_class: consumer
+    notes: "declared Plugin component copying canonicalizes its non-symlink source root and prunes the current operation's materialization subtree"
   - id: req-sc-001
     keyword: MUST
     section: "10.4"
