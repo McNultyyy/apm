@@ -1201,6 +1201,20 @@
     },
     {
       "conformance_class": "consumer",
+      "id": "req-sc-015",
+      "keyword": "MUST",
+      "oracle": "tests/fixtures/spec-conformance/source-plan/req-sc-015.json",
+      "section": "10.16",
+      "status": "active",
+      "test_count": 3,
+      "tests": [
+        "tests/spec_conformance/test_manifest_reqs.py::test_authorized_source_plan_fixture_oracle_covers_symlinked_content",
+        "tests/spec_conformance/test_manifest_reqs.py::test_authorized_source_plan_limits_scanning_and_skill_materialization",
+        "tests/spec_conformance/test_manifest_reqs.py::test_authorized_source_plan_requirement_covers_reintegration_and_symlinks"
+      ]
+    },
+    {
+      "conformance_class": "consumer",
       "id": "req-tg-001",
       "keyword": "MUST",
       "section": "8.4",
@@ -1336,7 +1350,7 @@
   "spec_version": "v0.1.1",
   "summary_by_class": {
     "consumer": {
-      "active": 86,
+      "active": 87,
       "skipped": 1,
       "unbound": 0,
       "xfail": 0
@@ -1360,5 +1374,5 @@
       "xfail": 0
     }
   },
-  "total_requirements": 117
+  "total_requirements": 118
 }

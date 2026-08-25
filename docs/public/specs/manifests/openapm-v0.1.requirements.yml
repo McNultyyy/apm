@@ -495,6 +495,12 @@ requirements:
     section: "10.15"
     conformance_class: consumer
     notes: "per-invocation consent for bin/ deployment defaults to deny when stdout is not a TTY; explicit opt-in overrides; allowExecutables policy gate evaluated first"
+  - id: req-sc-015
+    keyword: MUST
+    section: "10.16"
+    conformance_class: consumer
+    oracle: tests/fixtures/spec-conformance/source-plan/req-sc-015.json
+    notes: "one post-authorization source-file set drives every install and uninstall re-integration scan and primitive materialization; source-only files and symlink entries are excluded"
   - id: req-rg-001
     keyword: MUST
     section: "11.3.3"

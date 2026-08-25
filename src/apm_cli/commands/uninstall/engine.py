@@ -1064,7 +1064,10 @@ def _sync_integrations_after_uninstall(
     stale at this point in the uninstall pipeline, so Phase 2 must not
     re-read it from disk.
     """
-    from ...install.services import _deployed_path_entry, _skill_bundle_file_entries
+    from ...install.services import (
+        IntegratorBundle,
+        integrate_package_primitives,
+    )
     from ...install.target_filter import resolve_effective_package_targets
     from ...integration.base_integrator import BaseIntegrator
     from ...integration.dispatch import get_dispatch_table
@@ -1092,6 +1095,15 @@ def _sync_integrations_after_uninstall(
 
     _dispatch = get_dispatch_table()
     _integrators = {name: entry.integrator_class() for name, entry in _dispatch.items()}
+    _integrator_bundle = IntegratorBundle(
+        prompt=_integrators["prompts"],
+        agent=_integrators["agents"],
+        skill=_integrators["skills"],
+        instruction=_integrators["instructions"],
+        command=_integrators["commands"],
+        hook=_integrators["hooks"],
+        canvas=_integrators["canvas"],
+    )
 
     # Resolve targets once -- used for both Phase 1 removal and Phase 2 re-integration.
     config_target = list(apm_package.canonical_targets)
@@ -1108,7 +1120,10 @@ def _sync_integrations_after_uninstall(
             None,
             dep_ref.get_identity(),
         )
-        target_survivor_plan.append((dep_ref, pkg_info, target_selection))
+        authorized_targets = []
+        for target in target_selection.targets:
+            authorized_targets.append(target)
+        target_survivor_plan.append((dep_ref, pkg_info, authorized_targets))
 
     sync_managed = all_deployed_files if all_deployed_files else None
     if sync_managed is not None:
@@ -1256,7 +1271,12 @@ def _sync_integrations_after_uninstall(
     )
     counts["hooks"] = result.get("files_removed", 0)
 
-    # Phase 2: Re-integrate from remaining installed packages
+    # Phase 2: Re-integrate from remaining installed packages.
+    #
+    # Route every primitive through the install service so its post-authorization
+    # DeployableSourcePlan and pre-deploy SecurityGate scan protect this lifecycle
+    # path too.  Calling individual integrators here would create a second,
+    # unscanned materialization path after the cleanup pass.
     # Re-clear the discovery memo: Phase 1 mutated the on-disk primitive
     # set (removed files), so any cache snapshot taken between entry and
     # here is stale. Integrator dispatch below walks discovery internally.
@@ -1264,33 +1284,33 @@ def _sync_integrations_after_uninstall(
     _targets = _resolved_targets
 
     # The complete survivor plan was validated before Phase 1 mutated disk.
-    for dep_ref, pkg_info, target_selection in target_survivor_plan:
+    from ...core.scope import InstallScope
+    from ...utils.diagnostics import DiagnosticCollector
+
+    _rebuild_scope = InstallScope.USER if user_scope else InstallScope.PROJECT
+    _allow_executables = getattr(apm_package, "allow_executables", None)
+    reintegration_diagnostics = DiagnosticCollector()
+    for dep_ref, pkg_info, authorized_targets in target_survivor_plan:
         dep_key = dep_ref.get_unique_key()
         deployed_files = package_deployed_files.setdefault(dep_key, [])
 
         try:
-            for _target in target_selection.targets:
-                for _prim_name in _target.primitives:
-                    _entry = _dispatch.get(_prim_name)
-                    if not _entry or _entry.multi_target:
-                        continue
-                    integration_result = getattr(_integrators[_prim_name], _entry.integrate_method)(
-                        _target,
-                        pkg_info,
-                        project_root,
-                    )
-                    deployed_files.extend(
-                        _deployed_path_entry(path, project_root, _targets)
-                        for path in integration_result.target_paths
-                    )
-            skill_result = _integrators["skills"].integrate_package_skill(
+            integration_result = integrate_package_primitives(
                 pkg_info,
                 project_root,
-                targets=target_selection.targets,
+                targets=authorized_targets,
+                integrators=_integrator_bundle,
+                force=False,
+                managed_files=None,
+                diagnostics=reintegration_diagnostics,
+                package_name=dep_ref.get_identity(),
+                logger=logger,
+                scope=_rebuild_scope,
+                allow_executables=_allow_executables,
+                trust_bin=False,
+                bin_skip_reason_override="not_retrusted_on_uninstall",
             )
-            for path in skill_result.target_paths:
-                deployed_files.append(_deployed_path_entry(path, project_root, _targets))
-                deployed_files.extend(_skill_bundle_file_entries(path, project_root, _targets))
+            deployed_files.extend(integration_result["deployed_files"])
         except Exception as exc:
             pkg_id = _dependency_public_label(dep_ref)
             logger.warning(
@@ -1301,6 +1321,7 @@ def _sync_integrations_after_uninstall(
                 f"    Re-integration error: {_reintegration_error_detail(dep_ref, exc)}"
             )
 
+    reintegration_diagnostics.render_summary()
     return counts, package_deployed_files
 
 

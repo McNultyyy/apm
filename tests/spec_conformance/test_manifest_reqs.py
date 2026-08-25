@@ -11,6 +11,7 @@ or (c) a real apm_cli loader call where the surface exists.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -34,6 +35,7 @@ from apm_cli.utils.diagnostics import (
 )
 from tests.spec_conformance._helpers import (
     assert_spec_contains,
+    load_json_fixture,
     load_schema,
     load_yaml_fixture,
     validate_against,
@@ -1102,4 +1104,138 @@ def test_bin_deployment_defaults_to_deny_in_non_interactive_context() -> None:
     assert_spec_contains(
         "MUST deny\nthat deployment by default when its standard output is not connected to a",
         "explicitly opted in for that invocation",
+    )
+
+
+@pytest.mark.req("req-sc-015")
+def test_authorized_source_plan_limits_scanning_and_skill_materialization(tmp_path: Path) -> None:
+    """Selected deployable files alone are scanned and admitted to a skill copy."""
+    from apm_cli.install.deployable_source_plan import DeployableSourcePlan
+    from apm_cli.security.gate import BLOCK_POLICY, SecurityGate
+
+    package_root = tmp_path / "package"
+    selected = package_root / "skills" / "selected" / "SKILL.md"
+    source_only = package_root / "source-only.txt"
+    selected.parent.mkdir(parents=True)
+    selected.write_text("selected\n", encoding="utf-8")
+    source_only.write_text("source-only\u202e\n", encoding="utf-8")
+    target = SimpleNamespace(primitives={"skills": object()})
+    plan = DeployableSourcePlan.create(
+        SimpleNamespace(install_path=package_root),
+        [target],
+        skill_subset=("selected",),
+        hooks_approved=False,
+        canvas_approved=False,
+        skip_bin=True,
+    )
+
+    assert not plan.includes("source-only.txt")
+    assert plan.copy_ignore(str(package_root), ["source-only.txt"]) == ["source-only.txt"]
+    assert not SecurityGate.scan_files(
+        package_root,
+        policy=BLOCK_POLICY,
+        path_filter=plan.includes,
+    ).has_findings
+
+    selected.write_text("selected\u202e\n", encoding="utf-8")
+    assert SecurityGate.scan_files(
+        package_root,
+        policy=BLOCK_POLICY,
+        path_filter=plan.includes,
+    ).has_findings
+
+
+@pytest.mark.req("req-sc-015")
+def test_authorized_source_plan_fixture_oracle_covers_symlinked_content(tmp_path: Path) -> None:
+    """The portable oracle keeps scan and materialization on one safe source set."""
+    from apm_cli.install.deployable_source_plan import DeployableSourcePlan
+    from apm_cli.security.gate import BLOCK_POLICY, SecurityGate
+
+    fixture = load_json_fixture("source-plan", "req-sc-015.json")
+    assert fixture["spec_anchor"] == "req-sc-015"
+    source = fixture["input"]
+    expected = fixture["expected"]
+    package_root = tmp_path / "package"
+    for entry in source["package_files"]:
+        path = package_root / entry["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(entry["content"], encoding="utf-8")
+    for entry in source["external_files"]:
+        path = tmp_path / entry["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(entry["content"], encoding="utf-8")
+    for entry in source["symlinks"]:
+        path = package_root / entry["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        target = package_root / entry["target"] if entry["internal"] else tmp_path / entry["target"]
+        path.symlink_to(target, target_is_directory=entry["kind"] == "directory")
+
+    target = SimpleNamespace(primitives={"skills": object()})
+    kwargs = {
+        "skill_subset": tuple(source["skill_subset"]),
+        "hooks_approved": False,
+        "canvas_approved": False,
+        "skip_bin": True,
+    }
+    plan = DeployableSourcePlan.create(
+        SimpleNamespace(install_path=package_root),
+        [target],
+        **kwargs,
+    )
+    expected_paths = frozenset(expected["authorized_paths"])
+    lifecycle_expectations = expected["lifecycles"]
+
+    assert plan.paths == expected_paths
+    assert all(not plan.includes(path) for path in expected["source_only_paths"])
+    assert all(not plan.includes(path) for path in expected["symlink_paths"])
+    install_scan = SecurityGate.scan_files(
+        package_root,
+        policy=BLOCK_POLICY,
+        path_filter=plan.includes,
+    )
+    assert install_scan.scanned_files == expected_paths
+
+    def materialize(destination: Path, source_plan: DeployableSourcePlan) -> frozenset[str]:
+        shutil.copytree(package_root, destination, ignore=source_plan.copy_ignore)
+        return frozenset(
+            path.relative_to(destination).as_posix()
+            for path in destination.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        )
+
+    assert set(install_scan.scanned_files) == set(
+        lifecycle_expectations["install"]["scanned_paths"]
+    )
+    assert materialize(tmp_path / "materialized", plan) == frozenset(
+        lifecycle_expectations["install"]["materialized_paths"]
+    )
+    reintegration_plan = DeployableSourcePlan.create(
+        SimpleNamespace(install_path=package_root),
+        [target],
+        **kwargs,
+    )
+    reintegration_scan = SecurityGate.scan_files(
+        package_root,
+        policy=BLOCK_POLICY,
+        path_filter=reintegration_plan.includes,
+    )
+    assert reintegration_plan.paths == frozenset(
+        lifecycle_expectations["reintegration"]["authorized_paths"]
+    )
+    assert set(reintegration_scan.scanned_files) == set(
+        lifecycle_expectations["reintegration"]["scanned_paths"]
+    )
+    assert materialize(tmp_path / "reintegrated", reintegration_plan) == frozenset(
+        lifecycle_expectations["reintegration"]["materialized_paths"]
+    )
+
+
+@pytest.mark.req("req-sc-015")
+def test_authorized_source_plan_requirement_covers_reintegration_and_symlinks() -> None:
+    """The citation names every lifecycle and excludes symlink source entries."""
+    assert_spec_contains(
+        "including\ninstall and re-integration after uninstall. The set MUST exclude symlink\n"
+        "files and MUST NOT traverse symlinked directories.",
+        "MUST materialize primitive files only from that\nsame set; each primitive-integrator "
+        "materialization path MUST consume the\ncanonical set rather than derive a second classifier.",
     )

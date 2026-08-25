@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed false-positive security blocks from source-only package files:
+  `apm install` and surviving-package reintegration now scan the same authorized
+  file set they can deploy, while deployable prompts, hooks, skills, and approved
+  plugin bins remain protected. (#2490)
 - Marketplace `sourceBase` and full HTTPS repository paths now preserve safe
   percent-encoded segments, enabling Azure DevOps project names such as
   `My%20Projects`. (by @aryansk; fixes #2554) (#2584)

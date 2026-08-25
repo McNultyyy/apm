@@ -163,6 +163,7 @@ def check(root: Path) -> list[str]:  # noqa: C901, PLR0912, PLR0915
     prune_command_path = source_root / "commands" / "prune.py"
     hook_integrator_path = source_root / "integration" / "hook_integrator.py"
     skill_integrator_path = source_root / "integration" / "skill_integrator.py"
+    skill_routing_path = source_root / "integration" / "skill_package_routing.py"
     required = (
         projection_path,
         package_path,
@@ -180,6 +181,7 @@ def check(root: Path) -> list[str]:  # noqa: C901, PLR0912, PLR0915
         prune_command_path,
         hook_integrator_path,
         skill_integrator_path,
+        skill_routing_path,
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
@@ -209,6 +211,7 @@ def check(root: Path) -> list[str]:  # noqa: C901, PLR0912, PLR0915
     prune_command_tree = parsed.get(prune_command_path)
     hook_integrator_tree = parsed.get(hook_integrator_path)
     skill_integrator_tree = parsed.get(skill_integrator_path)
+    skill_routing_tree = parsed.get(skill_routing_path)
     if (
         projection_tree is None
         or package_tree is None
@@ -226,6 +229,7 @@ def check(root: Path) -> list[str]:  # noqa: C901, PLR0912, PLR0915
         or prune_command_tree is None
         or hook_integrator_tree is None
         or skill_integrator_tree is None
+        or skill_routing_tree is None
     ):
         return violations
 
@@ -733,7 +737,8 @@ def check(root: Path) -> list[str]:  # noqa: C901, PLR0912, PLR0915
 
     native_skill_references = [
         node
-        for node in ast.walk(skill_integrator_tree)
+        for tree in (skill_integrator_tree, skill_routing_tree)
+        for node in ast.walk(tree)
         if isinstance(node, ast.Attribute) and node.attr == "AGENT_PLUGIN"
     ]
     if native_skill_references:

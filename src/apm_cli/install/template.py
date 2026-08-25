@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from apm_cli.agent_plugins.errors import AgentPluginDeploymentBoundaryError
-from apm_cli.install.helpers.security_scan import _pre_deploy_security_scan
 from apm_cli.install.package_resolution import effective_deploy_skill_subset
 from apm_cli.install.services import (
     IntegratorBundle,
@@ -223,7 +222,6 @@ def _integrate_materialization(
     ctx = source.ctx
     dep_ref = source.dep_ref
     deltas = m.deltas
-    install_path = m.install_path
     dep_key = m.dep_key
     diagnostics = ctx.diagnostics
     logger = ctx.logger
@@ -257,17 +255,6 @@ def _integrate_materialization(
         return deltas
 
     try:
-        # Pre-deploy security gate
-        if not _pre_deploy_security_scan(
-            install_path,
-            diagnostics,
-            package_name=dep_key,
-            force=ctx.force,
-            logger=logger,
-        ):
-            ctx.package_deployed_files[dep_key] = []
-            return deltas
-
         # Per-package effective subset: ``--skill`` is additive (issue
         # #1786), so deploy the UNION of the persisted apm.yml ``skills:``
         # and the current CLI ``--skill`` values -- a targeted ``--skill``

@@ -218,6 +218,20 @@ def ensure_path_within_resolved(path: Path, resolved_base: Path) -> Path:
     return resolved
 
 
+def has_symlink_component(base_dir: Path, path: Path) -> bool:
+    """Return whether any component of *path* below *base_dir* is a symlink."""
+    try:
+        relative = path.relative_to(base_dir)
+        current = base_dir
+        for part in relative.parts:
+            current /= part
+            if current.is_symlink():
+                return True
+        return False
+    except (OSError, ValueError):
+        return True
+
+
 def safe_rmtree(path: Path, base_dir: Path) -> None:
     """Remove *path* only if it resolves within *base_dir*.
 

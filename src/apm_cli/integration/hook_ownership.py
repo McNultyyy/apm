@@ -10,6 +10,7 @@ from typing import Any
 from apm_cli.utils.path_security import (
     PathTraversalError,
     ensure_path_within,
+    has_symlink_component,
     validate_path_segments,
 )
 
@@ -116,20 +117,6 @@ def safe_dependency_path(apm_modules: Path, relative_path: str) -> Path | None:
         return package_path
     except (OSError, PathTraversalError, RuntimeError, TypeError):
         return None
-
-
-def has_symlink_component(apm_modules: Path, package_path: Path) -> bool:
-    """Return True when any component below apm_modules is a symlink."""
-    try:
-        relative = package_path.relative_to(apm_modules)
-        current = apm_modules
-        for part in relative.parts:
-            current /= part
-            if current.is_symlink():
-                return True
-        return False
-    except (OSError, ValueError):
-        return True
 
 
 def is_dependency_package_dir(path: Path) -> bool:
