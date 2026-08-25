@@ -218,7 +218,10 @@ def test_agent_plugin_contract_has_single_owner() -> None:
     assert "| Agent Plugin producer portable-surface admission |" in architecture
     assert "| APMPackage interpreted-manifest construction |" in architecture
     assert "| Agent Plugin compatibility package projection |" in architecture
-    assert "| Neutral hook source grammar and shape -> per-target native |" in architecture
+    assert (
+        "| Neutral hook source grammar, per-target native shape, and "
+        "shared-config APM-owned drift projection |"
+    ) in architecture
     assert "src/apm_cli/hook_contract.py" in architecture
     assert architecture == (root / ".apm/instructions/architecture.instructions.md").read_text(
         encoding="utf-8"
@@ -2130,11 +2133,12 @@ def test_drift_hook_membership_exemptions_use_canonical_registries() -> None:
     root = Path(__file__).parents[2]
     consumer = (root / "src/apm_cli/install/manifest_reconcile.py").read_text(encoding="utf-8")
     guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
-    body = consumer.split("def merge_hook_config_paths(", maxsplit=1)[1].split(
+    body = consumer.split("def merge_hook_config_projection_specs(", maxsplit=1)[1].split(
         "\ndef ",
         maxsplit=1,
     )[0]
 
+    assert "merge_hook_config_projection_specs(targets)" in consumer
     assert "_MERGE_HOOK_TARGETS" in body
     assert "_APM_HOOKS_SIDECAR" in body
     assert "settings.json" not in body
@@ -3146,10 +3150,50 @@ def test_merged_hook_ownership_markers_have_one_owner() -> None:
 
     assert "def dependency_hook_source_marker(" in owner
     assert "def dependency_hook_sources(" in owner
+    assert "def project_apm_owned_hook_entries(" in owner
     assert "from apm_cli.integration.hook_ownership import (" in integrator
     assert "def _dependency_hook_source_marker(" not in integrator
-    assert "Merged-hook ownership markers must route through integration/hook_ownership.py" in guard
+    assert "Shared hook drift projection must route through hook_ownership.py" in guard
     assert "`src/apm_cli/integration/hook_ownership.py`" in architecture
+
+
+def test_shared_hook_drift_projection_guard_rejects_bypass(tmp_path: Path) -> None:
+    """The static guard rejects drift reintroducing whole-file shared-config comparison."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(
+        root,
+        sandbox,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+        ),
+    )
+    drift_path = sandbox / "src/apm_cli/install/drift.py"
+    drift_path.write_text(
+        drift_path.read_text(encoding="utf-8").replace(
+            "project_apm_owned_hook_entries(",
+            "bypassed_hook_projection(",
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ("bash", "scripts/lint-architecture-boundaries.sh"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 1
+    assert "Shared hook drift projection must route through hook_ownership.py" in result.stdout
 
 
 def test_dependency_winner_selection_has_one_algorithm() -> None:
