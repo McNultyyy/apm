@@ -16,6 +16,7 @@ from ..models.apm_package import APMPackage, DependencyReference
 from ..models.validation import validate_apm_package
 from ..utils.path_security import PathTraversalError, ensure_path_within, validate_path_segments
 from ..utils.paths import portable_relpath
+from ._shared import MarketplaceManifestMaterializationError, materialize_marketplace_manifest
 from .dependency_graph import (
     CircularRef,
     DependencyGraph,
@@ -512,6 +513,11 @@ class APMDependencyResolver:
             if resolution.dependency_reference is not None
             else DependencyReference.parse(resolution.canonical)
         )
+        manifest = getattr(resolution.plugin, "manifest", None)
+        if isinstance(manifest, dict) and manifest:
+            resolved.marketplace_manifest = dict(manifest)
+            resolved.marketplace_name = dep_ref.marketplace_name
+            resolved.marketplace_plugin_name = dep_ref.marketplace_plugin_name
         self._marketplace_provenance[resolved.get_unique_key()] = resolution.provenance(
             dep_ref.marketplace_name,
             dep_ref.marketplace_plugin_name,
@@ -762,7 +768,11 @@ class APMDependencyResolver:
             # --- Phase C (main thread): integrate results, enqueue sub-deps ---
             for (node, dep_ref, _parent_node, is_dev), loaded_package, exc in results:
                 if exc is not None:
-                    if isinstance(exc, ValueError):
+                    if isinstance(exc, MarketplaceManifestMaterializationError):
+                        message = f"Marketplace package materialization failed: {exc}"
+                        _logger.warning(message)
+                        tree.resolution_errors.append(message)
+                    elif isinstance(exc, ValueError):
                         _logger.warning(
                             "Invalid transitive apm.yml for %s: %s",
                             dep_ref.get_display_name(),
@@ -1102,6 +1112,10 @@ class APMDependencyResolver:
                             # as already-downloaded.
                             with self._download_lock:
                                 self._downloaded_packages.discard(unique_key)
+                    except MarketplaceManifestMaterializationError:
+                        with self._download_lock:
+                            self._downloaded_packages.discard(unique_key)
+                        raise
                     except Exception as exc:
                         # Surface the failure at default verbosity AND log a
                         # traceback at debug. Previously this branch silently
@@ -1128,6 +1142,8 @@ class APMDependencyResolver:
             # Still doesn't exist after download attempt
             if not install_path.exists():
                 return None
+
+        materialize_marketplace_manifest(dep_ref, install_path)
 
         # Native Agent Plugins must retain their projected compatibility package
         # so recursive resolution can see APM-only dependencies without requiring
