@@ -58,6 +58,11 @@ File primitives resolve targets in this order: `--target`, manifest
 `--runtime` / `--target`, then manifest targets, saved config, then
 auto-detection only when `apm.yml` declares no targets.
 
+Native [Agent Plugin registration](../../../consumer/copilot-agent-plugins/#requirements)
+does not discover or execute the Copilot CLI. APM owns deterministic
+materialization and settings projection; you provide a supported runtime when
+you use the generated registration.
+
 ### Policy and trust
 
 | Flag | Default | Description |
@@ -211,12 +216,13 @@ apm install ./my-bundle.zip --as custom-name
 apm install ./my-bundle --target opencode
 ```
 
-:::note[Planned]
-This deploys Claude plugin bundles (the default `apm pack` output). A bundle
-produced with `apm pack --format agent-plugin` (portable Agent Plugins v1) is not
-deployable yet -- `apm install` fails closed and points you to a
-Claude-compatible package instead. See
-[Package Types](../../package-types/#agent-plugin-pluginjson-with-an-agent-plugins-schema).
+:::note[Claude bundles only]
+This imperative route deploys Claude plugin bundles (the default `apm pack`
+output). A portable Agent Plugins v1 package installs declaratively instead:
+declare it in `apm.yml` and run `apm install --target copilot`, which keeps it
+whole and registers it without locating or executing Copilot. Stable Copilot
+CLI 1.0.81 or newer is required when loading the projection. See
+[Install Agent Plugins for Copilot](../../../consumer/copilot-agent-plugins/).
 :::
 
 ### Install only a subset of skills from a bundle

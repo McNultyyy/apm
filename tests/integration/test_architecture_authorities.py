@@ -531,13 +531,27 @@ def test_agent_plugin_component_ir_mutations_are_killed(
         ),
         (
             "src/apm_cli/agent_plugins/errors.py",
-            "        raise AgentPluginDeploymentBoundaryError(AGENT_PLUGIN_DEPLOYMENT_BLOCKED)",
-            "        return AgentPluginDeploymentBoundaryError(AGENT_PLUGIN_DEPLOYMENT_BLOCKED)",
+            "        raise AgentPluginDeploymentBoundaryError(AGENT_PLUGIN_BUNDLE_ROUTE_BLOCKED)",
+            "        return AgentPluginDeploymentBoundaryError(AGENT_PLUGIN_BUNDLE_ROUTE_BLOCKED)",
             "native deployment boundary must fail closed",
         ),
         (
             "src/apm_cli/agent_plugins/errors.py",
-            "    raise AgentPluginDeploymentBoundaryError(AGENT_PLUGIN_DEPLOYMENT_BLOCKED)",
+            "    if capability is not None and capability.supported:",
+            "    if capability is None or capability.supported:",
+            "native deployment boundary must fail closed",
+        ),
+        (
+            "src/apm_cli/agent_plugins/errors.py",
+            "    capability = current_native_registration()",
+            "    capability = None",
+            "native deployment boundary must fail closed",
+        ),
+        (
+            "src/apm_cli/agent_plugins/errors.py",
+            "    raise AgentPluginTargetExcludedError(\n"
+            "        capability.reason if capability is not None else AGENT_PLUGIN_DEPLOYMENT_BLOCKED\n"
+            "    )",
             "    return None  # native package accepted",
             "native deployment boundary must fail closed",
         ),
@@ -595,7 +609,11 @@ def test_agent_plugin_component_ir_mutations_are_killed(
         ),
         (
             "src/apm_cli/commands/install.py",
-            "            preflight_agent_plugin_dry_run(ctx, all_apm_deps)",
+            "            preflight_agent_plugin_dry_run(\n"
+            "                ctx,\n"
+            "                all_apm_deps,\n"
+            "                apm_package=apm_package,\n"
+            "            )",
             "            pass  # native dry-run preflight removed",
             "dry-run native preflight must run before rendering success",
         ),
@@ -706,9 +724,8 @@ def test_agent_plugin_component_ir_mutations_are_killed(
         ),
         (
             "src/apm_cli/agent_plugins/errors.py",
-            "        enforce_agent_plugin_deployment_boundary(package_info)\n"
-            "        plan.append((dependency, package_info))",
-            "        plan.append((dependency, package_info))",
+            "            enforce_agent_plugin_deployment_boundary(package_info)",
+            "            _ = package_info",
             "survivor reintegration preflight must use the native deployment boundary owner",
         ),
         (
@@ -787,6 +804,51 @@ def test_agent_plugin_projection_guard_rejects_bypass(
 
     assert result.returncode == 1
     assert message in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "src/apm_cli/commands/prune.py",
+        "src/apm_cli/commands/uninstall/cli.py",
+    ),
+)
+def test_agent_plugin_projection_guard_rejects_runtime_discovery_at_lifecycle_callers(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    """Every admission call site must remain free of Copilot runtime discovery."""
+    root = Path(__file__).parents[2]
+    sandbox = tmp_path / "repo"
+    shutil.copytree(root / "src" / "apm_cli", sandbox / "src" / "apm_cli")
+    mutation_path = sandbox / relative_path
+    source = mutation_path.read_text(encoding="utf-8")
+    old = "    manifest_target = None"
+    assert old in source
+    mutation_path.write_text(
+        source.replace(
+            old,
+            '    import shutil\n\n    shutil.which("copilot")\n    manifest_target = None',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        (
+            "python3",
+            "scripts/check_agent_plugin_projection_boundary.py",
+            "--root",
+            str(sandbox),
+        ),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "no Copilot binary/version discovery" in result.stdout + result.stderr
 
 
 def test_policy_cache_metadata_redaction_has_single_owner() -> None:

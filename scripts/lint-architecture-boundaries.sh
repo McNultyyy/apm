@@ -1899,6 +1899,43 @@ if ! python3 scripts/check_hash_visible_lf_writes.py; then
     violations=$((violations + 1))
 fi
 
+echo "[*] AC35: native Copilot Agent Plugin registration authority"
+native_registration_owner_defs=$(grep -rEc \
+    '^def resolve_native_registration_capability\(' \
+    src/apm_cli --include='*.py' \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+native_catalog_owner_defs=$(grep -rEc \
+    '^def synchronize_copilot_plugins\(' \
+    src/apm_cli --include='*.py' \
+    | awk -F: '{sum += $2} END {print sum + 0}')
+native_binary_coupling_hits=$(
+    grep -rnE \
+        'COPILOT_LIVE_PLUGIN_MIN_VERSION|probe_copilot_cli_version|APM_COPILOT_CLI_VERSION|find_runtime_binary|is_qualified_client_version|normalize_client_version|minimum_client_version|undetected_client_reason|unqualified_client_reason|AgentPluginClientUnavailableError|SemVer|parse_semver|subprocess\.(run|Popen|check_output|check_call)|shutil\.which' \
+        src/apm_cli/copilot_plugins \
+        src/apm_cli/install/phases/copilot_plugins.py \
+        src/apm_cli/install/template.py \
+        src/apm_cli/commands/prune.py \
+        src/apm_cli/commands/uninstall \
+        --include='*.py' \
+        || true
+)
+native_settings_key_hits=$(
+    grep -rn "extraKnownMarketplaces\|enabledPlugins" src/apm_cli --include='*.py' \
+        | grep -v 'src/apm_cli/copilot_plugins/' \
+        || true
+)
+if [ "$native_registration_owner_defs" -ne 1 ] \
+    || [ "$native_catalog_owner_defs" -ne 1 ] \
+    || ! grep -q 'from apm_cli.copilot_plugins.capability import current_native_registration' \
+        src/apm_cli/agent_plugins/errors.py \
+    || [ -n "$native_binary_coupling_hits" ] \
+    || [ -n "$native_settings_key_hits" ]; then
+    echo "[x] Native Copilot plugin registration must route through copilot_plugins/ with no binary/version coupling"
+    [ -n "$native_binary_coupling_hits" ] && echo "$native_binary_coupling_hits"
+    [ -n "$native_settings_key_hits" ] && echo "$native_settings_key_hits"
+    violations=$((violations + 1))
+fi
+
 echo "[*] AC18: bootstrap project-name authority"
 if ! uv run --extra dev python scripts/lint-bootstrap-project-name.py; then
     echo "[x] Manifest bootstrap names must route through core/project_name.py"
