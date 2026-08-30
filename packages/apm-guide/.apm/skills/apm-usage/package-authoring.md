@@ -299,6 +299,9 @@ correctly -- the component just records NOASSERTION (genuinely unknown).
 This warning fires only on the **authoring** path (your own `apm.yml`);
 installing or exporting other people's dependencies is silent.
 
+Encode primitive Markdown as UTF-8. APM accepts files with or without a
+leading UTF-8 BOM and strips the BOM before parsing frontmatter.
+
 ## The 7 primitive types
 
 ### 1. Instruction (`*.instructions.md`)
