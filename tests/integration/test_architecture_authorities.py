@@ -14,6 +14,45 @@ from types import ModuleType
 import pytest
 
 
+def test_resolution_replacement_activation_has_one_owner(tmp_path: Path) -> None:
+    """Resolution downloads must publish through the staging session owner."""
+    root = Path(__file__).parents[2]
+    guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
+    assert (
+        "Resolution replacements must stay staged until their canonical publish boundary" in guard
+    )
+
+    sandbox = tmp_path / "repo"
+    for relative in (
+        "scripts/lint-resolution-replacement-boundary.py",
+        "src/apm_cli/install/resolution_staging.py",
+        "src/apm_cli/install/phases/resolve.py",
+        "src/apm_cli/install/service.py",
+    ):
+        source = root / relative
+        destination = sandbox / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    duplicate = sandbox / "src/apm_cli/install/service.py"
+    duplicate.write_text(
+        duplicate.read_text(encoding="utf-8")
+        + "\n\ndef prepare_replacement(path):\n    return path\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        (sys.executable, "scripts/lint-resolution-replacement-boundary.py"),
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert "duplicates owner methods: prepare_replacement" in result.stdout
+
+
 def test_generated_bundle_text_writes_are_lf_deterministic() -> None:
     """Generated bundle text must route through the checked LF boundary."""
     root = Path(__file__).parents[2]

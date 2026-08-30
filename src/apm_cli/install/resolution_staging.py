@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import uuid
+from hashlib import sha256
 from pathlib import Path
 
 from filelock import FileLock, Timeout
@@ -27,6 +28,8 @@ class ResolutionStagingSession:
         self._staging_lock_path = self._staging_root.with_suffix(".lock")
         self._staging_lock: FileLock | None = None
         self._backups: dict[Path, Path | None] = {}
+        self._replacement_by_destination: dict[Path, Path] = {}
+        self._destination_by_replacement: dict[Path, Path] = {}
         self._relocations: list[tuple[Path, Path]] = []
         self._lock = threading.Lock()
 
@@ -41,10 +44,70 @@ class ResolutionStagingSession:
                 self._acquire_staging_lock()
                 resolved_base = ensure_path_within(self._modules_dir, self._modules_dir)
                 relative = resolved.relative_to(resolved_base)
-                backup = self._staging_root / relative
+                backup = self._staging_root / "backups" / relative
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 resolved.replace(backup)
             self._backups[resolved] = backup
+
+    def prepare_replacement(self, path: Path) -> Path:
+        """Return an isolated download path without disturbing *path*."""
+        resolved = ensure_path_within(path, self._modules_dir)
+        replacement = self._isolated_staging_path("replacements", resolved)
+        replacement = ensure_path_within(replacement, self._staging_root)
+        with self._lock:
+            if resolved in self._backups:
+                raise RuntimeError(f"Path is already staged for replacement: {resolved}")
+            if resolved in self._replacement_by_destination:
+                raise RuntimeError(f"Path already has a replacement in progress: {resolved}")
+            if replacement.exists():
+                safe_rmtree(replacement, self._staging_root)
+            replacement.parent.mkdir(parents=True, exist_ok=True)
+            self._replacement_by_destination[resolved] = replacement
+            self._destination_by_replacement[replacement] = resolved
+        return replacement
+
+    def publish_replacement(self, replacement: Path) -> Path:
+        """Activate a prepared replacement and return its live path."""
+        staged = ensure_path_within(replacement, self._staging_root)
+        with self._lock:
+            resolved = self._destination_by_replacement.get(staged)
+            if resolved is None:
+                raise RuntimeError(f"Replacement path is not reserved by this session: {staged}")
+            if resolved in self._backups:
+                raise RuntimeError(f"Path is already staged for replacement: {resolved}")
+            if not staged.exists():
+                raise FileNotFoundError(f"Replacement path was not materialized: {staged}")
+
+            backup: Path | None = None
+            if resolved.exists():
+                backup = self._isolated_staging_path("backups", resolved)
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                self._backups[resolved] = backup
+                resolved.replace(backup)
+            else:
+                self._backups[resolved] = None
+            try:
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                staged.replace(resolved)
+            except BaseException:
+                if backup is not None and backup.exists() and not resolved.exists():
+                    backup.replace(resolved)
+                raise
+            self._replacement_by_destination.pop(resolved)
+            self._destination_by_replacement.pop(staged)
+            return resolved
+
+    def discard_replacement(self, replacement: Path) -> None:
+        """Discard a failed prepared replacement without touching the live path."""
+        staged = ensure_path_within(replacement, self._staging_root)
+        with self._lock:
+            resolved = self._destination_by_replacement.get(staged)
+            if resolved is None:
+                return
+            if staged.exists():
+                safe_rmtree(staged, self._staging_root)
+            self._replacement_by_destination.pop(resolved)
+            self._destination_by_replacement.pop(staged)
 
     def relocate_path(self, source: Path, destination: Path) -> None:
         """Move one existing package path and journal the rename for rollback."""
@@ -80,6 +143,8 @@ class ResolutionStagingSession:
         """Discard preserved pre-resolution contents after successful validation."""
         self._remove_staging_root()
         self._backups.clear()
+        self._replacement_by_destination.clear()
+        self._destination_by_replacement.clear()
         self._relocations.clear()
         return self._release_staging_lock()
 
@@ -100,12 +165,14 @@ class ResolutionStagingSession:
         cleanup_issues: list[tuple[Path, str]] = []
         with self._lock:
             for path, backup in reversed(self._backups.items()):
-                if path.exists():
-                    safe_rmtree(path, self._modules_dir)
                 if backup is not None and backup.exists():
+                    if path.exists():
+                        safe_rmtree(path, self._modules_dir)
                     path.parent.mkdir(parents=True, exist_ok=True)
                     backup.replace(path)
-                else:
+                elif backup is None:
+                    if path.exists():
+                        safe_rmtree(path, self._modules_dir)
                     self._remove_empty_parents(path.parent)
             for source, destination in reversed(self._relocations):
                 if destination.exists():
@@ -126,6 +193,8 @@ class ResolutionStagingSession:
             ):
                 self._modules_dir.rmdir()
             self._backups.clear()
+            self._replacement_by_destination.clear()
+            self._destination_by_replacement.clear()
             self._relocations.clear()
         return cleanup_issues
 
@@ -135,6 +204,13 @@ class ResolutionStagingSession:
         while path != self._modules_dir and path.exists() and not any(path.iterdir()):
             path.rmdir()
             path = path.parent
+
+    def _isolated_staging_path(self, bucket: str, destination: Path) -> Path:
+        """Return an opaque slot so nested destinations never overlap."""
+        modules = ensure_path_within(self._modules_dir, self._modules_dir)
+        relative = destination.relative_to(modules).as_posix().encode("utf-8")
+        slot = sha256(relative).hexdigest()
+        return self._staging_root / bucket / slot
 
     @staticmethod
     def _replace_case_only(source: Path, destination: Path) -> None:

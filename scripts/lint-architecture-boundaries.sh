@@ -2035,6 +2035,12 @@ if ! uv run --extra dev python scripts/lint-bootstrap-project-name.py; then
     violations=$((violations + 1))
 fi
 
+echo "[*] AC36: resolution replacement activation authority"
+if ! uv run --extra dev python scripts/lint-resolution-replacement-boundary.py; then
+    echo "[x] Resolution replacements must stay staged until their canonical publish boundary"
+    violations=$((violations + 1))
+fi
+
 if [ "$violations" -gt 0 ]; then
     echo "[x] $violations architecture boundary rule(s) failed"
     exit 1
