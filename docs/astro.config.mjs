@@ -268,7 +268,7 @@ export default defineConfig({
 						{ label: 'Overview', slug: 'reference' },
 						{
 							label: 'Commands',
-							autogenerate: { directory: 'reference/cli' },
+							items: [{ autogenerate: { directory: 'reference/cli' } }],
 						},
 					],
 				},
@@ -323,7 +323,7 @@ export default defineConfig({
 				},
 				{
 					label: 'Contributing',
-					autogenerate: { directory: 'contributing' },
+					items: [{ autogenerate: { directory: 'contributing' } }],
 				},
 			],
 		}),
