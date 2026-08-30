@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Marketplace installs now materialize catalog-only LSP and MCP metadata
   without requiring a package manifest in the downloaded source
   (by @lkshrk, #2709).
+- Private `github.com` subdirectory packages now populate the persistent Git
+- Private `github.com` packages now populate the persistent Git
+  cache through repository-scoped credential fallback without storing
+  credentials in cache keys or remote URLs. (#2722)
 - Plugin refreshes now keep the existing package and its registered hooks live
   while replacement content downloads and validates. Failed refreshes retain
   the prior package instead of accepting stale content. (#2723)
