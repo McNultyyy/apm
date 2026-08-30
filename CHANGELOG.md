@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Marketplace installs now materialize catalog-only LSP and MCP metadata
   without requiring a package manifest in the downloaded source
   (by @lkshrk, #2709).
+- Successful installs now remove inactive resolution staging directories left
+  by interrupted earlier runs while preserving active and unrelated entries.
+  (closes #2716)
+- Successful installs now safely clean up temporary backups left by interrupted
+  lock-aware runs without disturbing active installs or unrelated files. Legacy
+  lockless backups are preserved with manual recovery guidance. (#2720)
 - `apm doctor` now reports malformed project `executables` configuration as an
   actionable informational warning instead of omitting the check. (#2719)
 - `apm doctor` now reports malformed project `executables` or deprecated
