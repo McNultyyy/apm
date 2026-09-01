@@ -548,6 +548,14 @@ MUTATIONS: tuple[MutationCase, ...] = (
         intent="Ref seeding makes a parallel freshness decision outside RefFreshnessPolicy.",
     ),
     MutationCase(
+        guard_id="transport-platform-revision-pin-outcome",
+        rule_id="transport-platform-revision-pin-outcome",
+        path="src/apm_cli/commands/update.py",
+        old="logger.revision_pins_retained(resolution.skips)",
+        new="logger.revision_pins_retained(())",
+        intent="Update discards resolver-provided retained revision pins.",
+    ),
+    MutationCase(
         guard_id="transport-platform-self-update-resolution",
         rule_id="transport-platform-self-update-resolution",
         path="src/apm_cli/commands/self_update.py",
