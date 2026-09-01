@@ -29,8 +29,17 @@ def main() -> int:
     valid = (
         inventory.count("class CompileInventory") == 1
         and inventory.count("os.walk(") == 1
+        and _has_all(
+            inventory,
+            (
+                'if path != root and (".git" in file_names or ".git" in child_dirs):',
+                "nested_repository_roots.add(path)",
+                "def nested_repository_root_for(",
+            ),
+        )
         and "os.walk(" not in optimizer
         and "os.walk(" not in distributed
+        and "os.walk(" not in discovery
         and _has_all(
             optimizer,
             (
@@ -43,7 +52,9 @@ def main() -> int:
             discovery,
             (
                 "inventory: CompileInventory | None = None",
+                "inventory = CompileInventory.collect(base_path, exclude_patterns=exclude_patterns)",
                 "inventory.files_within(base_path)",
+                "inventory.nested_repository_root_for(directory)",
             ),
         )
         and _has_all(
@@ -51,8 +62,7 @@ def main() -> int:
             (
                 "source_inventory: CompileInventory | None = None",
                 "deploy_inventory: CompileInventory | None = None",
-                '(entry.path / ".git").is_file()',
-                "relative_path.is_relative_to(worktree_root)",
+                "deploy_inventory.nested_repository_root_for(directory_path)",
                 "for directory_path, (relative_path, files) in sorted(cleanup_directories.items()):",
             ),
         )
@@ -63,13 +73,18 @@ def main() -> int:
                 "self.source_dir, exclude_patterns=config.exclude",
                 "source_inventory=self._source_inventory",
                 "deploy_inventory=self._deploy_inventory",
+                "deploy_inventory.nested_repository_root_for(agents_path.parent)",
             ),
         )
+        and "_nested_git_repository_root" not in agents
+        and ' / ".git"' not in agents
+        and ' / ".git"' not in distributed
+        and ' / ".git"' not in discovery
     )
     if valid:
         return 0
 
-    print("[x] Compile traversal must route through compilation/inventory.py")
+    print("[x] Compile nested Git boundaries must route through compilation/inventory.py")
     return 1
 
 

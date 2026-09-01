@@ -1344,16 +1344,42 @@ def test_gitlab_policy_adapter_guard_survives_nested_facade_else(tmp_path: Path)
 
 
 @pytest.mark.parametrize(
-    ("guard", "replacement"),
+    ("relative_path", "guard", "replacement"),
     [
-        ('(entry.path / ".git").is_file()', "False"),
-        ("relative_path.is_relative_to(worktree_root)", "False"),
+        (
+            "src/apm_cli/compilation/inventory.py",
+            'if path != root and (".git" in file_names or ".git" in child_dirs):',
+            "if False:",
+        ),
+        (
+            "src/apm_cli/compilation/agents_compiler.py",
+            "nested_root = deploy_inventory.nested_repository_root_for(agents_path.parent)",
+            "nested_root = None",
+        ),
+        (
+            "src/apm_cli/compilation/distributed_compiler.py",
+            "if deploy_inventory.nested_repository_root_for(directory_path) is not None:",
+            "if False:",
+        ),
+        (
+            "src/apm_cli/primitives/discovery.py",
+            "inventory = CompileInventory.collect(base_path, exclude_patterns=exclude_patterns)",
+            "inventory = None",
+        ),
+        (
+            "src/apm_cli/primitives/discovery.py",
+            "if inventory is not None and inventory.nested_repository_root_for(directory) is not None:",
+            "if False:",
+        ),
     ],
 )
-def test_nested_worktree_cleanup_guard_rejects_unbounded_agents_scan(
-    tmp_path: Path, guard: str, replacement: str
+def test_compile_nested_git_boundary_rejects_split_authority(
+    tmp_path: Path,
+    relative_path: str,
+    guard: str,
+    replacement: str,
 ) -> None:
-    """The cleanup boundary guard requires detection and pruning."""
+    """The static guard rejects bypasses of the canonical inventory owner."""
     root = Path(__file__).parents[2]
     sandbox = tmp_path / "repo"
     shutil.copytree(
@@ -1369,10 +1395,10 @@ def test_nested_worktree_cleanup_guard_rejects_unbounded_agents_scan(
             "node_modules",
         ),
     )
-    compiler_path = sandbox / "src/apm_cli/compilation/distributed_compiler.py"
-    source = compiler_path.read_text(encoding="utf-8")
+    mutated_path = sandbox / relative_path
+    source = mutated_path.read_text(encoding="utf-8")
     assert source.count(guard) == 1
-    compiler_path.write_text(
+    mutated_path.write_text(
         source.replace(guard, replacement, 1),
         encoding="utf-8",
     )
@@ -1387,7 +1413,36 @@ def test_nested_worktree_cleanup_guard_rejects_unbounded_agents_scan(
     )
 
     assert result.returncode == 1
-    assert "Compile traversal must route through compilation/inventory.py" in result.stdout
+    assert (
+        "Compile nested Git boundaries must route through compilation/inventory.py" in result.stdout
+    )
+
+
+def test_compile_nested_git_boundary_has_single_owner() -> None:
+    """Discovery, writes, and cleanup consume the inventory-owned decision."""
+    root = Path(__file__).parents[2]
+    inventory = (root / "src/apm_cli/compilation/inventory.py").read_text(encoding="utf-8")
+    agents = (root / "src/apm_cli/compilation/agents_compiler.py").read_text(encoding="utf-8")
+    distributed = (root / "src/apm_cli/compilation/distributed_compiler.py").read_text(
+        encoding="utf-8"
+    )
+    discovery = (root / "src/apm_cli/primitives/discovery.py").read_text(encoding="utf-8")
+    architecture = (root / ".apm/instructions/architecture.instructions.md").read_text(
+        encoding="utf-8",
+    )
+
+    assert inventory.count("def nested_repository_root_for(") == 1
+    assert 'if path != root and (".git" in file_names or ".git" in child_dirs)' in inventory
+    assert "deploy_inventory.nested_repository_root_for(agents_path.parent)" in agents
+    assert "deploy_inventory.nested_repository_root_for(directory_path)" in distributed
+    assert "inventory.files_within(base_path)" in discovery
+    assert "inventory.nested_repository_root_for(directory)" in discovery
+    assert ' / ".git"' not in agents
+    assert ' / ".git"' not in distributed
+    assert "| Compile traversal and nested Git repository boundary |" in architecture
+    assert architecture == (root / ".github/instructions/architecture.instructions.md").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_experimental_target_hints_have_single_owner() -> None:
@@ -3729,8 +3784,8 @@ def test_policy_cache_serializer_boundary_is_registered() -> None:
     root = Path(__file__).parents[2]
     guard = (root / "scripts/lint-architecture-boundaries.sh").read_text(encoding="utf-8")
     owner_row = (
-        "| Cached policy shape | policy/discovery.py "
-        "(_policy_to_dict via _serialize_policy; ADO_POLICY_PROJECT; ADO_POLICY_REPOSITORY) |"
+        "| Cached policy shape | policy/discovery.py (_policy_to_dict via "
+        "_serialize_policy; ADO_POLICY_PROJECT; ADO_POLICY_REPOSITORY) |"
     )
     assert ("Cached policy shape must route through policy/discovery.py::_policy_to_dict") in guard
     for token in ("_policy_to_dict", "_serialize_policy", "_write_cache"):
@@ -3866,8 +3921,8 @@ def test_windows_owner_row_stays_synced_source_deployed_and_lockfile() -> None:
 
     owner_rows = (
         "| Windows stable executable path | install.ps1 ($currentDir / $currentExe) |",
-        "| Cached policy shape | policy/discovery.py "
-        "(_policy_to_dict via _serialize_policy; ADO_POLICY_PROJECT; ADO_POLICY_REPOSITORY) |",
+        "| Cached policy shape | policy/discovery.py (_policy_to_dict via "
+        "_serialize_policy; ADO_POLICY_PROJECT; ADO_POLICY_REPOSITORY) |",
     )
     source_text = source.read_text(encoding="utf-8")
     for owner_row in owner_rows:

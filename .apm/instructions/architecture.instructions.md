@@ -46,6 +46,8 @@ semicolon-delimited, and specific to the file(s) that own the fact.
 | Runtime descriptors | runtime/registry.py | `src/apm_cli/runtime/registry.py` |
 | User-facing output / diagnostics | CommandLogger / console owner | `src/apm_cli/core/command_logger.py`; `src/apm_cli/utils/console.py` |
 | Compiled-output writes (atomic) | CompiledOutputWriter | `src/apm_cli/compilation/output_writer.py` |
+| Distributed AGENTS.md output eligibility and content preparation | compilation/agents_compiler.py (_prepare_distributed_file) | `src/apm_cli/compilation/agents_compiler.py` |
+| Compile traversal and nested Git repository boundary | compilation/inventory.py (CompileInventory) | `src/apm_cli/compilation/inventory.py` |
 | Generated-content footer ownership wording | compilation/footer.py (build_generation_footer) | `src/apm_cli/compilation/footer.py` |
 | Deployment provenance / state | deployment_ledger.py | `src/apm_cli/core/deployment_ledger.py` |
 | Target-scoped deployed-file contraction | install/manifest_reconcile.py (reconcile_target_deployed_files) | `src/apm_cli/install/manifest_reconcile.py` |
