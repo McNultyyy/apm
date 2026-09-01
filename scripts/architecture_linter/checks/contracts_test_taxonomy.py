@@ -13,6 +13,7 @@ their single registry allocation.
 
 from __future__ import annotations
 
+import ast
 import re
 from collections.abc import Sequence
 
@@ -65,10 +66,21 @@ _GUARD_APPLY_TO = "contracts-tooling-apply-to-placement"
 _GUARD_FRONTMATTER = "contracts-tooling-frontmatter-yaml"
 
 
+_GUARD_LOCKFILE_READ = "contracts-tooling-lockfile-read"
+
+
 _GUARD_GENERATION_FOOTER = "contracts-tooling-generation-footer"
 
 
 _SRC_PREFIX = "src/apm_cli/"
+
+_LOCKFILE_OWNER = "src/apm_cli/deps/lockfile.py"
+
+_LOCKFILE_CONSUMERS = (
+    "src/apm_cli/bundle/packer.py",
+    "src/apm_cli/bundle/plugin_exporter.py",
+    "src/apm_cli/bundle/agent_plugin_exporter.py",
+)
 
 
 def _facts_for(provider: FactsProvider, path: str, rule_id: str):
@@ -117,6 +129,127 @@ def _count_defs_across(provider: FactsProvider, prefix: str, pattern: re.Pattern
             continue
         total += _count_re(facts, pattern)
     return total
+
+
+def _named_calls(nodes: Sequence[ast.AST], name: str) -> tuple[ast.Call, ...]:
+    """Return direct calls to one unqualified function name."""
+    return tuple(
+        node
+        for node in nodes
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    )
+
+
+def _keyword_is_name(call: ast.Call, keyword_name: str, value_name: str) -> bool:
+    """Return whether a call has `keyword_name=value_name`."""
+    return any(
+        keyword.arg == keyword_name
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id == value_name
+        for keyword in call.keywords
+    )
+
+
+def check_lockfile_read_resolution(provider: FactsProvider) -> tuple[Violation, ...]:
+    """Read-only lockfile consumers must route through one non-mutating owner."""
+    rule_id = _GUARD_LOCKFILE_READ
+    owner, owner_failures = _facts_for(provider, _LOCKFILE_OWNER, rule_id)
+    if owner_failures:
+        return tuple(owner_failures)
+    owner_index = owner.tree_index
+    if owner_index is None:
+        return (_summary(rule_id, _LOCKFILE_OWNER, "Lockfile owner has no Python syntax tree"),)
+
+    findings: list[Violation] = []
+    resolver = owner_index.function("resolve_lockfile_path_for_read")
+    if resolver is None:
+        findings.append(
+            _summary(rule_id, _LOCKFILE_OWNER, "Read-only lockfile resolver must have one owner")
+        )
+    else:
+        read_only_guards = tuple(
+            node
+            for node in owner_index.children(resolver)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "read_only"
+        )
+        migrate_calls = _named_calls(
+            owner_index.own_scope(resolver),
+            "migrate_lockfile_if_needed",
+        )
+        migration_is_read_only = bool(read_only_guards) and any(
+            call in owner_index.walk(read_only_guards[0]) for call in migrate_calls
+        )
+        if len(read_only_guards) != 1 or len(migrate_calls) != 1 or migration_is_read_only:
+            findings.append(
+                _summary(
+                    rule_id,
+                    _LOCKFILE_OWNER,
+                    "Read-only lockfile resolution must guard migration",
+                )
+            )
+
+    installed_paths = owner_index.function("LockFile.installed_paths_for_project")
+    if installed_paths is None:
+        findings.append(
+            _summary(rule_id, _LOCKFILE_OWNER, "LockFile installed-path reader must exist")
+        )
+    else:
+        installed_nodes = owner_index.own_scope(installed_paths)
+        installed_calls = _named_calls(installed_nodes, "resolve_lockfile_path_for_read")
+        rederives_legacy = any(
+            isinstance(node, ast.Name) and node.id == "LEGACY_LOCKFILE_NAME"
+            for node in installed_nodes
+        )
+        has_read_only_call = len(installed_calls) == 1 and any(
+            keyword.arg == "read_only"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in installed_calls[0].keywords
+        )
+        if not has_read_only_call or rederives_legacy:
+            findings.append(
+                _summary(
+                    rule_id,
+                    _LOCKFILE_OWNER,
+                    "LockFile installed-path reads must delegate without re-deriving fallback",
+                )
+            )
+
+    for consumer_path in _LOCKFILE_CONSUMERS:
+        consumer, consumer_failures = _facts_for(provider, consumer_path, rule_id)
+        findings.extend(consumer_failures)
+        if consumer_failures or consumer.tree_index is None:
+            continue
+        imported = {
+            alias.name
+            for node in consumer.tree_index.nodes
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+        calls = _named_calls(
+            consumer.tree_index.nodes,
+            "resolve_lockfile_path_for_read",
+        )
+        routes_read_only = len(calls) == 1 and _keyword_is_name(
+            calls[0],
+            "read_only",
+            "dry_run",
+        )
+        if (
+            "resolve_lockfile_path_for_read" not in imported
+            or {"get_lockfile_path", "migrate_lockfile_if_needed"} & imported
+            or not routes_read_only
+        ):
+            findings.append(
+                _summary(
+                    rule_id,
+                    consumer_path,
+                    "Bundle lockfile reads must route through the read-only owner",
+                )
+            )
+    return tuple(findings)
 
 
 _TAXONOMY_PLUGIN = "tests/quality/taxonomy_inventory_plugin.py"
@@ -589,6 +722,11 @@ RULES: tuple[Rule, ...] = (
         _GUARD_FRONTMATTER,
         "Frontmatter BOM decoding and bounded YAML parsing stay owned by utils/yaml_io.py.",
         check_frontmatter_yaml,
+    ),
+    _owner_rule(
+        _GUARD_LOCKFILE_READ,
+        "Read-only lockfile path resolution stays owned by deps/lockfile.py.",
+        check_lockfile_read_resolution,
     ),
     _owner_rule(
         _GUARD_GENERATION_FOOTER,

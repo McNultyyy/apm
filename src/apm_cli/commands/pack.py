@@ -250,8 +250,8 @@ def _parse_marketplace_filter(
     help=(
         "Release gate: regenerate every configured marketplace output to a "
         "temp representation and diff against the effective on-disk path, "
-        "including --marketplace-path overrides. Exits 4 for drift. Use "
-        "with --dry-run to check without normal pack output generation."
+        "including --marketplace-path overrides. This mode is read-only and "
+        "exits 4 for drift."
     ),
 )
 @click.option(
@@ -316,7 +316,9 @@ def pack_cmd(  # noqa: PLR0913 -- Click handler, one param per CLI option
     check_clean,
 ):
     """Pack APM artifacts: bundle and/or marketplace.json."""
-    logger = CommandLogger("pack", verbose=verbose, dry_run=dry_run)
+    effective_dry_run = dry_run or check_clean
+    implicit_check_clean_dry_run = check_clean and not dry_run
+    logger = CommandLogger("pack", verbose=verbose, dry_run=effective_dry_run)
 
     try:
         bundle_format = resolve_bundle_format(
@@ -386,7 +388,7 @@ def pack_cmd(  # noqa: PLR0913 -- Click handler, one param per CLI option
         marketplace_include_prerelease=include_prerelease,
         marketplace_formats=marketplace_formats,
         marketplace_path_overrides=path_overrides if path_overrides else None,
-        dry_run=dry_run,
+        dry_run=effective_dry_run,
         verbose=verbose,
     )
 
@@ -530,7 +532,7 @@ def pack_cmd(  # noqa: PLR0913 -- Click handler, one param per CLI option
     if json_output:
         envelope = {
             "ok": True,
-            "dry_run": dry_run,
+            "dry_run": effective_dry_run,
             "warnings": list(result.warnings),
             "errors": [],
             "marketplace": {"outputs": []},
@@ -555,14 +557,19 @@ def pack_cmd(  # noqa: PLR0913 -- Click handler, one param per CLI option
             ctx.exit(4)
         return
 
+    if implicit_check_clean_dry_run:
+        logger.dry_run_notice("--check-clean is read-only; no pack outputs were written.")
+
     for sub in result.producer_results:
+        if implicit_check_clean_dry_run:
+            continue
         if sub.kind is OutputKind.BUNDLE:
             _render_bundle_result(
                 logger,
                 sub.payload,
                 bundle_format,
                 target,
-                dry_run,
+                effective_dry_run,
                 show_zip_migration_notice=(
                     archive
                     and archive_format == "zip"
@@ -571,7 +578,9 @@ def pack_cmd(  # noqa: PLR0913 -- Click handler, one param per CLI option
                 ),
             )
         elif sub.kind is OutputKind.MARKETPLACE:
-            _render_marketplace_result(logger, sub.payload, dry_run, sub.warnings, sub.outputs)
+            _render_marketplace_result(
+                logger, sub.payload, effective_dry_run, sub.warnings, sub.outputs
+            )
 
     # Gate exit codes (after non-JSON rendering above): 3 wins over 4.
     if version_gate_failed:

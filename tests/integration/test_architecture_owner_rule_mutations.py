@@ -140,6 +140,14 @@ MUTATIONS: tuple[MutationCase, ...] = (
         intent="Generated footer owner loses the one canonical builder definition.",
     ),
     MutationCase(
+        guard_id="contracts-tooling-lockfile-read",
+        rule_id="contracts-tooling-lockfile-read",
+        path="src/apm_cli/deps/lockfile.py",
+        old="    if read_only:\n",
+        new="    if False and read_only:\n",
+        intent="Read-only lockfile resolution stops guarding the mutating migration path.",
+    ),
+    MutationCase(
         guard_id="hooks-integrations-copilot-cli-mcp-paths",
         rule_id="mutation_writes.copilot_cli_mcp_paths",
         path="src/apm_cli/adapters/client/copilot.py",
