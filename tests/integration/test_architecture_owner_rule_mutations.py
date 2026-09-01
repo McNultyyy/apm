@@ -260,6 +260,14 @@ MUTATIONS: tuple[MutationCase, ...] = (
         intent="Effective package-target authorization loses its single resolver.",
     ),
     MutationCase(
+        guard_id="install-deployment-prospective-dry-run-plan",
+        rule_id="install-deployment-prospective-dry-run-plan",
+        path="src/apm_cli/commands/install.py",
+        old="mcp_deps=list(prospective_plan.selected_mcp_dependencies) or None",
+        new="mcp_deps=mcp_deps if should_install_mcp else None",
+        intent="Dry-run policy checks bypass the plan-owned MCP selection.",
+    ),
+    MutationCase(
         guard_id="install-deployment-provenance-state",
         rule_id="install-deployment-provenance-state",
         path="src/apm_cli/commands/prune.py",
