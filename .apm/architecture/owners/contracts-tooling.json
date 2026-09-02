@@ -3,8 +3,8 @@
   "owners": [
     {
       "id": "dependency-identity-materialization",
-      "decision": "Dependency comparison identity vs display-cased materialization path",
-      "owner": "models/dependency/identity.py + materialization.py + DependencyReference",
+      "decision": "Dependency comparison identity vs display-cased materialization path; embedded git URL subpath validation",
+      "owner": "models/dependency/identity.py + materialization.py + DependencyReference (_check_no_embedded_subpath consumes core/host_providers.py)",
       "selectors": [
         "src/apm_cli/models/dependency/identity.py",
         "src/apm_cli/models/dependency/materialization.py",

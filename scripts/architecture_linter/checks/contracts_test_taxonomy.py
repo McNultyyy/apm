@@ -446,7 +446,7 @@ _RESOLVE_PHASE = "src/apm_cli/install/phases/resolve.py"
 
 
 def check_dependency_identity(provider: FactsProvider) -> tuple[Violation, ...]:
-    """Identity may casefold only in identity.py; materialization preserves casing."""
+    """Guard dependency identity, materialization, and embedded-subpath ownership."""
     rule_id = _GUARD_DEPENDENCY_IDENTITY
     identity, identity_fail = _facts_for(provider, _IDENTITY_OWNER, rule_id)
     materialization, mat_fail = _facts_for(provider, _MATERIALIZATION_OWNER, rule_id)
@@ -496,6 +496,42 @@ def check_dependency_identity(provider: FactsProvider) -> tuple[Violation, ...]:
                 rule_id,
                 _IDENTITY_OWNER,
                 "Package identity casing must route through is_github_hostname",
+            )
+        )
+    embedded_subpath_body = _awk_body(
+        reference,
+        re.compile(r"^    def _check_no_embedded_subpath\("),
+        re.compile(r"^    def "),
+    )
+    embedded_subpath_message = (
+        "Embedded git URL subpath validation must use DependencyReference and host_providers"
+    )
+    if not _body_has(embedded_subpath_body, "classify_host_provider(") or not _body_has(
+        embedded_subpath_body, 'provider.kind == "gitlab"'
+    ):
+        findings.append(
+            _summary(
+                rule_id,
+                _REFERENCE_OWNER,
+                embedded_subpath_message,
+            )
+        )
+    primitive_dirs = re.compile(r"_APM_PRIMITIVE_DIRS")
+    for path in _python_paths(provider, _SRC_PREFIX):
+        if path == _REFERENCE_OWNER:
+            continue
+        facts, path_failures = _facts_for(provider, path, rule_id)
+        findings.extend(path_failures)
+        if path_failures:
+            continue
+        findings.extend(
+            _line_findings(
+                facts,
+                path,
+                rule_id,
+                primitive_dirs,
+                embedded_subpath_message,
+                respect_exempt=True,
             )
         )
     return tuple(findings)
@@ -1229,7 +1265,7 @@ RULES: tuple[Rule, ...] = (
     ),
     _owner_rule(
         _GUARD_DEPENDENCY_IDENTITY,
-        "Dependency comparison identity casefolds only in identity.py; materialization preserves casing.",
+        "Dependency identity, materialization, and embedded git URL subpaths have canonical owners.",
         check_dependency_identity,
     ),
     _owner_rule(

@@ -115,6 +115,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   infinite recursion or unbounded writes during `apm install`.
   `docs/src/content/docs/specs/openapm-v0.1.md` now explicitly requires
   containment of consumer-generated staging output. (closes #2556)
+- Explicit GitLab URLs now accept deep repository namespaces whose names match
+  APM primitive directories, while an unambiguous `.git` repository boundary
+  followed by a primitive path still fails before lock, cache, or module writes.
+  (by @aryansk) (#2581)
+- Hook commands such as `"${CLAUDE_PLUGIN_ROOT}"/hooks/probe.py` now rewrite to
+  `"${CLAUDE_PLUGIN_ROOT}/hooks/probe.py"` and warn when a supported plugin-root
+  placeholder remains unresolved instead of silently deploying a dead hook.
+  OpenAPM v0.1 (`docs/src/content/docs/specs/openapm-v0.1.md#req-tg-012`) binds
+  the behavior.
+  (by @MohammedAlkindi; closes #2639) (#2645)
+- `apm uninstall --global` now cleans removed-only target files before deleting their ownership state, while preserving files owned by surviving packages. (#2658)
+- Windows binary is now Authenticode-signed in the release workflow, eliminating
+  the `Trojan:Script/Wacatac.H!ml` Windows Defender false positive on unsigned
+  PyInstaller bundles. (#2435)
 - Multi-target `apm compile` now avoids repeating expensive project analysis
   for each target, making multi-target runs scale like single-target runs
   without changing generated output. (closes #2482)
@@ -125,6 +139,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - YAML expansion guard no longer rejects large anchor-free lockfiles (150K+
   entries) with a false-positive "billion-laughs" error. APM-generated
   lockfiles with no anchors or aliases now load without error. (#2389)
+- `apm install` no longer skips the credential retry on non-English machines.
+  Git localises its diagnostics through gettext, so a translated stderr made an
+  authentication failure unrecognisable and private-repo installs failed with
+  misleading network guidance. Git subprocesses in the authentication retry
+  path now run with `LC_ALL=C` and `LANGUAGE=C`. (by @Naofel-eal, closes #2533)
 
 ### Changed
 

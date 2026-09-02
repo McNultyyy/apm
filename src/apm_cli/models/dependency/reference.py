@@ -620,7 +620,7 @@ class DependencyReference(ProviderCoordinateMixin):
         return normalized
 
     @staticmethod
-    def _check_no_embedded_subpath(url: str) -> None:
+    def _check_no_embedded_subpath(url: str, *, host_type: str | None = None) -> None:
         """Guard: reject a subpath embedded in an explicit git URL form (#872).
 
         Detects when a user writes, e.g.:
@@ -630,45 +630,40 @@ class DependencyReference(ProviderCoordinateMixin):
         ``fatal: '...' does not appear to be a git repository`` message.
         This guard fires early and points at the supported ``path:`` key.
 
-        The heuristic: for SCP (``git@host:path``), ``ssh://``, or
-        ``https://``/``http://`` URL forms, if any non-last path segment
-        matches a known APM primitive directory name (skills, agents, prompts,
-        etc.), the URL encodes a subpath that belongs in the ``path:`` key.
-
-        GitLab subgroups and Azure DevOps org/project paths do not use APM
-        primitive names (skills, agents, prompts, ...) as segment labels, so
-        the check produces no false positives for those legitimate forms.
-
-        Scoping (issue #1014 follow-up): the embedded-subpath shape is
-        ``org/repo`` followed by ``<primitive>/<name>``, so a primitive
-        segment is only treated as an embedded subpath when it is preceded
-        by a complete ``org/repo`` prefix (segment index >= 2). This avoids
-        a false positive for a GitLab subgroup literally named after a
-        primitive, e.g. ``git@gitlab.com:group/skills/repo.git`` (here
-        ``skills`` is a subgroup at index 1 and ``repo`` is the real
-        repository). A residual ambiguity remains for deep subgroups that
-        embed a primitive name at index >= 2 (e.g.
-        ``group/sub/skills/repo``); that shape is genuinely undecidable
-        without probing the host, so it is still treated as malformed.
+        GitLab repository paths may have arbitrary namespace depth, including
+        namespace names that match APM primitive directories. Fixed-boundary
+        providers instead reserve the path after ``org/repo`` for an APM
+        subpath. The canonical host-provider registry supplies that grammar;
+        this method deliberately performs no network probing.
         """
         raw = url.strip()
 
-        if SCP_LIKE_RE.match(raw):
+        scp_match = SCP_LIKE_RE.match(raw)
+        if scp_match:
             colon_idx = raw.index(":")
             path_part = raw[colon_idx + 1 :]
+            host = scp_match.group("host")
         elif raw.lower().startswith(("ssh://", "https://", "http://")):
-            path_part = urllib.parse.urlparse(raw).path
+            parsed = urllib.parse.urlparse(raw)
+            path_part = parsed.path
+            host = parsed.hostname
         else:
             return  # bare shorthand or other form -- not in scope
 
-        # Strip fragment and query string, then remove trailing .git suffix
         path_part = path_part.split("#")[0].split("?")[0]
-        if path_part.endswith(".git"):
-            path_part = path_part[:-4]
-
+        decoded_path = urllib.parse.unquote(path_part)
+        while decoded_path != path_part:
+            path_part = decoded_path
+            decoded_path = urllib.parse.unquote(path_part)
         segments = [s for s in path_part.replace("\\", "/").split("/") if s]
         if len(segments) < 3:
             return  # too few segments to contain an interior primitive name
+
+        if host is None:
+            return
+        from apm_cli.core.host_providers import classify_host_provider
+
+        provider = classify_host_provider(host, host_type=host_type)
 
         # Azure DevOps repo URLs carry the repository under a `_git` segment
         # and legitimately encode a virtual path after it (e.g.
@@ -679,6 +674,17 @@ class DependencyReference(ProviderCoordinateMixin):
         if "_git" in segments:
             return
 
+        if provider.kind == "gitlab":
+            # A terminal .git segment is an unambiguous repository boundary.
+            # A .git segment followed by an APM primitive is instead an
+            # unambiguous embedded subpath, even on GitLab.
+            for idx, seg in enumerate(segments[:-1]):
+                if seg.endswith(".git") and any(
+                    tail in DependencyReference._APM_PRIMITIVE_DIRS for tail in segments[idx + 1 :]
+                ):
+                    DependencyReference._raise_embedded_subpath_error(raw)
+            return
+
         # An embedded subpath is `org/repo` + `<primitive>/<name>`, so the
         # primitive directory must be preceded by a complete org/repo prefix
         # (index >= 2). Restricting to index >= 2 keeps the real malformed-URL
@@ -687,14 +693,19 @@ class DependencyReference(ProviderCoordinateMixin):
         # (group/skills/repo, where `repo` is the actual repository).
         for idx, seg in enumerate(segments[:-1]):
             if idx >= 2 and seg in DependencyReference._APM_PRIMITIVE_DIRS:
-                raise ValueError(
-                    "A subpath cannot be embedded in a git URL. "
-                    f"Got: `{raw}`. "
-                    "Use the `path:` key instead: "
-                    "`git: <repo-url>` + `path: <primitive>/<name>` "
-                    "(or the shorthand `org/repo/<primitive>/<name>`). "
-                    "See https://microsoft.github.io/apm/consumer/manage-dependencies/"
-                )
+                DependencyReference._raise_embedded_subpath_error(raw)
+
+    @staticmethod
+    def _raise_embedded_subpath_error(raw: str) -> None:
+        """Raise the canonical recovery error for an embedded primitive path."""
+        raise ValueError(
+            "A subpath cannot be embedded in a git URL. "
+            f"Got: `{raw}`. "
+            "Use the `path:` key instead: "
+            "`git: <repo-url>` + `path: <primitive>/<name>` "
+            "(or the shorthand `org/repo/<primitive>/<name>`). "
+            "See https://microsoft.github.io/apm/consumer/manage-dependencies/"
+        )
 
     @classmethod
     def parse_from_dict(cls, entry: dict) -> "DependencyReference":
@@ -865,7 +876,7 @@ class DependencyReference(ProviderCoordinateMixin):
             validate_path_segments(sub_path, context="path")
 
         # Parse the git URL using the standard parser
-        dep = cls.parse(git_url)
+        dep = cls.parse(git_url, host_type=host_type)
         dep.host_type = host_type
         dep.allow_insecure = allow_insecure
         # Object-form ``- git:`` is an explicit Git resolver pin, even when
@@ -1736,7 +1747,12 @@ class DependencyReference(ProviderCoordinateMixin):
         return None
 
     @classmethod
-    def parse(cls, dependency_str: str) -> "DependencyReference":
+    def parse(
+        cls,
+        dependency_str: str,
+        *,
+        host_type: str | None = None,
+    ) -> "DependencyReference":
         """Parse a dependency string into a DependencyReference.
 
         Supports formats:
@@ -1808,7 +1824,7 @@ class DependencyReference(ProviderCoordinateMixin):
         # Guard: detect a subpath embedded in an explicit git URL form (#872).
         # Fires before virtual-package detection so the user gets an actionable
         # error rather than a cryptic downstream git failure.
-        cls._check_no_embedded_subpath(dependency_str)
+        cls._check_no_embedded_subpath(dependency_str, host_type=host_type)
 
         # Phase 1: detect virtual packages
         is_virtual_package, virtual_path, validated_host = cls._detect_virtual_package(
@@ -1864,6 +1880,7 @@ class DependencyReference(ProviderCoordinateMixin):
         return cls(
             repo_url=repo_url,
             host=host,
+            host_type=host_type,
             port=port,
             explicit_scheme=explicit_scheme,
             reference=reference,
