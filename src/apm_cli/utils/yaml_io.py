@@ -437,6 +437,10 @@ class _BoundedYAMLHandler(_FrontmatterYAMLHandler):
     ``apm install`` / ``apm audit``.
     """
 
+    def detect(self, text: str) -> bool:
+        """Strip one leading UTF-8 BOM before detecting front matter."""
+        return super().detect(text.removeprefix("\ufeff"))
+
     def split(self, text: str) -> tuple[str, str]:
         """Strip one leading UTF-8 BOM before locating the front matter."""
         return super().split(text.removeprefix("\ufeff"))
@@ -456,6 +460,35 @@ class _BoundedYAMLHandler(_FrontmatterYAMLHandler):
 _BOUNDED_FRONTMATTER_HANDLER = _BoundedYAMLHandler()
 
 
+def loads_frontmatter(text: str, *, preserve_body: bool = False) -> Any:
+    """Parse Markdown text through the bounded handler.
+
+    ``preserve_body`` retains body whitespace after consuming the delimiter's
+    first line break. Integrators use it when target conversion must not alter
+    the authored body.
+    """
+    import frontmatter
+
+    if not _BOUNDED_FRONTMATTER_HANDLER.detect(text):
+        return frontmatter.Post(text)
+
+    try:
+        split = _BOUNDED_FRONTMATTER_HANDLER.split(text)
+        post = frontmatter.loads(text, handler=_BOUNDED_FRONTMATTER_HANDLER)
+    except yaml.YAMLError:
+        raise
+    except (IndexError, ValueError) as exc:
+        raise yaml.YAMLError(f"malformed frontmatter delimiters: {exc}") from exc
+    if preserve_body:
+        _, body = split
+        if body.startswith("\r\n"):
+            body = body[2:]
+        elif body.startswith("\n"):
+            body = body[1:]
+        post.content = body
+    return post
+
+
 def load_frontmatter(fd: Any, encoding: str = "utf-8-sig") -> Any:
     """Parse Markdown front matter with the bounded YAML loader.
 
@@ -473,9 +506,17 @@ def load_frontmatter(fd: Any, encoding: str = "utf-8-sig") -> Any:
     (written by PowerShell's ``Out-File``, ``>``, or Notepad) therefore cannot
     hide the ``---`` fence and silently drop its ``applyTo`` scope (apm#2683).
     """
-    import frontmatter
+    text = ""
+    if isinstance(fd, (str, Path)):
+        text = Path(fd).read_text(encoding=encoding)
+    elif hasattr(fd, "read"):
+        text = fd.read()
+        if isinstance(text, bytes):
+            text = text.decode(encoding)
+    else:
+        text = str(fd)
 
-    return frontmatter.load(fd, encoding=encoding, handler=_BOUNDED_FRONTMATTER_HANDLER)
+    return loads_frontmatter(text)
 
 
 def dump_yaml(

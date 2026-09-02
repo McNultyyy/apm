@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from apm_cli.agent_plugins.errors import enforce_agent_plugin_deployment_boundary
 
 from .deployed_paths import deployed_path_entry as _deployed_path_entry
+from .deployed_paths import format_target_collapse as _format_target_collapse
 from .deployed_paths import skill_bundle_file_entries as _skill_bundle_file_entries
 from .exec_gate import check_executable_approval
 from .exec_gate import plugin_bin_deployable as _plugin_bin_deployable
@@ -35,6 +36,9 @@ from .local_bundle_paths import bundle_pack_files as _bundle_pack_files
 from .local_bundle_paths import bundle_slug_validation_error as _bundle_slug_error
 from .local_bundle_paths import known_bundle_deploy_prefixes as _known_bundle_prefixes
 from .local_bundle_paths import target_bundle_deploy_prefixes as _target_bundle_prefixes
+from .target_filter import (
+    log_package_target_restriction as _log_package_target_restriction,
+)
 from .target_filter import resolve_effective_package_targets
 
 if TYPE_CHECKING:
@@ -199,21 +203,6 @@ def _warn_target_reconcile_failure(
     )
 
 
-def _log_package_target_restriction(logger: InstallLogger | None, target_selection: Any) -> None:
-    """Name the declared and effective target sets when a package narrows them."""
-    if logger is None or not target_selection.package_restriction_active:
-        return
-    declared = (
-        ", ".join(target_selection.package_declared_targets)
-        if target_selection.package_declared_targets
-        else "unrestricted"
-    )
-    effective = ", ".join(target.name for target in target_selection.targets) or "none"
-    logger.verbose_detail(
-        f"Package target restriction: [{declared}]; effective targets: [{effective}]"
-    )
-
-
 def integrate_package_primitives(  # noqa: PLR0913
     package_info: Any,
     project_root: Path,
@@ -318,14 +307,18 @@ def integrate_package_primitives(  # noqa: PLR0913
         "reconcile_package_target_restriction",
         None,
     )
-    if target_selection.excluded_targets and callable(reconcile_package_targets):
-        reconcile_stats = reconcile_package_targets(
-            package_info,
-            project_root,
-            target_selection.excluded_targets,
-        )
-        _warn_target_reconcile_failure(diagnostics, package_name, reconcile_stats)
+
+    def _reconcile_excluded_targets() -> None:
+        if target_selection.excluded_targets and callable(reconcile_package_targets):
+            reconcile_stats = reconcile_package_targets(
+                package_info,
+                project_root,
+                target_selection.excluded_targets,
+            )
+            _warn_target_reconcile_failure(diagnostics, package_name, reconcile_stats)
+
     if not targets:
+        _reconcile_excluded_targets()
         return result
 
     # Executable approval gate (npm v12-style default-deny); all five verdicts feed the gates.
@@ -384,6 +377,7 @@ def integrate_package_primitives(  # noqa: PLR0913
     from apm_cli.install.native_plugin_admission import finalize_native_plugin
 
     if admits_native_plugin(package_info):
+        _reconcile_excluded_targets()
         return finalize_native_plugin(
             result,
             package_info,
@@ -414,37 +408,6 @@ def integrate_package_primitives(  # noqa: PLR0913
         if logger:
             logger.tree_item(msg)
 
-    def _format_target_collapse(paths: list[str], verbose: bool) -> tuple[str, list[str]]:
-        """Apply the 1/2/3+ multi-target collapse rule.
-
-        Returns a tuple ``(suffix, expansion_lines)``:
-
-        * ``suffix`` -- the text appended after ``-> `` on the aggregate line.
-        * ``expansion_lines`` -- extra ``  |     -> <path>`` lines emitted
-          AFTER the aggregate line when ``verbose`` is True. Empty list when
-          collapsed.
-
-        The rule:
-          1 target  -> ``<path1>``
-          2 targets -> ``<path1>, <path2>``
-          3+        -> ``N targets`` (verbose forces full enumeration)
-        """
-        deduped: list[str] = []
-        seen: set = builtins.set()
-        for p in paths:
-            if p not in seen:
-                seen.add(p)
-                deduped.append(p)
-        if verbose and len(deduped) >= 2:
-            return "", [f"  |     -> {p}" for p in deduped]
-        if len(deduped) == 0:
-            return "", []
-        if len(deduped) == 1:
-            return deduped[0], []
-        if len(deduped) == 2:
-            return f"{deduped[0]}, {deduped[1]}", []
-        return f"{len(deduped)} targets", []
-
     _verbose = bool(getattr(ctx, "verbose", False)) if ctx is not None else False
 
     _INTEGRATOR_KWARGS = {
@@ -456,6 +419,21 @@ def integrate_package_primitives(  # noqa: PLR0913
         "canvas": integrators.canvas,
         "skills": integrators.skill,
     }
+
+    # Validate every converted instruction target before any primitive kind can
+    # write. A rejected instruction must not leave prompts, agents, commands,
+    # or identity-target instructions from the same package active.
+    if integrators.instruction is not None:
+        integrators.instruction.preflight_instructions_for_targets(
+            targets,
+            package_info,
+            project_root,
+            source_plan,
+            force=force,
+            diagnostics=diagnostics,
+        )
+
+    _reconcile_excluded_targets()
 
     # Aggregate per-primitive across targets so we emit ONE line per kind
     # (per the 1/2/3+ collapse rule), not one per target.

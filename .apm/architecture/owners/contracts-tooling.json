@@ -31,8 +31,8 @@
     },
     {
       "id": "frontmatter-bom-bounded-yaml",
-      "decision": "Frontmatter BOM decoding and bounded YAML parsing",
-      "owner": "utils/yaml_io.py (load_frontmatter, _BoundedYAMLHandler)",
+      "decision": "Frontmatter delimiter detection, BOM decoding, and bounded YAML parsing",
+      "owner": "utils/yaml_io.py (load_frontmatter, loads_frontmatter, _BoundedYAMLHandler)",
       "selectors": ["src/apm_cli/utils/yaml_io.py"],
       "guards": ["contracts-tooling-frontmatter-yaml"]
     },
