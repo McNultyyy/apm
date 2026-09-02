@@ -671,6 +671,7 @@ mutation_writes.hook_command_vocabulary
 mutation_writes.jetbrains_mcp_path
 mutation_writes.mcp_declaration_scope
 mutation_writes.mcp_package_launcher
+mutation_writes.mcp_passthrough_denylist
 mutation_writes.mcp_target_selection
 mutation_writes.neutral_hook_contract
 mutation_writes.user_root_scope

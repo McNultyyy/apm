@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decodes critical hidden characters. `--force` overrides only the critical
   character finding, never malformed YAML; warning-level findings do not block.
   (by @manideep-malyala, #2666)
+- OpenCode MCP generation now preserves safe passthrough fields while preventing
+  custom fields from injecting the modeled `environment` alias. (by @aryansk,
+  fixes #2510) (#2593)
 - `apm pack` now reports unavailable remote package metadata, exposes
   certifiability in JSON, prevents `--check-clean` from certifying degraded
   regeneration, and lets `--strict-metadata` fail before writes. (closes #2524)

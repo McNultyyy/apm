@@ -214,6 +214,14 @@ MUTATIONS: tuple[MutationCase, ...] = (
         intent="Shared adapter loses the canonical OCI-to-docker launcher alias.",
     ),
     MutationCase(
+        guard_id="hooks-integrations-mcp-passthrough-denylist",
+        rule_id="mutation_writes.mcp_passthrough_denylist",
+        path="src/apm_cli/models/dependency/mcp.py",
+        old='frozenset({"enabled", "environment", "http_headers", "id"})',
+        new='frozenset({"enabled", "http_headers", "id"})',
+        intent="Shared MCP model stops denying the OpenCode environment alias.",
+    ),
+    MutationCase(
         guard_id="hooks-integrations-mcp-target-selection",
         rule_id="mutation_writes.mcp_target_selection",
         path="src/apm_cli/integration/mcp_integrator_install.py",

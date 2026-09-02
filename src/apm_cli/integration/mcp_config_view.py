@@ -242,7 +242,7 @@ def _allows_missing_manifest(
     package_type, _ = detect_package_type(package_dir)
     if package_type is PackageType.HOOK_PACKAGE:
         return (
-            dependency_ref.is_virtual_subdirectory()
+            dependency.to_dependency_ref().is_virtual_subdirectory()
             and dependency.package_type == PackageType.HOOK_PACKAGE.value
         )
     return (

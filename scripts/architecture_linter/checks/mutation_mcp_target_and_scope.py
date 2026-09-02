@@ -9,6 +9,8 @@ Ports three of the owner guards recorded in
   scope.
 * ``hooks-integrations-mcp-package-launcher`` -- AC26/AC30/AC32
   MCPClientAdapter launcher selection and argv shape.
+* ``hooks-integrations-mcp-passthrough-denylist`` -- MCP passthrough modeled
+  fields and harness aliases.
 * ``hooks-integrations-jetbrains-mcp-path`` -- AC28 JetBrains Copilot MCP
   path.
 """
@@ -55,6 +57,12 @@ _MCP_SCOPE_OWNER = "src/apm_cli/integration/mcp_config_view.py"
 
 
 _MCP_ADAPTER_BASE = "src/apm_cli/adapters/client/base.py"
+
+
+_MCP_MODEL = "src/apm_cli/models/dependency/mcp.py"
+
+
+_MCP_OPENCODE = "src/apm_cli/adapters/client/opencode.py"
 
 
 _MCP_CONTAINER_CONSUMERS: tuple[str, ...] = (
@@ -465,6 +473,77 @@ def _mpl_runtime_variables(
     return tuple(findings)
 
 
+def _check_mcp_passthrough_denylist(provider: FactsProvider) -> Iterable[Violation]:
+    """MCP passthrough filtering must route through the base adapter denylist."""
+    rule_id = "mutation_writes.mcp_passthrough_denylist"
+    facts_by_path, failures = _read_required(
+        provider,
+        rule_id,
+        (_MCP_MODEL, _MCP_ADAPTER_BASE, _MCP_OPENCODE),
+    )
+    findings: list[Violation] = list(failures)
+    if failures:
+        return tuple(findings)
+
+    findings.extend(
+        _require(
+            _has_fixed(
+                facts_by_path[_MCP_ADAPTER_BASE],
+                "from ...models.dependency.mcp import _EXTRA_DENYLIST, TrustedEnvLiteral",
+            ),
+            rule_id,
+            _MCP_ADAPTER_BASE,
+            "base adapter must import the canonical passthrough denylist",
+        )
+    )
+    findings.extend(
+        _require(
+            _has_fixed(
+                facts_by_path[_MCP_MODEL],
+                '_HARNESS_EXTRA_ALIASES = frozenset({"enabled", "environment", '
+                '"http_headers", "id"})',
+            ),
+            rule_id,
+            _MCP_MODEL,
+            "MCP model must own the harness-alias denylist",
+        )
+    )
+    findings.extend(
+        _require(
+            _has_fixed(
+                facts_by_path[_MCP_MODEL],
+                "_EXTRA_DENYLIST = _RESERVED_EXTRA_KEYS | _HARNESS_EXTRA_ALIASES",
+            ),
+            rule_id,
+            _MCP_MODEL,
+            "MCP model must combine modeled fields and harness aliases",
+        )
+    )
+    findings.extend(
+        _require(
+            _has_fixed(
+                facts_by_path[_MCP_OPENCODE],
+                "from ...models.dependency.mcp import _EXTRA_DENYLIST",
+            ),
+            rule_id,
+            _MCP_OPENCODE,
+            "OpenCode adapter must import the canonical passthrough denylist",
+        )
+    )
+    findings.extend(
+        _require(
+            _has_fixed(
+                facts_by_path[_MCP_OPENCODE],
+                "translated_keys = _EXTRA_DENYLIST",
+            ),
+            rule_id,
+            _MCP_OPENCODE,
+            "OpenCode translation must derive exclusions from the canonical denylist",
+        )
+    )
+    return tuple(findings)
+
+
 def _check_jetbrains_mcp_path(provider: FactsProvider) -> Iterable[Violation]:
     """JetBrains Copilot MCP config paths must come from the IntelliJ adapter.
 
@@ -571,6 +650,13 @@ RULES: tuple[Rule, ...] = (
         guard_ids=("hooks-integrations-mcp-package-launcher",),
         description="MCP launcher selection and argv shape must route through MCPClientAdapter.",
         check=_check_mcp_package_launcher,
+    ),
+    Rule(
+        id="mutation_writes.mcp_passthrough_denylist",
+        group=GROUP,
+        guard_ids=("hooks-integrations-mcp-passthrough-denylist",),
+        description="MCP passthrough filtering must route through the base adapter denylist.",
+        check=_check_mcp_passthrough_denylist,
     ),
     Rule(
         id="mutation_writes.jetbrains_mcp_path",
