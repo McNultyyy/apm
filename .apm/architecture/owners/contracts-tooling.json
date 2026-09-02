@@ -38,10 +38,15 @@
     },
     {
       "id": "read-only-lockfile-path",
-      "decision": "Read-only lockfile path resolution",
-      "owner": "deps/lockfile.py (resolve_lockfile_path_for_read)",
+      "decision": "Lockfile read path, timestamp emission, and reproducible fallback",
+      "owner": "deps/lockfile.py (resolve_lockfile_path_for_read, LockFile.write, resolve_reproducible_timestamp)",
       "selectors": ["src/apm_cli/deps/lockfile.py"],
-      "guards": ["contracts-tooling-lockfile-read"]
+      "guards": [
+        "contracts-tooling-lockfile-read",
+        "contracts-tooling-lockfile-timestamp",
+        "contracts-tooling-lockfile-timestamp-constructor",
+        "contracts-tooling-lockfile-timestamp-fallback"
+      ]
     },
     {
       "id": "generated-content-footer-wording",
