@@ -90,6 +90,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (closes #2522, #2654)
 - The lifecycle scripts guide now documents the Windows admin-tier policy path
   alongside the Linux and macOS path. (by @WilliamK112, closes #2621, #2640)
+- Windows binary is now Authenticode-signed in the release workflow, eliminating
+  the `Trojan:Script/Wacatac.H!ml` Windows Defender false positive on unsigned
+  PyInstaller bundles. (#2435)
+- Plugin `.lsp.json` intake now accepts Copilot-dialect `fileExtensions` and
+  `warmupTimeoutMs` aliases, preserving C# LSP setup from dotnet/skills.
+  (closes #2509, #2513)
+  (by @normandev92; closes #2509) (#2513)
+- `apm install --skill <name>` now matches on plugins whose manifest declares
+  the conventional skills container (`"skills": ["./skills/"]`). The declared
+  container was normalized under its own name, burying every skill at
+  `.apm/skills/skills/<name>/` -- one level below the depth `--skill`
+  enumeration, deployment, the `bin/` security scan and primitive counting all
+  read, so selection reported `Available: (none)` even though a bare install
+  deployed those same skills. A declared entry that is itself a skill
+  (`"skills": "./skills/engineering/tdd"`) still lands under its own leaf name
+  instead of spilling a bare `SKILL.md` into the shared skills root.
+  (closes #2530)
+- Root-declared plugin components (Claude Code single-skill shape
+  `"skills": ["./"]`, and the same for agents/commands/hooks) no longer cause
+  infinite recursion or unbounded writes during `apm install`.
+  `docs/src/content/docs/specs/openapm-v0.1.md` now explicitly requires
+  containment of consumer-generated staging output. (closes #2556)
+- Multi-target `apm compile` now avoids repeating expensive project analysis
+  for each target, making multi-target runs scale like single-target runs
+  without changing generated output. (closes #2482)
+- `deployed-files-present` no longer false-positives on gitignored deploy
+  paths (e.g. `.agents/`), enabling `apm audit --ci` to pass on a fresh
+  checkout when deployed outputs are intentionally not committed. (closes
+  #2452, thanks @sergio-sisternes-epam)
+- YAML expansion guard no longer rejects large anchor-free lockfiles (150K+
+  entries) with a false-positive "billion-laughs" error. APM-generated
+  lockfiles with no anchors or aliases now load without error. (#2389)
 
 ### Changed
 

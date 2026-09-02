@@ -36,6 +36,10 @@ _logger = logging.getLogger(__name__)
 # Cap the file size first, then funnel every parse failure into a single
 # ``ValueError`` so callers fail closed with one except type.
 _MAX_PLUGIN_JSON_BYTES = 5 * 1024 * 1024
+_LSP_FIELD_ALIASES = (
+    ("extensionToLanguage", "fileExtensions"),
+    ("startupTimeout", "warmupTimeoutMs"),
+)
 _PLUGIN_SKILL_SOURCES_FILE = ".plugin-skill-sources.json"
 
 
@@ -95,20 +99,11 @@ def _assert_no_symlink_descendants(target: Path) -> None:
 
 
 def _surface_warning(message: str, logger: logging.Logger) -> None:
-    """Emit a warning to both the stdlib logger and the rich console.
-
-    The ``apm`` stdlib logger has no handlers configured by default, so
-    ``logger.warning`` calls are silently dropped in non-debug runs. For
-    user-visible plugin-parse issues (skipped MCP servers, validation
-    failures), also route through ``_rich_warning`` so the user sees them
-    even without ``--verbose``. Falls back gracefully if Rich is unavailable.
-    """
-    logger.warning(message)
-    try:  # noqa: SIM105
+    """Emit one standard user-facing warning, with logging as fallback."""
+    try:
         _rich_warning(message, symbol="warning")
     except Exception:
-        # Console output is best-effort; never mask the underlying warning.
-        pass
+        logger.warning(message)
 
 
 def _is_within_plugin(candidate: Path, plugin_root: Path, *, component: str) -> bool:
@@ -982,6 +977,14 @@ def _lsp_servers_to_apm_deps(
     - ``command``: binary to run
     - ``extensionToLanguage``: mapping of file extensions to language IDs
 
+    Copilot-dialect spellings are accepted as aliases (#2509): plugins
+    authored against the Copilot CLI schema -- including the official
+    ``dotnet/skills`` dotnet plugin -- write the extension map as
+    ``fileExtensions`` and the startup budget as ``warmupTimeoutMs``.
+    APM itself emits ``fileExtensions`` when generating Copilot output,
+    so rejecting it on intake would drop servers that every supported
+    consumer runtime accepts. Canonical names win when both are present.
+
     All resulting entries are routed through ``LSPDependency.from_dict()``
     for validation. Entries that fail validation are skipped with a warning.
 
@@ -1004,6 +1007,7 @@ def _lsp_servers_to_apm_deps(
             continue
 
         dep: dict[str, Any] = {"name": name}
+        aliases_used: list[tuple[str, str]] = []
 
         # Copy all recognized fields
         for key in (
@@ -1023,13 +1027,49 @@ def _lsp_servers_to_apm_deps(
             if key in cfg:
                 dep[key] = cfg[key]
 
+        # Copilot-dialect aliases; canonical spelling wins when both exist.
+        for canonical, alias in _LSP_FIELD_ALIASES:
+            if dep.get(canonical) is None and alias in cfg:
+                dep[canonical] = cfg[alias]
+                aliases_used.append((alias, canonical))
+                logger.debug(
+                    "Normalizing LSP server '%s' from plugin '%s': '%s' to '%s'",
+                    name,
+                    plugin_path.name,
+                    alias,
+                    canonical,
+                )
+            elif canonical in dep and alias in cfg and dep[canonical] != cfg[alias]:
+                _surface_warning(
+                    f"LSP server '{name}' from plugin '{plugin_path.name}' defines both "
+                    f"'{canonical}' and '{alias}'; using '{canonical}'.",
+                    logger,
+                )
+
+        # ``cwd`` has no LSPDependency equivalent: APM-managed servers are
+        # started by the consumer runtime in its own working directory.
+        # Ignore it explicitly rather than letting it look like a typo.
+        if "cwd" in cfg:
+            _surface_warning(
+                f"LSP server '{name}' from plugin '{plugin_path.name}' uses unsupported "
+                "'cwd'; the consumer runtime chooses the working directory.",
+                logger,
+            )
+
         # Route through the validation chokepoint
         try:
             LSPDependency.from_dict(dep)
         except Exception as exc:
             if warn_on_invalid:
+                alias_context = ""
+                if aliases_used:
+                    normalized = ", ".join(
+                        f"'{alias}' to '{canonical}'" for alias, canonical in aliases_used
+                    )
+                    alias_context = f" after normalizing {normalized}"
                 _surface_warning(
-                    f"Skipping invalid LSP server '{name}' from plugin '{plugin_path.name}': {exc}",
+                    f"Skipping invalid LSP server '{name}' from plugin "
+                    f"'{plugin_path.name}'{alias_context}: {exc}",
                     logger,
                 )
             continue
