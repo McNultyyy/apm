@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows users no longer get line-ending-only diffs when APM rewrites
+  `apm.yml`: install, uninstall, dependency resolution, and revision-pin
+  updates now produce deterministic LF output. A Windows `apm.yml` already
+  in the CRLF domain has a one-time line-ending-only diff on its next rewrite.
+  (closes #2624; group 1 landed in #2638)
+
+## [0.29.0] - 2026-08-26
 ### Changed
 
 - Architecture ownership guards now use a sharded JSON registry and a

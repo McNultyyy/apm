@@ -53,6 +53,8 @@ def atomic_write_text(
     *,
     new_file_mode: int | None = None,
     normalize_line_endings: bool = True,
+    temp_prefix: str = "apm-atomic-",
+    temp_suffix: str = "",
 ) -> None:
     """Atomically write ``data`` (UTF-8) to ``path``.
 
@@ -72,11 +74,19 @@ def atomic_write_text(
     generated output. Callers preserving hand-authored byte ranges can
     disable normalization with ``normalize_line_endings=False``.
 
+    ``temp_prefix`` and ``temp_suffix`` let compatibility wrappers retain
+    an established sibling-file naming contract without reimplementing the
+    atomic write.
+
     On any failure, the temp file is removed and the original target
     file (if any) remains untouched.
     """
     existed = path.exists()
-    fd, tmp_name = tempfile.mkstemp(prefix="apm-atomic-", dir=str(path.parent))
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=temp_prefix,
+        suffix=temp_suffix,
+        dir=str(path.parent),
+    )
     fd_wrapped = False
     try:
         if new_file_mode is not None and not existed and hasattr(os, "fchmod"):

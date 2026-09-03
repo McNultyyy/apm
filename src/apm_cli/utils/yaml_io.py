@@ -14,9 +14,6 @@ Public API::
     yaml_to_str(data)               -- serialize dict -> YAML string
 """
 
-import os
-import secrets
-from contextlib import suppress
 from io import StringIO
 from pathlib import Path
 from typing import Any, NoReturn
@@ -576,37 +573,17 @@ def write_yaml_text_atomic(
 ) -> None:
     """Atomically replace a YAML file with already-rendered text.
 
-    The replacement is written to a sibling file first and then moved into
-    place with ``os.replace``. If the write or replace fails, the original
-    file remains untouched.
-
-    Deterministic LF line endings (apm#2624): ``newline=""`` disables the
-    platform newline translation and the content is CRLF-normalized, so
-    the on-disk bytes are identical on every OS instead of following the
-    writing platform.
+    The canonical atomic writer creates the replacement beside the target
+    before moving it into place. If the write or replace fails, the original
+    file remains untouched. Its deterministic LF policy keeps the on-disk
+    bytes identical on every OS.
     """
-    from .atomic_io import normalize_crlf_to_lf
+    from .atomic_io import atomic_write_text
 
     target = Path(path)
-    tmp_path: Path | None = None
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        for _attempt in range(10):
-            candidate = target.with_name(f".{target.name}.{secrets.token_hex(8)}{tmp_suffix}")
-            try:
-                fd = os.open(candidate, flags, 0o600)
-            except FileExistsError:
-                continue
-            tmp_path = candidate
-            break
-        else:
-            raise FileExistsError(f"Could not create a unique temp file for {target}")
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-            fh.write(normalize_crlf_to_lf(content))
-        os.replace(tmp_path, target)
-        tmp_path = None
-    except Exception:
-        if tmp_path is not None:
-            with suppress(OSError):
-                tmp_path.unlink()
-        raise
+    atomic_write_text(
+        target,
+        content,
+        temp_prefix=f".{target.name}.",
+        temp_suffix=tmp_suffix,
+    )

@@ -421,7 +421,8 @@ class TestWriteYamlTextAtomic:
     def test_atomic_write_leaves_original_on_replace_failure(self, tmp_path, monkeypatch):
         """If os.replace fails, the original file is untouched and temp cleaned."""
 
-        from apm_cli.utils import yaml_io as _yi
+        from apm_cli.utils import atomic_io
+        from apm_cli.utils.yaml_io import write_yaml_text_atomic
 
         target = tmp_path / "out.yml"
         target.write_text("orig: 1\n", encoding="utf-8")
@@ -429,9 +430,9 @@ class TestWriteYamlTextAtomic:
         def _boom(src, dst):
             raise OSError("replace denied")
 
-        monkeypatch.setattr(_yi.os, "replace", _boom)
+        monkeypatch.setattr(atomic_io, "_replace_atomic_file", _boom)
         with pytest.raises(OSError):
-            _yi.write_yaml_text_atomic(target, "new: 2\n")
+            write_yaml_text_atomic(target, "new: 2\n")
         assert target.read_text(encoding="utf-8") == "orig: 1\n"
         leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(".out.yml.")]
         assert leftovers == []
