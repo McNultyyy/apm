@@ -101,6 +101,32 @@ class TestAtomicWriteText:
 
         assert captured_kwargs[0]["prefix"] == "apm-atomic-"
 
+    @pytest.mark.parametrize(
+        ("parameter", "value"),
+        [
+            ("temp_prefix", "../escape-"),
+            ("temp_prefix", "..\\escape-"),
+            ("temp_suffix", "/../../escape"),
+            ("temp_suffix", "\\..\\..\\escape"),
+        ],
+    )
+    def test_tmp_name_fragments_cannot_escape_parent(
+        self,
+        tmp_path: Path,
+        parameter: str,
+        value: str,
+    ) -> None:
+        """Caller-provided temp naming cannot redirect creation outside the parent."""
+        target = tmp_path / "out.txt"
+
+        with (
+            patch("apm_cli.utils.atomic_io.tempfile.mkstemp") as mock_mkstemp,
+            pytest.raises(ValueError, match="without path separators"),
+        ):
+            atomic_write_text(target, "data", **{parameter: value})
+
+        mock_mkstemp.assert_not_called()
+
     # ------------------------------------------------------------------
     # fchmod / new_file_mode
     # ------------------------------------------------------------------

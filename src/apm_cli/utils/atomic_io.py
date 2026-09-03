@@ -47,6 +47,12 @@ def write_text_lf(path: Path, data: str) -> None:
     path.write_text(normalize_crlf_to_lf(data), encoding="utf-8", newline="")
 
 
+def _validate_temp_name_fragment(fragment: str, parameter: str) -> None:
+    """Reject temp-name fragments that could escape the target directory."""
+    if "\x00" in fragment or "/" in fragment or "\\" in fragment:
+        raise ValueError(f"{parameter} must be a filename fragment without path separators")
+
+
 def atomic_write_text(
     path: Path,
     data: str,
@@ -82,6 +88,8 @@ def atomic_write_text(
     file (if any) remains untouched.
     """
     existed = path.exists()
+    _validate_temp_name_fragment(temp_prefix, "temp_prefix")
+    _validate_temp_name_fragment(temp_suffix, "temp_suffix")
     fd, tmp_name = tempfile.mkstemp(
         prefix=temp_prefix,
         suffix=temp_suffix,
