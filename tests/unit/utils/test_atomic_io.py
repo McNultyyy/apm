@@ -106,8 +106,11 @@ class TestAtomicWriteText:
         [
             ("temp_prefix", "../escape-"),
             ("temp_prefix", "..\\escape-"),
+            ("temp_prefix", "C:escape-"),
+            ("temp_prefix", "invalid\x00prefix"),
             ("temp_suffix", "/../../escape"),
             ("temp_suffix", "\\..\\..\\escape"),
+            ("temp_suffix", "invalid\x00suffix"),
         ],
     )
     def test_tmp_name_fragments_cannot_escape_parent(
@@ -121,7 +124,7 @@ class TestAtomicWriteText:
 
         with (
             patch("apm_cli.utils.atomic_io.tempfile.mkstemp") as mock_mkstemp,
-            pytest.raises(ValueError, match="without path separators"),
+            pytest.raises(ValueError, match="portable filename fragment"),
         ):
             atomic_write_text(target, "data", **{parameter: value})
 

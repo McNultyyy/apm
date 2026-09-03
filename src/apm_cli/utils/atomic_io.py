@@ -49,8 +49,8 @@ def write_text_lf(path: Path, data: str) -> None:
 
 def _validate_temp_name_fragment(fragment: str, parameter: str) -> None:
     """Reject temp-name fragments that could escape the target directory."""
-    if "\x00" in fragment or "/" in fragment or "\\" in fragment:
-        raise ValueError(f"{parameter} must be a filename fragment without path separators")
+    if "\x00" in fragment or "/" in fragment or "\\" in fragment or ":" in fragment:
+        raise ValueError(f"{parameter} must be a portable filename fragment")
 
 
 def atomic_write_text(
